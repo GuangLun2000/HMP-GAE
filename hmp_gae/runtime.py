@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -70,6 +70,19 @@ class HMPGAERuntime:
         self.graph_weight = float(self.cfg.get("graph_weight", 1.0))
         self.residual_weight_alpha = float(self.cfg.get("residual_weight_alpha", 0.3))
         self.hist_weight_beta = float(self.cfg.get("hist_weight_beta", 0.0))
+        # Round-dependent phase gating: if set, hist signal is only enabled for
+        # round_num < hist_warmup_rounds; otherwise β_eff = 0.  None = always
+        # on (backward compatible with all V1/V2 runs including Y2 and Y5).
+        #
+        # Rationale: Y5 (2026-05-22) showed hist_dev signal direction is
+        # correct in Phase 1 (R1-R11, 100% atk_hist_dev > bgn_hist_dev) but
+        # inverts in Phase 3 (R26+, only 28% correct).  Gating hist to the
+        # warmup window exploits the good phase and avoids the steady-state
+        # inversion.
+        _hwr = self.cfg.get("hist_warmup_rounds", None)
+        self.hist_warmup_rounds: Optional[int] = (
+            None if _hwr is None else int(_hwr)
+        )
         # Per-sample semantic-divergence signal weight. Off by default (=0.0)
         # so existing experiments reproduce bit-for-bit; enable with
         # defense_config.semantic_weight > 0 once the server is forwarding a
@@ -292,6 +305,15 @@ class HMPGAERuntime:
             Z = self.hmp_encoder(eta, H, D_V_inv, D_E_inv)
             _, A_probs = inner_product_decoder(Z)
 
+            # Phase-gated β: hist signal only active in warmup window.
+            # hist_warmup_rounds is None  -> always on (backward compatible)
+            # hist_warmup_rounds is int N -> active for round_num < N (0-indexed)
+            if (self.hist_warmup_rounds is not None
+                    and int(round_num) >= int(self.hist_warmup_rounds)):
+                hist_weight_beta_eff = 0.0
+            else:
+                hist_weight_beta_eff = self.hist_weight_beta
+
             trust = compute_trust_weights(
                 A_hat=A_probs,
                 Z=Z,
@@ -299,7 +321,7 @@ class HMPGAERuntime:
                 H=H,
                 graph_weight=self.graph_weight,
                 residual_weight_alpha=self.residual_weight_alpha,
-                hist_weight_beta=self.hist_weight_beta,
+                hist_weight_beta=hist_weight_beta_eff,
                 softmax_tau=self.softmax_tau,
                 probe_distributions=probe_arg,
                 semantic_weight=self.semantic_weight,
@@ -379,6 +401,17 @@ class HMPGAERuntime:
             "recon_residual_z": trust.recon_residual_z.detach().cpu().tolist(),
             "semantic_weight": float(self.semantic_weight),
             "gate_signal": str(self.gate_signal),
+            # Phase-gating diagnostics (NEW 2026-05-23):
+            #   _configured = what main.py set (static, same every round)
+            #   _effective  = what was actually applied this round (=0 once
+            #                 round_num >= hist_warmup_rounds)
+            # When hist_warmup_rounds is None, _effective == _configured.
+            "hist_weight_beta_configured": float(self.hist_weight_beta),
+            "hist_weight_beta_effective": float(hist_weight_beta_eff),
+            "hist_warmup_rounds": (
+                None if self.hist_warmup_rounds is None
+                else int(self.hist_warmup_rounds)
+            ),
             "hist_dev": trust.hist_dev.detach().cpu().tolist(),
             "has_history": bool(has_hist),
             "cold_start_fallback_used": bool(use_cold_start_fallback),

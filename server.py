@@ -362,6 +362,21 @@ class Server:
             )
             print(f"  🕰️  hist_dev:      {hist_dev_summary}")
 
+        # Phase-gating diagnostics (NEW 2026-05-23): show whether hist signal
+        # was actually applied this round.  Helps cross-check that
+        # hist_warmup_rounds is gating as expected.  Only prints when the
+        # runtime exposes these fields (HMP-GAE defense; FedAvg silently skips).
+        beta_cfg = defense_stats.get('hist_weight_beta_configured')
+        beta_eff = defense_stats.get('hist_weight_beta_effective')
+        hwr = defense_stats.get('hist_warmup_rounds')
+        if beta_cfg is not None and beta_eff is not None:
+            status = "ON" if beta_eff > 0 else "OFF"
+            hwr_str = "None" if hwr is None else str(hwr)
+            print(
+                f"  ⏱️  hist gate:     β_cfg={beta_cfg:.2f}, "
+                f"β_eff={beta_eff:.2f}, warmup_rounds={hwr_str}, status={status}"
+            )
+
         # Compute similarity and distance metrics for visualization (unchanged).
         mode = getattr(self, 'similarity_mode', 'local_vs_global')
         if mode == 'local_vs_global':

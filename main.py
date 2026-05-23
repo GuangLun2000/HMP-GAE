@@ -1157,12 +1157,30 @@ def main(config_overrides: Optional[Dict] = None):
             # real features drift more than attackers stuck on a fixed mislabel
             # manifold, which can invert the signal. Re-enable with care.
             'hist_weight_beta': 0.0,
+            # Round-dependent phase gating for hist signal.
+            # None  = always on (backward compatible; matches Y2/Y5 behavior).
+            # int N = enable hist for round_num < N (0-indexed), then beta_eff=0.
+            #
+            # Y5 (β=0.3, no gating) showed hist_dev signal direction is correct
+            # in R1-R11 (Phase 1, warmup, 100% atk>bgn) but inverts in R26+
+            # (Phase 3, steady state, only 28% atk>bgn). Setting
+            # hist_warmup_rounds=10 should capture the good Phase 1 signal
+            # without the Phase 3 inversion penalty.
+            'hist_warmup_rounds': None,
             'softmax_tau': 0.1,          # only used when trust_mode='softmax'
+            # gate_signal: which suspicion signal feeds the rejection gate.
+            #   'graph'    -> graph_residual_z only (ignores recon/sem/hist).
+            #   'combined' -> z-score(-trust.s); folds in ALL enabled signals.
+            # Set explicitly so hist_weight_beta is guaranteed to drive the gate.
+            # (runtime.py only auto-promotes to 'combined' when semantic_weight>0,
+            #  so a future ablation with semantic_weight=0 + hist_weight_beta>0
+            #  would silently fall back to graph-only without this line.)
+            'gate_signal': 'combined',
             # Trust-to-weight mapping:
-            #   'soft_reject_fedavg' (default): sigmoid gate on graph_residual_z,
+            #   'soft_reject_fedavg' (default): sigmoid gate on the gate_signal,
             #       then data-size FedAvg among continuously-trusted clients.
             #       Robust to threshold miscalibration; works for any N.
-            #   'reject_then_fedavg': hard binary rejection (gr_z > threshold),
+            #   'reject_then_fedavg': hard binary rejection (gate_signal > threshold),
             #       then FedAvg.  Calibrated for 8B/2A; fragile on other configs.
             #   'softmax': pure softmax of trust logits (concentrates on 1-2 clients).
             'trust_mode': 'soft_reject_fedavg',
