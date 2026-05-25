@@ -428,6 +428,7 @@ class Server:
                   'graph_residual_z', 'recon_residual_z', 'sem_div_z', 'hist_dev_z',
                   'hist_dev', 's', 'sus_z', 'gate',
                   'graph_weight', 'residual_weight_alpha',
+                  'semantic_weight', 'hist_weight_beta_effective',
                   'L_rec', 'L_smooth', 'L_hist',
                   'fallback_reason', 'defense_time_ms'):
             if k in defense_stats:

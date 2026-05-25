@@ -1000,8 +1000,8 @@ def main(config_overrides: Optional[Dict] = None):
 
         # ========== Federated Learning Setup ==========
         'num_clients': 7,    # Total clients: 5 benign, 2 attackers (Y2 config)
-        'num_attackers': 2,  # No attackers in this baseline
-        'num_rounds': 3,    # Total federated learning rounds
+        'num_attackers': 2,  # SMOKE: 2 attackers (C5/C6), exercises HMP-GAE trust path
+        'num_rounds': 10,    # Total federated learning rounds
 
         # ========== Training Hyperparameters ==========
         'client_lr': 5e-5,   # Learning rate for local client training
