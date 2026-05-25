@@ -999,9 +999,9 @@ def main(config_overrides: Optional[Dict] = None):
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
-        'num_clients': 7,    # Total clients: 7 benign, 0 attackers (clean ceiling)
-        'num_attackers': 0,  # No attackers in this baseline
-        'num_rounds': 50,    # Total federated learning rounds
+        'num_clients': 7,    # Total clients: 5 benign, 2 attackers (Y2 config)
+        'num_attackers': 2,  # No attackers in this baseline
+        'num_rounds': 3,    # Total federated learning rounds
 
         # ========== Training Hyperparameters ==========
         'client_lr': 5e-5,   # Learning rate for local client training
@@ -1073,7 +1073,7 @@ def main(config_overrides: Optional[Dict] = None):
         # proposed per-round randomized label-flipping attack. Switch to
         # 'NoAttack' (with num_attackers=0) for the clean ceiling, or to one
         # of the classical-baseline strings for V2 comparison runs.
-        'attack_method': 'NoAttack',
+        'attack_method': 'Hallucination',
         'attack_start_round': None,  # None = attack active from round 0 (default)
 
         # ---- Hallucination (label-flipping, this paper's attacker) ----
@@ -1112,7 +1112,7 @@ def main(config_overrides: Optional[Dict] = None):
         # Current value is 'hmp_gae': the proposed defense, paired with the
         # same Hallucination attack / Yahoo Answers data as the FedAvg
         # no-defense baseline (only this field differs — controlled variable).
-        'defense_method': 'fedavg',
+        'defense_method': 'hmp_gae',
         'defense_config': {
             # --- Node features (eta_i) ---
             'proj_dim': 64,              # random-projection dim for flat update
@@ -1152,7 +1152,7 @@ def main(config_overrides: Optional[Dict] = None):
             # signal is known to degrade in non-IID, so we give more weight to
             # the output-behavior signal (orthogonal to update geometry).
             # Effective signal share: sem rises 44% -> 61%; graph drops 44% -> 30%.
-            'semantic_weight': 2.0,
+            'semantic_weight': 1.0,
             # Historical deviation disabled by default: benign clients learning
             # real features drift more than attackers stuck on a fixed mislabel
             # manifold, which can invert the signal. Re-enable with care.
