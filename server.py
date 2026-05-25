@@ -377,6 +377,23 @@ class Server:
                 f"β_eff={beta_eff:.2f}, warmup_rounds={hwr_str}, status={status}"
             )
 
+        # Combined-gate diagnostics (NEW 2026-05-23, Issue 1): the suspicion
+        # z-score that actually drives the sigmoid gate, and the resulting gate.
+        # High sus_z = suspicious (gate -> 0); compare attacker vs benign to see
+        # whether the trust mechanism points the right direction.
+        sus_z_list = defense_stats.get('sus_z')
+        gate_list = defense_stats.get('gate')
+        if isinstance(sus_z_list, list) and len(sus_z_list) == len(client_ids):
+            sus_z_summary = ", ".join(
+                f"c{cid}={v:.3f}" for cid, v in zip(client_ids, sus_z_list)
+            )
+            print(f"  🎯 sus_z:        {sus_z_summary}")
+        if isinstance(gate_list, list) and len(gate_list) == len(client_ids):
+            gate_summary = ", ".join(
+                f"c{cid}={v:.3f}" for cid, v in zip(client_ids, gate_list)
+            )
+            print(f"  🚪 gate:         {gate_summary}")
+
         # Compute similarity and distance metrics for visualization (unchanged).
         mode = getattr(self, 'similarity_mode', 'local_vs_global')
         if mode == 'local_vs_global':
@@ -407,7 +424,11 @@ class Server:
         # Persist extra defense stats (skip bulky numpy blobs like 'Z' from the
         # main JSON log to keep result files lean; HMP runtime writes its own
         # stats file if enabled).
-        for k in ('residual', 'hist_dev', 'L_rec', 'L_smooth', 'L_hist',
+        for k in ('residual', 'recon_residual', 'sem_div',
+                  'graph_residual_z', 'recon_residual_z', 'sem_div_z', 'hist_dev_z',
+                  'hist_dev', 's', 'sus_z', 'gate',
+                  'graph_weight', 'residual_weight_alpha',
+                  'L_rec', 'L_smooth', 'L_hist',
                   'fallback_reason', 'defense_time_ms'):
             if k in defense_stats:
                 aggregation_log[k] = defense_stats[k]

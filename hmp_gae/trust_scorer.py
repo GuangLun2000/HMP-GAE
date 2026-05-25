@@ -273,6 +273,30 @@ def _suspicion_signal(trust: "TrustResult", source: str) -> torch.Tensor:
     return trust.graph_residual_z.detach().clone()
 
 
+def gate_diagnostics(
+    trust: "TrustResult",
+    reject_z_threshold: float,
+    soft_reject_k: float,
+    gate_signal: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Single source of truth for the soft-rejection gate.
+
+    Returns (sus_z, gate) where:
+      sus_z = suspicion z-score selected by gate_signal (for 'combined' this is
+              the SECOND z-score: _zscore(-trust.s), folding in all signals).
+      gate  = sigmoid(-k * (sus_z - threshold)), the raw multiplicative weight
+              BEFORE the keep_min safety fallback.
+
+    `reject_soft_weighted` calls this so the production aggregation path and the
+    diagnostic both compute sus_z/gate from the exact same expression -- no
+    drift. Exposing sus_z lets callers measure the combined-gate double-z-score
+    effect (compare sus_z against -trust.s directly).
+    """
+    sus_z = _suspicion_signal(trust, gate_signal)
+    gate = torch.sigmoid(-soft_reject_k * (sus_z - float(reject_z_threshold)))
+    return sus_z, gate
+
+
 def reject_then_weighted(
     trust: "TrustResult",
     data_sizes: torch.Tensor,
@@ -367,8 +391,9 @@ def reject_soft_weighted(
     dtype = trust.alpha.dtype
     N = trust.alpha.numel()
 
-    gr_z = _suspicion_signal(trust, gate_signal)
-    gate = torch.sigmoid(-soft_reject_k * (gr_z - float(reject_z_threshold)))
+    gr_z, gate = gate_diagnostics(
+        trust, reject_z_threshold, soft_reject_k, gate_signal
+    )
 
     # Safety: if every client's gate is tiny (all look suspicious), fall back
     # to keeping the keep_min least-isolated clients with uniform weight.

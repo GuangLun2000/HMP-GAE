@@ -31,7 +31,7 @@ from .hypergraph import knn_hypergraph
 from .encoder import HMPEncoder
 from .decoder import inner_product_decoder, HyperedgeDecoder
 from .losses import total_loss
-from .trust_scorer import compute_trust_weights, weighted_aggregate, reject_then_weighted, reject_soft_weighted
+from .trust_scorer import compute_trust_weights, weighted_aggregate, reject_then_weighted, reject_soft_weighted, gate_diagnostics
 
 
 class HMPGAERuntime:
@@ -379,6 +379,14 @@ class HMPGAERuntime:
         # ---- 4) weighted aggregation ---- #
         aggregated = weighted_aggregate(updates_stack, used_alpha)
 
+        # ---- 4b) gate diagnostics (raw sus_z + gate, pre keep_min fallback) ---- #
+        # Computed via the same gate_diagnostics() that reject_soft_weighted uses,
+        # so the logged sus_z/gate match the production aggregation exactly.
+        # sus_z exposes the combined-gate double-z-score; compare against `s`.
+        diag_sus_z, diag_gate = gate_diagnostics(
+            trust, self.reject_z_threshold, self.soft_reject_k, self.gate_signal
+        )
+
         # ---- 5) update EMA history ---- #
         self._update_history(client_ids, Z)
 
@@ -399,6 +407,21 @@ class HMPGAERuntime:
             "sem_div_z": trust.sem_div_z.detach().cpu().tolist(),
             "graph_residual_z": trust.graph_residual_z.detach().cpu().tolist(),
             "recon_residual_z": trust.recon_residual_z.detach().cpu().tolist(),
+            "hist_dev_z": trust.hist_dev_z.detach().cpu().tolist(),
+            # Trust-weight formula decomposition (NEW 2026-05-23, Issue 1):
+            #   s       = -(w_g·z_g + alpha·z_r + w_s·z_s + beta·z_h)  (trust logit)
+            #   sus_z   = combined-gate suspicion z-score (= zscore(-s) when
+            #             gate_signal='combined'); the SECOND z-score that washes
+            #             out absolute weight magnitudes (Bug 1 evidence).
+            #   gate    = sigmoid(-k·(sus_z - threshold)), raw multiplicative
+            #             weight before keep_min fallback.
+            # graph_weight / residual_weight_alpha emitted so the notebook can
+            # reconstruct the per-term weighted contributions w_k·z_k.
+            "s": trust.s.detach().cpu().tolist(),
+            "sus_z": diag_sus_z.detach().cpu().tolist(),
+            "gate": diag_gate.detach().cpu().tolist(),
+            "graph_weight": float(self.graph_weight),
+            "residual_weight_alpha": float(self.residual_weight_alpha),
             "semantic_weight": float(self.semantic_weight),
             "gate_signal": str(self.gate_signal),
             # Phase-gating diagnostics (NEW 2026-05-23):
