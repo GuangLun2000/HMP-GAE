@@ -995,19 +995,19 @@ def main(config_overrides: Optional[Dict] = None):
         # defense runs on this dataset are compared against.  Because
         # FedAvgDefense ignores trust_scorer entirely, this baseline is
         # unaffected by the ongoing HMP-GAE trust-scoring investigation.
-        'experiment_name': 'agnews-(non-iid0.5)-benign-baseline-fedavg-no-attacker(localround=1,seed=42)',
+        'experiment_name': 'yahoo-(iid)-hmpgae-defense-attack(localround=1,seed=42,b=0.3,batch=64,128)',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
         'num_clients': 7,    # Total clients: 5 benign, 2 attackers (Y2 config)
         'num_attackers': 2,  # SMOKE: 2 attackers (C5/C6), exercises HMP-GAE trust path
-        'num_rounds': 10,    # Total federated learning rounds
+        'num_rounds': 50,    # Total federated learning rounds
 
         # ========== Training Hyperparameters ==========
         'client_lr': 5e-5,   # Learning rate for local client training
         'server_lr': 1.0,    # Server aggregation lr (fixed at 1.0 for standard FedAvg aggregation)
-        'batch_size': 32,    # 32 is safe for T4 15GB with Qwen2.5-0.5B + seq_len=128; raise to 64 on A100
-        'test_batch_size': 64,   # Inference uses less VRAM; 64 is safe
+        'batch_size': 64,    # 32 is safe for T4 15GB with Qwen2.5-0.5B + seq_len=128; raise to 64 on A100
+        'test_batch_size': 128,   # Inference uses less VRAM; 64 is safe
         'local_epochs': 1,   # 1 epoch per round: 50 rounds × 1 epoch sufficient for LoRA convergence
                              # and keeps total wall-clock time manageable (~3-4 h on T4)
         'grad_clip_norm': 1.0,  # Qwen2.5-0.5B is typically stable at 1.0; reduce to 0.5 if NaN
@@ -1016,9 +1016,9 @@ def main(config_overrides: Optional[Dict] = None):
         # ========== Dataset Configuration ==========
         # Choose dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers' — set num_labels and max_length accordingly
         # Dataset 1: AG News
-        'dataset': 'ag_news',  # news classification (4 classes)
-        'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
-        'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
+        # 'dataset': 'ag_news',  # news classification (4 classes)
+        # 'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
+        # 'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
         # -------------------------------------------
         # Dataset 2: IMDB
         # 'dataset': 'imdb',   # sentiment (2 classes)
@@ -1031,14 +1031,14 @@ def main(config_overrides: Optional[Dict] = None):
         # 'max_length': 512,
         # -------------------------------------------
         # Dataset 4: Yahoo Answers (10 classes, 1.4M train / 60K test)
-        # 'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
-        # 'num_labels': 10,       # Yahoo Answers: 10 classes
-        # 'max_length': 128,      # Yahoo Answers: 128, 256 (Q&A text is longer than AG News headlines)
+        'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
+        'num_labels': 10,       # Yahoo Answers: 10 classes
+        'max_length': 128,      # Yahoo Answers: 128, 256 (Q&A text is longer than AG News headlines)
         
         # ========== Data Distribution ==========
         # For V1 first experiment we use IID to isolate the defense effect from data heterogeneity noise.
         # Switch to 'non-iid' with dirichlet_alpha in [0.3, 1.0] once baseline numbers are stable.
-        'data_distribution': 'non-iid',  # 'iid' uniform, 'non-iid' Dirichlet-heterogeneous
+        'data_distribution': 'iid',  # 'iid' uniform, 'non-iid' Dirichlet-heterogeneous
         'dirichlet_alpha': 0.5,          # Only used when data_distribution='non-iid'. Lower = more heterogeneous.
         # 'dataset_size_limit': None,  # Full dataset: AG News ~120K; IMDB 25K; DBpedia 560K; Yahoo Answers 1.4M
         'dataset_size_limit': 10000,  # 10K train → ~1428 samples/client (7 clients, IID); test ≤ 1500
@@ -1156,7 +1156,7 @@ def main(config_overrides: Optional[Dict] = None):
             # Historical deviation disabled by default: benign clients learning
             # real features drift more than attackers stuck on a fixed mislabel
             # manifold, which can invert the signal. Re-enable with care.
-            'hist_weight_beta': 0.0,
+            'hist_weight_beta': 0.3,
             # Round-dependent phase gating for hist signal.
             # None  = always on (backward compatible; matches Y2/Y5 behavior).
             # int N = enable hist for round_num < N (0-indexed), then beta_eff=0.
