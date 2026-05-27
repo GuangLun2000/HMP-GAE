@@ -995,7 +995,7 @@ def main(config_overrides: Optional[Dict] = None):
         # defense runs on this dataset are compared against.  Because
         # FedAvgDefense ignores trust_scorer entirely, this baseline is
         # unaffected by the ongoing HMP-GAE trust-scoring investigation.
-        'experiment_name': 'yahoo-(iid)-hmpgae-defense-attack(localround=1,seed=42,b=0.3,batch=64,128)',
+        'experiment_name': 'yahoo-(iid)-hmpgae-defense-attack(localround=1,seed=42,b=0.3,batch=32,64)',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
@@ -1006,8 +1006,8 @@ def main(config_overrides: Optional[Dict] = None):
         # ========== Training Hyperparameters ==========
         'client_lr': 5e-5,   # Learning rate for local client training
         'server_lr': 1.0,    # Server aggregation lr (fixed at 1.0 for standard FedAvg aggregation)
-        'batch_size': 64,    # 32 is safe for T4 15GB with Qwen2.5-0.5B + seq_len=128; raise to 64 on A100
-        'test_batch_size': 128,   # Inference uses less VRAM; 64 is safe
+        'batch_size': 32,    # 32 is safe for T4 15GB with Qwen2.5-0.5B + seq_len=128; raise to 64 on A100
+        'test_batch_size': 64,   # Inference uses less VRAM; 64 is safe
         'local_epochs': 1,   # 1 epoch per round: 50 rounds × 1 epoch sufficient for LoRA convergence
                              # and keeps total wall-clock time manageable (~3-4 h on T4)
         'grad_clip_norm': 1.0,  # Qwen2.5-0.5B is typically stable at 1.0; reduce to 0.5 if NaN
