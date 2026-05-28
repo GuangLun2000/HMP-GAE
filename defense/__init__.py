@@ -5,12 +5,18 @@
 # standard FedAvg and robust/immunization methods (e.g., HMP-GAE) purely via
 # config, without changing the FL orchestration.
 #
-# V1 exports:
-#   - Defense         : abstract base class
-#   - FedAvgDefense   : faithful migration of the original FedAvg logic
-#   - HMPGAEDefense   : hypergraph message-passing GAE immunization (this paper)
+# Exports:
+#   - Defense           : abstract base class
+#   - FedAvgDefense     : faithful migration of the original FedAvg logic
+#   - HMPGAEDefense     : hypergraph message-passing GAE immunization (this paper)
+#   - KrumDefense       : Krum                  (Blanchard et al., NeurIPS '17)
+#   - MultiKrumDefense  : Multi-Krum            (Blanchard et al., NeurIPS '17)
+#   - CoordMedianDefense: Coord-wise Median     (Yin et al., ICML '18)
+#   - FLTrustDefense    : FLTrust (medroot var.)(Cao et al., NDSS '21)
+#   - FoolsGoldDefense  : FoolsGold             (Fung et al., RAID '20)
 #
-# Additional defense baselines can live under defense.baselines (see that package).
+# Each baseline lives in its own peer module (defense/krum.py, etc.) and is
+# re-exported here. Wire new methods into ``build_defense`` below.
 
 from __future__ import annotations
 
@@ -263,6 +269,15 @@ def build_defense(
 ) -> Defense:
     """
     Factory: instantiate a Defense from a config-facing method string.
+
+    Supported methods (case-insensitive, hyphens/underscores normalized):
+      - 'fedavg' / 'none'                : FedAvg (data-size weighted)
+      - 'hmp_gae'                        : HMP-GAE (this paper)
+      - 'krum'                           : Krum                (NeurIPS '17)
+      - 'multi_krum' / 'multikrum'       : Multi-Krum          (NeurIPS '17)
+      - 'coord_median' / 'median'        : Coord-wise Median   (ICML '18)
+      - 'fltrust'                        : FLTrust medroot var.(NDSS '21)
+      - 'foolsgold'                      : FoolsGold           (RAID '20)
     """
     m = (method or "fedavg").strip().lower()
     if m in {"fedavg", "fed_avg", "none", ""}:
@@ -273,6 +288,44 @@ def build_defense(
             config=defense_config or {},
             flat_update_dim=flat_update_dim,
         )
+    # Lazy imports keep the fedavg / hmp_gae paths zero-cost and avoid any
+    # partial-init issues at package load time.
+    if m in {"krum"}:
+        from defense.krum import KrumDefense
+        return KrumDefense(num_clients=num_clients, config=defense_config)
+    if m in {"multi_krum", "multikrum", "multi-krum"}:
+        from defense.krum import MultiKrumDefense
+        return MultiKrumDefense(num_clients=num_clients, config=defense_config)
+    if m in {"coord_median", "median", "coordmedian", "coord-median"}:
+        from defense.median import CoordMedianDefense
+        return CoordMedianDefense(num_clients=num_clients, config=defense_config)
+    if m in {"fltrust", "fl_trust", "fl-trust"}:
+        from defense.fltrust import FLTrustDefense
+        return FLTrustDefense(num_clients=num_clients, config=defense_config)
+    if m in {"foolsgold", "fools_gold", "fools-gold"}:
+        from defense.foolsgold import FoolsGoldDefense
+        return FoolsGoldDefense(num_clients=num_clients, config=defense_config)
     raise ValueError(
-        f"Unknown defense_method={method!r}. Supported in V1: 'fedavg', 'hmp_gae'."
+        f"Unknown defense_method={method!r}. Supported: "
+        f"'fedavg', 'hmp_gae', 'krum', 'multi_krum', 'coord_median', 'fltrust', 'foolsgold'."
     )
+
+
+# Re-export baseline classes at the package level so callers can do
+# `from defense import KrumDefense` (mirrors how FedAvgDefense / HMPGAEDefense
+# are surfaced here). Lazy attribute access avoids the modest import cost when
+# only the factory is used.
+def __getattr__(name: str):
+    if name in {"KrumDefense", "MultiKrumDefense"}:
+        from defense.krum import KrumDefense, MultiKrumDefense
+        return {"KrumDefense": KrumDefense, "MultiKrumDefense": MultiKrumDefense}[name]
+    if name == "CoordMedianDefense":
+        from defense.median import CoordMedianDefense
+        return CoordMedianDefense
+    if name == "FLTrustDefense":
+        from defense.fltrust import FLTrustDefense
+        return FLTrustDefense
+    if name == "FoolsGoldDefense":
+        from defense.foolsgold import FoolsGoldDefense
+        return FoolsGoldDefense
+    raise AttributeError(f"module 'defense' has no attribute {name!r}")
