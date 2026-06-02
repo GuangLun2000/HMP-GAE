@@ -1114,6 +1114,16 @@ def main(config_overrides: Optional[Dict] = None):
         # no-defense baseline (only this field differs — controlled variable).
         'defense_method': 'hmp_gae',
         'defense_config': {
+
+            # config for foolsgold
+            'epsilon': 1e-6,
+
+            # config for fltrust
+            'anchor': 'median',
+
+            # config for krum & multi-krum
+            'num_byzantine': 2,
+
             # --- Node features (eta_i) ---
             'proj_dim': 64,              # random-projection dim for flat update
             'eta_dim': 64,               # output dim of f_enc MLP
