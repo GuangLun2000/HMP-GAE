@@ -143,12 +143,42 @@ V1 ships the paper's core immunization pipeline end-to-end:
     'train_steps_per_round': 5, 'train_lr': 1e-3,
     'lambda_H': 1.0, 'lambda_A': 1.0, 'lambda_hist': 0.5,
     'graph_weight': 1.0, 'residual_weight_alpha': 0.3, 'hist_weight_beta': 0.0,
-    'trust_mode': 'soft_reject_fedavg', 'reject_z_threshold': 0.75, 'soft_reject_k': 2.0,
+    'semantic_weight': 1.0,
+    # --- Robust trust scoring (2026-07; legacy values in comments) ---
+    'zscore_mode': 'mad',                # 'std' = legacy mean/std z-scores
+    'zscore_clip': 10.0,                 # cap |z| per signal
+    'gate_rezscore': False,              # True = legacy double z-score gate
+    'sus_ema_beta': 0.6,                 # 0.0 = no cross-round suspicion EMA
+    'semantic_reference': 'median',      # 'pairwise' = legacy peer-consensus KL
+    'semantic_confidence_weight': False, # ablation knob
+    'semantic_probe_stratified': True,   # False = head-of-test_loader probes
+    'trust_mode': 'soft_reject_fedavg',
+    'reject_z_threshold': 2.5,           # per-signal robust-z units; use 0.75
+                                         # with gate_rezscore=True (legacy)
+    'soft_reject_k': 2.0,
     'softmax_tau': 0.1, 'hist_ema_beta': 0.9,
     'cold_start_fallback': False,
     'device': 'cpu', 'random_proj_seed': 42,
 },
 ```
+
+**Robust trust scoring (2026-07).** Four config-gated fixes targeting the two
+failure modes that cost clean accuracy: (1) `semantic_reference='median'`
+compares each client's probe softmax to the per-sample **median** consensus
+instead of pairwise peers, so non-IID benign heterogeneity is no longer
+penalized and attackers (a minority) cannot pollute the reference;
+(2) `zscore_mode='mad'` swaps mean/std for median/MAD z-scores, which stay
+meaningful up to ~50% attackers; (3) `gate_rezscore=False` removes the double
+z-score on the combined gate — the legacy path forced every round onto a ±σ
+scale so an all-benign round always down-weighted its most extreme client
+(the "scapegoat tax"); the suspicion score is instead `-s / ‖w‖₂`, putting
+`reject_z_threshold` in per-signal robust-z units; (4) `sus_ema_beta=0.6`
+smooths suspicion across rounds, so one-off benign extremes recover while
+persistent attackers stay gated. Setting the six legacy values noted above
+reproduces pre-2026-07 runs bit-for-bit. Detection quality (attacker/benign
+gate means + suspicion AUROC) is written to `detection_summary` in the
+results JSON. Sanity tests: `python tests/test_trust_robustness.py` (CPU,
+~1s, no dataset).
 
 ### Representative results (example regime)
 

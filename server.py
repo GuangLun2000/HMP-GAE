@@ -21,6 +21,7 @@ class Server:
                 num_clients: Optional[int] = None,
                 compute_classification_semantic_entropy: bool = True,
                 semantic_probe_size: int = 64,
+                semantic_probe_seed: int = 42,
                 eval_local_every_n_rounds: int = 1):
         self.global_model = copy.deepcopy(global_model)
         self.test_loader = test_loader
@@ -75,10 +76,18 @@ class Server:
 
         # Fixed probe subset for the per-client semantic-divergence trust
         # signal (Signal 3 in hmp_gae.trust_scorer). Built lazily on first
-        # request so that defenses that don't need it pay no cost. The probe
-        # batches are taken deterministically from the head of test_loader so
-        # they are identical across rounds.
+        # request so that defenses that don't need it pay no cost. Identical
+        # across rounds. Selection policy (defense_config.semantic_probe_stratified):
+        #   False (default) -> deterministic head of test_loader (historical).
+        #   True            -> class-stratified deterministic sample, seeded by
+        #                      semantic_probe_seed. Labels are used ONLY to
+        #                      balance the sample, never in the trust scoring,
+        #                      so the semantic signal stays label-free.
         self.semantic_probe_size = int(semantic_probe_size)
+        self.semantic_probe_seed = int(semantic_probe_seed)
+        self.semantic_probe_stratified = bool(
+            (self.defense_config or {}).get('semantic_probe_stratified', False)
+        )
         self._probe_batches: Optional[List[Dict[str, torch.Tensor]]] = None
         # Whether the active defense actually consumes probe distributions.
         # HMP-GAE will use them when defense_config.semantic_weight > 0.
@@ -426,9 +435,11 @@ class Server:
         # stats file if enabled).
         for k in ('residual', 'recon_residual', 'sem_div',
                   'graph_residual_z', 'recon_residual_z', 'sem_div_z', 'hist_dev_z',
-                  'hist_dev', 's', 'sus_z', 'gate',
+                  'hist_dev', 's', 'sus_z', 'sus_raw', 'gate',
                   'graph_weight', 'residual_weight_alpha',
                   'semantic_weight', 'hist_weight_beta_effective',
+                  'zscore_mode', 'gate_rezscore', 'sus_ema_beta',
+                  'semantic_reference',
                   'L_rec', 'L_smooth', 'L_hist',
                   'fallback_reason', 'defense_time_ms'):
             if k in defense_stats:
@@ -500,18 +511,76 @@ class Server:
             return self._probe_batches
         target = max(1, self.semantic_probe_size)
         batches: List[Dict[str, torch.Tensor]] = []
-        collected = 0
-        for batch in self.test_loader:
-            # Snapshot tensors on CPU to keep peak GPU memory bounded.
-            snapshot = {
-                'input_ids': batch['input_ids'].detach().cpu(),
-                'attention_mask': batch['attention_mask'].detach().cpu(),
-            }
-            batches.append(snapshot)
-            collected += int(snapshot['input_ids'].shape[0])
-            if collected >= target:
-                break
+        if self.semantic_probe_stratified:
+            batches = self._build_stratified_probe_batches(target)
+        if not batches:
+            # Historical behavior: deterministic head of test_loader. Also the
+            # fallback when the dataset does not expose labels for stratification.
+            collected = 0
+            for batch in self.test_loader:
+                # Snapshot tensors on CPU to keep peak GPU memory bounded.
+                snapshot = {
+                    'input_ids': batch['input_ids'].detach().cpu(),
+                    'attention_mask': batch['attention_mask'].detach().cpu(),
+                }
+                batches.append(snapshot)
+                collected += int(snapshot['input_ids'].shape[0])
+                if collected >= target:
+                    break
         self._probe_batches = batches
+        return batches
+
+    def _build_stratified_probe_batches(
+        self, target: int
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        Class-stratified deterministic probe selection.
+
+        Draws ~target/num_classes samples per class from test_loader.dataset
+        (seeded, without replacement) so the probe set is class-balanced --
+        a head-of-loader snapshot can be class-skewed, which biases the
+        semantic-divergence signal. Labels are consumed only here, for
+        balancing; the snapshot itself carries no labels.
+
+        Returns [] when the dataset does not expose a `labels` attribute,
+        in which case the caller falls back to the head-of-loader path.
+        """
+        dataset = getattr(self.test_loader, 'dataset', None)
+        labels = getattr(dataset, 'labels', None)
+        if dataset is None or labels is None or len(labels) == 0:
+            print("  [Server] semantic_probe_stratified=True but test dataset "
+                  "exposes no labels; falling back to head-of-loader probes.")
+            return []
+        by_class: Dict[int, List[int]] = {}
+        for idx, lab in enumerate(labels):
+            by_class.setdefault(int(lab), []).append(idx)
+        classes = sorted(by_class)
+        rng = np.random.default_rng(self.semantic_probe_seed)
+        quota, rem = divmod(target, len(classes))
+        chosen: List[int] = []
+        for j, c in enumerate(classes):
+            k = min(quota + (1 if j < rem else 0), len(by_class[c]))
+            if k <= 0:
+                continue
+            sel = rng.choice(len(by_class[c]), size=k, replace=False)
+            chosen.extend(by_class[c][int(i)] for i in sel)
+        if not chosen:
+            return []
+        chosen.sort()  # deterministic order, independent of class iteration
+        bs = int(self.test_loader.batch_size or 32)
+        batches: List[Dict[str, torch.Tensor]] = []
+        for start in range(0, len(chosen), bs):
+            items = [dataset[i] for i in chosen[start:start + bs]]
+            batches.append({
+                'input_ids': torch.stack([it['input_ids'] for it in items]).cpu(),
+                'attention_mask': torch.stack(
+                    [it['attention_mask'] for it in items]).cpu(),
+            })
+        per_class = {c: 0 for c in classes}
+        for i in chosen:
+            per_class[int(labels[i])] += 1
+        print(f"  [Server] stratified semantic probe: {len(chosen)} samples, "
+              f"per-class counts={per_class} (seed={self.semantic_probe_seed})")
         return batches
 
     def evaluate_local_probe_distribution(self, client) -> torch.Tensor:

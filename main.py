@@ -214,6 +214,7 @@ def setup_experiment(config):
         compute_classification_semantic_entropy=config.get(
             'eval_classification_semantic_entropy', True),
         semantic_probe_size=int(config.get('semantic_probe_size', 64)),
+        semantic_probe_seed=int(config.get('seed', 42)),
         eval_local_every_n_rounds=int(config.get('eval_local_every_n_rounds', 1)),
     )
 
@@ -589,16 +590,21 @@ def run_experiment(config):
         traceback.print_exc()
 
     # Save results
+    attacker_ids = [
+        c.client_id for c in server.clients
+        if getattr(c, 'is_attacker', False)
+    ]
+    # Detection-quality readout (attacker/benign gate means + suspicion AUROC).
+    # Pure post-processing of the per-round logs; None for FedAvg / no-attack.
+    detection_summary = compute_detection_summary(server.log_data, attacker_ids)
     results_data = {
         'config': config,
         'results': server.log_data,
         'progressive_metrics': progressive_metrics,
         'local_accuracies': server.history['local_accuracies'],
         'local_cse': server.history.get('local_cse', {}),
-        'attacker_ids': [
-            c.client_id for c in server.clients
-            if getattr(c, 'is_attacker', False)
-        ],
+        'attacker_ids': attacker_ids,
+        'detection_summary': detection_summary,
     }
 
     results_path = results_dir / f"{config['experiment_name']}_results.json"
@@ -606,6 +612,7 @@ def run_experiment(config):
         json.dump(results_data, f, indent=2)
 
     print(f"\nResults saved to: {results_path}")
+    print_detection_summary(detection_summary)
 
     save_global_model_checkpoint(server, config, results_dir)
 
@@ -640,6 +647,100 @@ def run_experiment(config):
     )
     
     return server.log_data, progressive_metrics
+
+def _rank_auroc(pos_scores: List[float], neg_scores: List[float]) -> Optional[float]:
+    """
+    AUROC via the Mann-Whitney U statistic: P(pos > neg), ties count 0.5.
+
+    1.0 = suspicion score perfectly ranks every attacker above every benign
+    client; 0.5 = chance; <0.5 = signal points the wrong way. O(n*m) pairwise
+    comparison — trivially cheap for FL-sized N, no sklearn dependency.
+    """
+    if not pos_scores or not neg_scores:
+        return None
+    wins = 0.0
+    for p in pos_scores:
+        for n in neg_scores:
+            if p > n:
+                wins += 1.0
+            elif p == n:
+                wins += 0.5
+    return wins / (len(pos_scores) * len(neg_scores))
+
+
+def compute_detection_summary(server_log_data, attacker_ids) -> Optional[Dict]:
+    """
+    Post-hoc detection-quality metrics from the per-round defense logs.
+
+    For every round whose aggregation log carries per-client 'gate' / 'sus_z'
+    (HMP-GAE rounds; FedAvg and fallback rounds are skipped), computes the
+    attacker vs benign mean gate and the AUROC of the suspicion score against
+    the ground-truth attacker labels.  This isolates "is the trust scorer
+    pointing at the right clients" from "did the run converge", so signal /
+    threshold changes get a direct readout that is independent of training
+    noise.  Returns None when there are no attackers or no gate-bearing rounds.
+    """
+    atk = {int(a) for a in (attacker_ids or [])}
+    if not atk:
+        return None
+    per_round = []
+    for log in server_log_data:
+        agg = log.get('aggregation') or {}
+        cids = agg.get('accepted_clients')
+        gates = agg.get('gate')
+        if not (isinstance(cids, list) and isinstance(gates, list)
+                and len(cids) == len(gates) and len(cids) > 0):
+            continue
+        atk_gates = [g for cid, g in zip(cids, gates) if int(cid) in atk]
+        bgn_gates = [g for cid, g in zip(cids, gates) if int(cid) not in atk]
+        entry = {
+            'round': log.get('round'),
+            'attacker_gate_mean': float(np.mean(atk_gates)) if atk_gates else None,
+            'benign_gate_mean': float(np.mean(bgn_gates)) if bgn_gates else None,
+        }
+        sus = agg.get('sus_z')
+        if isinstance(sus, list) and len(sus) == len(cids):
+            atk_sus = [s for cid, s in zip(cids, sus) if int(cid) in atk]
+            bgn_sus = [s for cid, s in zip(cids, sus) if int(cid) not in atk]
+            entry['sus_auroc'] = _rank_auroc(atk_sus, bgn_sus)
+        per_round.append(entry)
+    if not per_round:
+        return None
+
+    def _mean_of(key, rows):
+        vals = [r[key] for r in rows if r.get(key) is not None]
+        return float(np.mean(vals)) if vals else None
+
+    second_half = per_round[len(per_round) // 2:]
+    return {
+        # Mean over all gate-bearing rounds / over the steady-state 2nd half.
+        'attacker_gate_mean': _mean_of('attacker_gate_mean', per_round),
+        'benign_gate_mean': _mean_of('benign_gate_mean', per_round),
+        'sus_auroc_mean': _mean_of('sus_auroc', per_round),
+        'attacker_gate_mean_2nd_half': _mean_of('attacker_gate_mean', second_half),
+        'benign_gate_mean_2nd_half': _mean_of('benign_gate_mean', second_half),
+        'sus_auroc_mean_2nd_half': _mean_of('sus_auroc', second_half),
+        'n_rounds_with_gate': len(per_round),
+        'per_round': per_round,
+    }
+
+
+def print_detection_summary(summary: Optional[Dict]) -> None:
+    if not summary:
+        return
+    fmt = lambda v: 'n/a' if v is None else f"{v:.3f}"  # noqa: E731
+    print("\n" + "-" * 60)
+    print("🔍 DETECTION SUMMARY (defense gate vs ground-truth attackers)")
+    print("-" * 60)
+    print(f"  attacker gate mean : {fmt(summary['attacker_gate_mean'])}"
+          f"  (2nd half {fmt(summary['attacker_gate_mean_2nd_half'])})  → want ~0")
+    print(f"  benign   gate mean : {fmt(summary['benign_gate_mean'])}"
+          f"  (2nd half {fmt(summary['benign_gate_mean_2nd_half'])})  → want ~1")
+    print(f"  suspicion AUROC    : {fmt(summary['sus_auroc_mean'])}"
+          f"  (2nd half {fmt(summary['sus_auroc_mean_2nd_half'])})"
+          f"  [1.0 perfect, 0.5 chance]")
+    print(f"  rounds with gate   : {summary['n_rounds_with_gate']}")
+
 
 # Detailed statistics printing for data collection
 def print_detailed_statistics(server_log_data, progressive_metrics, local_accuracies, attacker_ids, 
@@ -989,13 +1090,15 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: FedAvg clean-ceiling baseline on AG News (non-IID, no attackers) ===
-        # 7 benign clients, no attackers, no defense (plain FedAvg).  Establishes
-        # the clean ceiling on non-IID Dirichlet(0.5) AG News that all attack /
-        # defense runs on this dataset are compared against.  Because
-        # FedAvgDefense ignores trust_scorer entirely, this baseline is
-        # unaffected by the ongoing HMP-GAE trust-scoring investigation.
-        'experiment_name': 'agnews-(non-iid0.5)-benign-baseline-fedavg-no-attacker(localround=1,seed=42)',
+        # === CURRENT RUN: HMP-GAE robust-trust vs Hallucination on AG News (non-IID 0.5) ===
+        # 7 clients (5 benign + 2 attackers), hmp_gae defense with the robust
+        # trust-scoring stack (mad z-scores, gate_rezscore=False, suspicion
+        # EMA, median semantic reference, stratified probes).  This is arm ①
+        # of the A/B protocol; arm ② overrides the robust keys back to the
+        # legacy values ('std'/True/0.0/'pairwise'/0.75), arms ③/④ set
+        # num_attackers=0 with hmp_gae / fedavg to measure the false-positive
+        # tax against the clean ceiling.
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-robusttrust-hallu(localround=1,seed=42)',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
@@ -1158,11 +1261,28 @@ def main(config_overrides: Optional[Dict] = None):
             # signal that catches geometrically-stealthy hallucination attackers.
             # When >0, the server forwards each client's softmax over a fixed
             # probe set into the runtime; otherwise no probe forward is done.
-            # Raised from 1.0 -> 2.0 for the non-IID Yahoo Answers run: graph
-            # signal is known to degrade in non-IID, so we give more weight to
-            # the output-behavior signal (orthogonal to update geometry).
-            # Effective signal share: sem rises 44% -> 61%; graph drops 44% -> 30%.
             'semantic_weight': 1.0,
+            # Semantic-divergence reference distribution:
+            #   'pairwise' — legacy peer-consensus KL.  Under non-IID,
+            #       legitimately heterogeneous benign clients diverge from
+            #       peers and get penalized, and every benign score is
+            #       inflated by its distance to the attackers (contrast
+            #       compression).
+            #   'median'   — per-sample median consensus (recommended).
+            #       Attackers are a minority so they cannot move the median:
+            #       a benign score reduces to its own heterogeneity bias
+            #       while an attacker score measures systematic wrongness.
+            'semantic_reference': 'median',
+            # Weight each probe sample's divergence by the client's own max
+            # softmax prob ("confidently wrong" counts in full,
+            # "unconfidently different" — the typical non-IID benign — is
+            # discounted).  Off pending ablation.
+            'semantic_confidence_weight': False,
+            # Class-stratified probe sampling (seeded by config['seed']).
+            # Labels are used ONLY to balance the probe set, never in the
+            # scoring, so the semantic signal stays label-free.  False =
+            # legacy head-of-test_loader snapshot (can be class-skewed).
+            'semantic_probe_stratified': True,
             # Historical deviation disabled by default: benign clients learning
             # real features drift more than attackers stuck on a fixed mislabel
             # manifold, which can invert the signal. Re-enable with care.
@@ -1194,7 +1314,41 @@ def main(config_overrides: Optional[Dict] = None):
             #       then FedAvg.  Calibrated for 8B/2A; fragile on other configs.
             #   'softmax': pure softmax of trust logits (concentrates on 1-2 clients).
             'trust_mode': 'soft_reject_fedavg',
-            'reject_z_threshold': 0.75,  # sigmoid midpoint (same scale as hard threshold)
+            # --- Robust suspicion scale (2026-07-04) ---
+            # zscore_mode 'mad': median/MAD z-scores.  mean/std gets polluted
+            #   as the attacker fraction grows (attackers drag the mean toward
+            #   themselves and inflate the std, shrinking their own z); the
+            #   median/MAD of the benign majority stays clean up to ~50%.
+            # zscore_clip: cap |z| so one extreme outlier cannot dominate the
+            #   weighted signal sum (mad-z explodes when the benign spread is
+            #   tiny).
+            # gate_rezscore False: gate on -s / ||w||₂ instead of re-z-scoring
+            #   -s.  The legacy double z-score forced every round onto a ±σ
+            #   scale, so even an all-benign round pushed its most extreme
+            #   client past the threshold — the "scapegoat tax" that shaved
+            #   benign weight (and accuracy) on every clean round.  With it
+            #   off, sus keeps an absolute scale and is divided by the L2
+            #   norm of the active signal weights, so the threshold lives in
+            #   per-signal robust-z units (invariant to weight rescaling and
+            #   signal on/off toggles) and is retuned to 2.5.
+            # sus_ema_beta 0.6: cross-round EMA of the suspicion score.
+            #   Benign clients rotate through the "most extreme this round"
+            #   seat, so their EMA reverts toward 0; attackers are suspicious
+            #   every round, so their EMA stays high.  Detection lag ≈ 2-3
+            #   rounds; 0.0 disables.
+            # Legacy behavior = {'zscore_mode': 'std', 'gate_rezscore': True,
+            #   'sus_ema_beta': 0.0, 'reject_z_threshold': 0.75,
+            #   'semantic_reference': 'pairwise',
+            #   'semantic_probe_stratified': False} — override these six keys
+            #   to reproduce pre-2026-07 runs bit-for-bit.
+            'zscore_mode': 'mad',
+            'zscore_clip': 10.0,
+            'gate_rezscore': False,
+            'sus_ema_beta': 0.6,
+            'reject_z_threshold': 2.5,   # sigmoid midpoint, in per-signal robust-z
+                                         # units (suspicion = -s / ||w||₂); use 0.75
+                                         # when gate_rezscore=True — the two keys
+                                         # must be changed together
             'soft_reject_k': 2.0,        # sigmoid steepness: 2=recommended, 3=near-binary
             'keep_min': 1,
             # --- Cold start ---

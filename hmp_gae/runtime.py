@@ -90,6 +90,31 @@ class HMPGAERuntime:
         self.semantic_weight = float(self.cfg.get("semantic_weight", 0.0))
         self.softmax_tau = float(self.cfg.get("softmax_tau", 0.1))
 
+        # ---- Robust trust scoring (all defaults = pre-existing behavior) ----
+        # zscore_mode: 'std' (classic mean/std, breaks down as attacker
+        #   fraction grows) or 'mad' (median/MAD, robust to <50% attackers).
+        # zscore_clip: symmetric bound on |z| so a single extreme outlier
+        #   cannot dominate the weighted signal sum.
+        self.zscore_mode = str(self.cfg.get("zscore_mode", "std"))
+        _zc = self.cfg.get("zscore_clip", None)
+        self.zscore_clip: Optional[float] = None if _zc is None else float(_zc)
+        # gate_rezscore: True keeps the historical second z-score on the
+        # combined gate (forces every round onto a +-sigma scale -> an
+        # all-benign round always gates its most extreme client). False gates
+        # on -trust.s directly; retune reject_z_threshold (~2.5) with it.
+        self.gate_rezscore = bool(self.cfg.get("gate_rezscore", True))
+        # sus_ema_beta: cross-round EMA on the suspicion score. 0 = off.
+        # Benign clients take turns being the round's extreme value, so their
+        # EMA reverts to ~0; attackers are suspicious every round, so their
+        # EMA stays high. Adds ~1/(1-beta) rounds of detection lag.
+        self.sus_ema_beta = float(self.cfg.get("sus_ema_beta", 0.0))
+        # Semantic-divergence reference: 'pairwise' (historical) or 'median'
+        # (robust per-sample consensus; recommended under non-IID).
+        self.semantic_reference = str(self.cfg.get("semantic_reference", "pairwise"))
+        self.semantic_confidence_weight = bool(
+            self.cfg.get("semantic_confidence_weight", False)
+        )
+
         # Trust-to-weight mapping:
         #   'reject_then_fedavg' (default, recommended for V1): use trust
         #     signals to flag attackers (graph_residual_z > threshold), then
@@ -166,6 +191,9 @@ class HMPGAERuntime:
         # ---- State ---- #
         # z_hist is a per-client EMA buffer of the latent embedding.
         self.z_hist: Dict[int, torch.Tensor] = {}
+        # sus_ema is a per-client EMA of the suspicion score driving the gate
+        # (only maintained when sus_ema_beta > 0).
+        self.sus_ema: Dict[int, float] = {}
 
     # --------------------------------------------------------------------- #
     # Helper: pack updates into a tensor aligned with self.num_clients order #
@@ -195,6 +223,29 @@ class HMPGAERuntime:
                 out[i] = h.to(device=self.device, dtype=torch.float32)
                 any_hist = True
         return out, any_hist
+
+    def _smooth_suspicion(
+        self, client_ids: List[int], sus_raw: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Cross-round EMA of the per-client suspicion score.
+
+        Returns sus_raw unchanged when sus_ema_beta <= 0. Otherwise updates
+        self.sus_ema in place (first observation initializes the EMA) and
+        returns the smoothed vector aligned with client_ids.
+        """
+        beta = self.sus_ema_beta
+        if beta <= 0.0:
+            return sus_raw
+        out = sus_raw.clone()
+        for i, cid in enumerate(client_ids):
+            key = int(cid)
+            cur = float(sus_raw[i].item())
+            prev = self.sus_ema.get(key)
+            smoothed = cur if prev is None else beta * prev + (1.0 - beta) * cur
+            self.sus_ema[key] = smoothed
+            out[i] = smoothed
+        return out
 
     def _update_history(self, client_ids: List[int], Z_new: torch.Tensor) -> None:
         Z_detached = Z_new.detach()
@@ -325,9 +376,27 @@ class HMPGAERuntime:
                 softmax_tau=self.softmax_tau,
                 probe_distributions=probe_arg,
                 semantic_weight=self.semantic_weight,
+                zscore_mode=self.zscore_mode,
+                zscore_clip=self.zscore_clip,
+                semantic_reference=self.semantic_reference,
+                semantic_confidence_weight=self.semantic_confidence_weight,
             )
 
-        # ---- 3b) Map trust signals to aggregation weights ---- #
+        # ---- 3b) Suspicion score + cross-round EMA smoothing ---- #
+        # sus_raw is this round's suspicion (per gate_signal / gate_rezscore);
+        # sus_used is what actually drives the gate: EMA-smoothed when
+        # sus_ema_beta > 0, identical to sus_raw otherwise. Computed before
+        # the trust_mode branch so diagnostics exist for every mode.
+        sus_raw, _ = gate_diagnostics(
+            trust, self.reject_z_threshold, self.soft_reject_k,
+            self.gate_signal,
+            gate_rezscore=self.gate_rezscore,
+            zscore_mode=self.zscore_mode,
+            zscore_clip=self.zscore_clip,
+        )
+        sus_used = self._smooth_suspicion(client_ids, sus_raw)
+
+        # ---- 3c) Map trust signals to aggregation weights ---- #
         ds_tensor = torch.tensor(
             data_sizes, dtype=torch.float32, device=self.device
         )
@@ -359,6 +428,7 @@ class HMPGAERuntime:
                 soft_reject_k=self.soft_reject_k,
                 keep_min=self.keep_min,
                 gate_signal=self.gate_signal,
+                sus_override=sus_used,
             )
             used_mode = f"soft_reject_fedavg[{self.gate_signal}]"
         elif self.trust_mode == "reject_then_fedavg":
@@ -369,6 +439,7 @@ class HMPGAERuntime:
                 reject_z_threshold=self.reject_z_threshold,
                 keep_min=self.keep_min,
                 gate_signal=self.gate_signal,
+                sus_override=sus_used,
             )
             used_mode = f"reject_then_fedavg[{self.gate_signal}]"
         else:
@@ -379,12 +450,14 @@ class HMPGAERuntime:
         # ---- 4) weighted aggregation ---- #
         aggregated = weighted_aggregate(updates_stack, used_alpha)
 
-        # ---- 4b) gate diagnostics (raw sus_z + gate, pre keep_min fallback) ---- #
-        # Computed via the same gate_diagnostics() that reject_soft_weighted uses,
-        # so the logged sus_z/gate match the production aggregation exactly.
-        # sus_z exposes the combined-gate double-z-score; compare against `s`.
+        # ---- 4b) gate diagnostics (sus_z + gate, pre keep_min fallback) ---- #
+        # Computed via the same gate_diagnostics() that reject_soft_weighted uses
+        # (same sus_override), so the logged sus_z/gate match the production
+        # aggregation exactly. sus_z is the gating value (EMA-smoothed when
+        # sus_ema_beta > 0); sus_raw in stats keeps this round's unsmoothed one.
         diag_sus_z, diag_gate = gate_diagnostics(
-            trust, self.reject_z_threshold, self.soft_reject_k, self.gate_signal
+            trust, self.reject_z_threshold, self.soft_reject_k, self.gate_signal,
+            sus_override=sus_used,
         )
 
         # ---- 5) update EMA history ---- #
@@ -419,11 +492,18 @@ class HMPGAERuntime:
             # reconstruct the per-term weighted contributions w_k·z_k.
             "s": trust.s.detach().cpu().tolist(),
             "sus_z": diag_sus_z.detach().cpu().tolist(),
+            "sus_raw": sus_raw.detach().cpu().tolist(),
             "gate": diag_gate.detach().cpu().tolist(),
             "graph_weight": float(self.graph_weight),
             "residual_weight_alpha": float(self.residual_weight_alpha),
             "semantic_weight": float(self.semantic_weight),
             "gate_signal": str(self.gate_signal),
+            # Robust-scoring knobs actually in effect this round (for
+            # post-hoc filtering of mixed-config result sets).
+            "zscore_mode": str(self.zscore_mode),
+            "gate_rezscore": bool(self.gate_rezscore),
+            "sus_ema_beta": float(self.sus_ema_beta),
+            "semantic_reference": str(self.semantic_reference),
             # Phase-gating diagnostics (NEW 2026-05-23):
             #   _configured = what main.py set (static, same every round)
             #   _effective  = what was actually applied this round (=0 once
@@ -468,6 +548,7 @@ class HMPGAERuntime:
             "optim": self.optim.state_dict(),
             "z_hist": {int(k): v.detach().cpu().clone()
                        for k, v in self.z_hist.items()},
+            "sus_ema": {int(k): float(v) for k, v in self.sus_ema.items()},
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
@@ -477,3 +558,6 @@ class HMPGAERuntime:
         self.optim.load_state_dict(state["optim"])
         self.z_hist = {int(k): v.detach().clone()
                        for k, v in (state.get("z_hist") or {}).items()}
+        # Older checkpoints predate sus_ema; default to empty (EMA restarts).
+        self.sus_ema = {int(k): float(v)
+                        for k, v in (state.get("sus_ema") or {}).items()}

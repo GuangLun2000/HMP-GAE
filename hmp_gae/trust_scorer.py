@@ -60,23 +60,81 @@ class TrustResult:
     # benign clients drift more than attackers during real learning).
     hist_dev: torch.Tensor              # (N,)
     hist_dev_z: torch.Tensor            # z-scored hist_dev
+    # L2 norm of the ACTIVE signal weights, sqrt(sum_k w_k^2) over signals
+    # that actually contributed to s. Used by the gate_rezscore=False path to
+    # express the suspicion threshold in per-signal z units, invariant to
+    # rescaling / enabling additional signals (otherwise adding a signal
+    # would silently tighten the same numeric threshold).
+    weight_norm: float = 1.0
 
 
-def _zscore(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _zscore(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    mode: str = "std",
+    clip: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Standardize a 1-D signal across clients.
+
+    mode='std' (default): classic (x - mean) / std. Breaks down as the
+        attacker fraction grows -- attackers pull mean/std toward themselves
+        and their own z-scores back into the benign range.
+    mode='mad': robust (x - median) / (1.4826 * MAD). The median/MAD are
+        computed from the (benign) majority, so attacker z-scores stay large
+        up to a ~50% attacker fraction. When MAD degenerates to 0 (e.g. the
+        coarsely-quantized graph_residual where the benign majority ties
+        exactly), fall back to the std scale rather than dividing by eps --
+        otherwise a single one-quantum deviation would explode to z ~ 1e5.
+
+    clip: optional symmetric bound on |z|. Keeps a genuinely extreme outlier
+        from dominating the weighted signal sum by orders of magnitude.
+    """
     if x.numel() == 0:
         return x
-    mean = x.mean()
-    std = x.std(unbiased=False).clamp(min=eps)
-    return (x - mean) / std
+    m = (mode or "std").lower()
+    if m == "mad":
+        med = x.median()
+        mad = (x - med).abs().median()
+        scale = 1.4826 * mad
+        if float(scale) < eps:
+            scale = x.std(unbiased=False)
+        z = (x - med) / scale.clamp(min=eps)
+    elif m == "std":
+        mean = x.mean()
+        std = x.std(unbiased=False).clamp(min=eps)
+        z = (x - mean) / std
+    else:
+        raise ValueError(f"Unknown zscore mode={mode!r}; expected 'std' or 'mad'")
+    if clip is not None:
+        c = abs(float(clip))
+        z = z.clamp(min=-c, max=c)
+    return z
 
 
-def _semantic_divergence_signal(probe_dists: torch.Tensor) -> torch.Tensor:
+def _semantic_divergence_signal(
+    probe_dists: torch.Tensor,
+    reference: str = "pairwise",
+    confidence_weight: bool = False,
+) -> torch.Tensor:
     """
     Per-client semantic divergence on a fixed probe subset.
 
-    For each probe sample k and each ordered client pair (i, j), compute
-    KL(p_i^k || p_j^k). Symmetrize, average over peers j != i and over the
-    K probe samples, yielding one scalar per client.
+    reference='pairwise' (default): for each probe sample k and each ordered
+        client pair (i, j), compute KL(p_i^k || p_j^k), symmetrize, average
+        over peers j != i and over the K samples. Weakness under non-IID:
+        legitimately heterogeneous benign clients diverge from peers and get
+        penalized, and every benign score is inflated by its distance to the
+        attackers (compressing attacker/benign contrast).
+    reference='median': compare each client to the per-sample per-class
+        median distribution across clients (renormalized). Attackers are a
+        minority so they cannot move the median; a benign score reduces to
+        its own heterogeneity bias while an attacker score measures its
+        systematic wrongness -- larger contrast, robust to <50% attackers.
+
+    confidence_weight: weight each sample's divergence by the client's own
+        max softmax prob. "Confidently wrong" (attacker) counts in full;
+        "unconfidently different" (typical non-IID benign) is discounted.
 
     Honest clients agree per-sample on the correct class -> low divergence.
     Hallucination attackers invert per-sample predictions vs honest peers
@@ -86,7 +144,7 @@ def _semantic_divergence_signal(probe_dists: torch.Tensor) -> torch.Tensor:
         probe_dists: (N, K, C) softmax probabilities. Must be non-negative.
 
     Returns:
-        (N,) mean per-sample symmetric KL to peers.
+        (N,) mean per-sample symmetric KL to the chosen reference.
     """
     if probe_dists.dim() != 3:
         raise ValueError(
@@ -100,15 +158,40 @@ def _semantic_divergence_signal(probe_dists: torch.Tensor) -> torch.Tensor:
     device, dtype = P.device, P.dtype
     if N <= 1 or K == 0:
         return torch.zeros(N, device=device, dtype=dtype)
-    # H_ik = sum_c P[i,k,c] * logP[i,k,c]                       (N, K)
-    # X_ijk = sum_c P[i,k,c] * logP[j,k,c]                      (N, N, K)
-    # KL_ijk = H_ik - X_ijk                                     (N, N, K)
-    H_ik = (P * logP).sum(dim=-1)
-    X = torch.einsum("ikc,jkc->ijk", P, logP)
-    KL = H_ik.unsqueeze(1) - X
-    sym_KL = 0.5 * (KL + KL.transpose(0, 1))
-    mask = 1.0 - torch.eye(N, device=device, dtype=dtype)
-    return (sym_KL * mask.unsqueeze(-1)).sum(dim=(1, 2)) / float((N - 1) * K)
+
+    ref = (reference or "pairwise").lower()
+    if ref == "median":
+        R = P.median(dim=0).values                       # (K, C)
+        R = R.clamp(min=eps)
+        R = R / R.sum(dim=-1, keepdim=True)
+        logR = R.log()
+        # symKL(P_i^k || R^k), per (i, k)
+        kl_pr = (P * (logP - logR.unsqueeze(0))).sum(dim=-1)               # (N, K)
+        kl_rp = (R.unsqueeze(0) * (logR.unsqueeze(0) - logP)).sum(dim=-1)  # (N, K)
+        div_ik = 0.5 * (kl_pr + kl_rp)                                     # (N, K)
+    elif ref == "pairwise":
+        # H_ik = sum_c P[i,k,c] * logP[i,k,c]                       (N, K)
+        # X_ijk = sum_c P[i,k,c] * logP[j,k,c]                      (N, N, K)
+        # KL_ijk = H_ik - X_ijk                                     (N, N, K)
+        H_ik = (P * logP).sum(dim=-1)
+        X = torch.einsum("ikc,jkc->ijk", P, logP)
+        KL = H_ik.unsqueeze(1) - X
+        sym_KL = 0.5 * (KL + KL.transpose(0, 1))
+        mask = 1.0 - torch.eye(N, device=device, dtype=dtype)
+        if not confidence_weight:
+            # Keep the original single-expression reduction bit-for-bit so
+            # pre-existing experiments reproduce exactly.
+            return (sym_KL * mask.unsqueeze(-1)).sum(dim=(1, 2)) / float((N - 1) * K)
+        div_ik = (sym_KL * mask.unsqueeze(-1)).sum(dim=1) / float(N - 1)   # (N, K)
+    else:
+        raise ValueError(
+            f"Unknown semantic reference={reference!r}; expected 'pairwise' or 'median'"
+        )
+
+    if confidence_weight:
+        w = P.max(dim=-1).values                                           # (N, K)
+        return (div_ik * w).sum(dim=1) / w.sum(dim=1).clamp(min=eps)
+    return div_ik.mean(dim=1)
 
 
 def compute_trust_weights(
@@ -123,6 +206,10 @@ def compute_trust_weights(
     min_alpha_clip: float = 1e-6,
     probe_distributions: Optional[torch.Tensor] = None,
     semantic_weight: float = 0.0,
+    zscore_mode: str = "std",
+    zscore_clip: Optional[float] = None,
+    semantic_reference: str = "pairwise",
+    semantic_confidence_weight: bool = False,
 ) -> TrustResult:
     """
     Compute closed-form trust weights for N clients.
@@ -190,7 +277,9 @@ def compute_trust_weights(
         use_sem = False
     else:
         sem_div = _semantic_divergence_signal(
-            probe_distributions.to(device=device, dtype=dtype)
+            probe_distributions.to(device=device, dtype=dtype),
+            reference=semantic_reference,
+            confidence_weight=semantic_confidence_weight,
         )
         use_sem = True
 
@@ -203,10 +292,16 @@ def compute_trust_weights(
         hist_dev = (Z - Z_hist_d).norm(dim=1)
         use_hist = True
 
-    graph_residual_z = _zscore(graph_residual)
-    recon_residual_z = _zscore(recon_residual)
-    sem_div_z = _zscore(sem_div) if use_sem else torch.zeros_like(sem_div)
-    hist_dev_z = _zscore(hist_dev) if use_hist else torch.zeros_like(hist_dev)
+    graph_residual_z = _zscore(graph_residual, mode=zscore_mode, clip=zscore_clip)
+    recon_residual_z = _zscore(recon_residual, mode=zscore_mode, clip=zscore_clip)
+    sem_div_z = (
+        _zscore(sem_div, mode=zscore_mode, clip=zscore_clip)
+        if use_sem else torch.zeros_like(sem_div)
+    )
+    hist_dev_z = (
+        _zscore(hist_dev, mode=zscore_mode, clip=zscore_clip)
+        if use_hist else torch.zeros_like(hist_dev)
+    )
 
     s = -(
         graph_weight * graph_residual_z
@@ -214,6 +309,17 @@ def compute_trust_weights(
         + semantic_weight * sem_div_z
         + hist_weight_beta * hist_dev_z
     )
+
+    # L2 norm of the weights of the signals that actually contributed to s.
+    # The gate_rezscore=False path divides the suspicion score by this so the
+    # rejection threshold is expressed in per-signal z units and stays valid
+    # when signal weights are rescaled or extra signals are switched on.
+    active_sq = float(graph_weight) ** 2 + float(residual_weight_alpha) ** 2
+    if use_sem:
+        active_sq += float(semantic_weight) ** 2
+    if use_hist:
+        active_sq += float(hist_weight_beta) ** 2
+    weight_norm = active_sq ** 0.5 if active_sq > 0.0 else 1.0
 
     tau = max(float(softmax_tau), 1e-4)
     alpha = torch.softmax(s / tau, dim=0)
@@ -231,6 +337,7 @@ def compute_trust_weights(
         sem_div_z=sem_div_z,
         hist_dev=hist_dev,
         hist_dev_z=hist_dev_z,
+        weight_norm=weight_norm,
     )
 
 
@@ -248,15 +355,35 @@ def weighted_aggregate(updates, alpha: torch.Tensor) -> torch.Tensor:
     return (stacked * alpha.view(-1, 1)).sum(dim=0)
 
 
-def _suspicion_signal(trust: "TrustResult", source: str) -> torch.Tensor:
+def _suspicion_signal(
+    trust: "TrustResult",
+    source: str,
+    gate_rezscore: bool = True,
+    zscore_mode: str = "std",
+    zscore_clip: Optional[float] = None,
+) -> torch.Tensor:
     """
     Pick which suspicion signal drives the rejection gate.
 
       'graph'    : use graph_residual_z only (backward-compatible).
                    Robust at cold start; ignores recon and sem_div.
-      'combined' : z-score the full trust logit (-trust.s, since trust.s is
-                   built so that high s = trustworthy). Lets all enabled
-                   signals (graph + recon + semantic + hist) drive the gate.
+      'combined' : the full trust logit (-trust.s, since trust.s is built so
+                   that high s = trustworthy). Lets all enabled signals
+                   (graph + recon + semantic + hist) drive the gate.
+
+    gate_rezscore controls whether combined mode re-z-scores -trust.s:
+      True  (default, backward-compatible): the historical double-z-score.
+            It forces the round's suspicion values onto a +-sigma scale, so
+            even an all-benign round always pushes its most extreme client
+            past a fixed threshold -- the "scapegoat" failure mode.
+      False (recommended): use -trust.s / trust.weight_norm. Each component
+            of s is already z-scored, so the weighted sum carries an absolute
+            scale: an all-benign round stays near 0 and no one gets gated,
+            while attackers land at |sus| >> threshold. Dividing by the L2
+            norm of the active signal weights expresses the threshold in
+            per-signal z units, so it survives weight rescaling and signal
+            on/off toggles. Retune reject_z_threshold (~2.5 in those units)
+            when switching this off.
 
     Combined mode is the right choice once any of recon/semantic/hist
     weights are non-zero, because graph-only gating would silently discard
@@ -265,7 +392,10 @@ def _suspicion_signal(trust: "TrustResult", source: str) -> torch.Tensor:
     src = (source or "graph").lower()
     if src == "combined":
         sus = (-trust.s).detach()
-        return _zscore(sus)
+        if gate_rezscore:
+            return _zscore(sus, mode=zscore_mode, clip=zscore_clip)
+        norm = float(getattr(trust, "weight_norm", 1.0))
+        return sus / max(norm, 1e-6)
     if src != "graph":
         raise ValueError(
             f"Unknown gate_signal={source!r}; expected 'graph' or 'combined'"
@@ -278,21 +408,35 @@ def gate_diagnostics(
     reject_z_threshold: float,
     soft_reject_k: float,
     gate_signal: str,
+    gate_rezscore: bool = True,
+    zscore_mode: str = "std",
+    zscore_clip: Optional[float] = None,
+    sus_override: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Single source of truth for the soft-rejection gate.
 
     Returns (sus_z, gate) where:
-      sus_z = suspicion z-score selected by gate_signal (for 'combined' this is
-              the SECOND z-score: _zscore(-trust.s), folding in all signals).
+      sus_z = suspicion score selected by gate_signal (see _suspicion_signal;
+              with gate_rezscore=True and 'combined' this is the historical
+              SECOND z-score _zscore(-trust.s)).
       gate  = sigmoid(-k * (sus_z - threshold)), the raw multiplicative weight
               BEFORE the keep_min safety fallback.
 
+    sus_override: when given, gate on this precomputed suspicion vector
+    instead of recomputing it from `trust`. The runtime uses this to gate on
+    the cross-round EMA-smoothed suspicion (see HMPGAERuntime) while keeping
+    this function the single place the sigmoid expression lives.
+
     `reject_soft_weighted` calls this so the production aggregation path and the
     diagnostic both compute sus_z/gate from the exact same expression -- no
-    drift. Exposing sus_z lets callers measure the combined-gate double-z-score
-    effect (compare sus_z against -trust.s directly).
+    drift.
     """
-    sus_z = _suspicion_signal(trust, gate_signal)
+    if sus_override is not None:
+        sus_z = sus_override
+    else:
+        sus_z = _suspicion_signal(
+            trust, gate_signal, gate_rezscore, zscore_mode, zscore_clip
+        )
     gate = torch.sigmoid(-soft_reject_k * (sus_z - float(reject_z_threshold)))
     return sus_z, gate
 
@@ -303,6 +447,10 @@ def reject_then_weighted(
     reject_z_threshold: float = 1.0,
     keep_min: int = 1,
     gate_signal: str = "graph",
+    gate_rezscore: bool = True,
+    zscore_mode: str = "std",
+    zscore_clip: Optional[float] = None,
+    sus_override: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Hybrid aggregation: use HMP-GAE trust signals to *detect* attackers,
@@ -323,7 +471,12 @@ def reject_then_weighted(
     dtype = trust.alpha.dtype
     N = trust.alpha.numel()
 
-    gr_z = _suspicion_signal(trust, gate_signal)
+    if sus_override is not None:
+        gr_z = sus_override
+    else:
+        gr_z = _suspicion_signal(
+            trust, gate_signal, gate_rezscore, zscore_mode, zscore_clip
+        )
     mask = gr_z <= float(reject_z_threshold)
 
     if int(mask.sum().item()) < max(1, keep_min):
@@ -350,6 +503,10 @@ def reject_soft_weighted(
     soft_reject_k: float = 2.0,
     keep_min: int = 1,
     gate_signal: str = "graph",
+    gate_rezscore: bool = True,
+    zscore_mode: str = "std",
+    zscore_clip: Optional[float] = None,
+    sus_override: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Soft-rejection variant of reject_then_weighted.
@@ -392,7 +549,11 @@ def reject_soft_weighted(
     N = trust.alpha.numel()
 
     gr_z, gate = gate_diagnostics(
-        trust, reject_z_threshold, soft_reject_k, gate_signal
+        trust, reject_z_threshold, soft_reject_k, gate_signal,
+        gate_rezscore=gate_rezscore,
+        zscore_mode=zscore_mode,
+        zscore_clip=zscore_clip,
+        sus_override=sus_override,
     )
 
     # Safety: if every client's gate is tiny (all look suspicious), fall back
