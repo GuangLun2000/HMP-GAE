@@ -1098,13 +1098,15 @@ def main(config_overrides: Optional[Dict] = None):
         # legacy values ('std'/True/0.0/'pairwise'/0.75), arms ③/④ set
         # num_attackers=0 with hmp_gae / fedavg to measure the false-positive
         # tax against the clean ceiling.
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-robusttrust-hallu(localround=1,seed=42)',
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-robusttrust-hallu(localround=1,seed=42,r50)',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
         'num_clients': 7,    # Total clients: 5 benign, 2 attackers (Y2 config)
-        'num_attackers': 2,  # SMOKE: 2 attackers (C5/C6), exercises HMP-GAE trust path
-        'num_rounds': 10,    # Total federated learning rounds
+        'num_attackers': 2,  # 2 attackers (C5/C6), per-round randomized label-flip
+        'num_rounds': 50,    # 50 × 1 local epoch = the paper regime (~3-4 h on T4).
+                             # Also gives the suspicion EMA (β=0.6, ~2-3 round lag)
+                             # a long steady state; 10-round runs are smoke tests.
 
         # ========== Training Hyperparameters ==========
         'client_lr': 5e-5,   # Learning rate for local client training
@@ -1139,12 +1141,15 @@ def main(config_overrides: Optional[Dict] = None):
         # 'max_length': 128,      # Yahoo Answers: 128, 256 (Q&A text is longer than AG News headlines)
         
         # ========== Data Distribution ==========
-        # For V1 first experiment we use IID to isolate the defense effect from data heterogeneity noise.
-        # Switch to 'non-iid' with dirichlet_alpha in [0.3, 1.0] once baseline numbers are stable.
+        # Current regime: non-IID Dirichlet(0.5) — the setting the robust trust
+        # stack is designed for (median semantic reference tolerates legitimate
+        # benign heterogeneity; see defense_config below).  Switch to 'iid' to
+        # reproduce the earlier IID runs.
         'data_distribution': 'non-iid',  # 'iid' uniform, 'non-iid' Dirichlet-heterogeneous
         'dirichlet_alpha': 0.5,          # Only used when data_distribution='non-iid'. Lower = more heterogeneous.
         # 'dataset_size_limit': None,  # Full dataset: AG News ~120K; IMDB 25K; DBpedia 560K; Yahoo Answers 1.4M
-        'dataset_size_limit': 10000,  # 10K train → ~1428 samples/client (7 clients, IID); test ≤ 1500
+        'dataset_size_limit': 10000,  # 10K train → ~1428 samples/client on average (7 clients;
+                                      # per-client sizes vary under Dirichlet); test ≤ 1500.
                                       # Enough for LoRA convergence on AG News; keeps per-round time ~3-5 min on T4
 
         # ========== Training Mode Configuration ==========
@@ -1213,8 +1218,9 @@ def main(config_overrides: Optional[Dict] = None):
         #   'fedavg'  — standard data-size-weighted FedAvg (no-defense baseline)
         #   'hmp_gae' — HMP-GAE immunization (this paper, requires hmp_gae/ subpackage)
         # Current value is 'hmp_gae': the proposed defense, paired with the
-        # same Hallucination attack / Yahoo Answers data as the FedAvg
-        # no-defense baseline (only this field differs — controlled variable).
+        # Hallucination attack on non-IID AG News.  The FedAvg no-defense
+        # baseline for this dataset keeps every other key identical and flips
+        # only this field (controlled variable).
         'defense_method': 'hmp_gae',
         'defense_config': {
 
