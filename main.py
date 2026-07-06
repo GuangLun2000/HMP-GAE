@@ -1090,17 +1090,17 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: cross-dataset generalization — HMP-GAE robust-trust vs
+        # === CURRENT RUN: attack-damage arm — FedAvg (no defense) vs
         # === Hallucination on Yahoo Answers (non-IID 0.5, 10 classes) ===
-        # Same 7-client / 2-attacker / 50-round regime, the same robust
-        # trust-scoring stack (mad z-scores, gate_rezscore=False, suspicion
-        # EMA, median semantic reference, stratified probes), and the same
-        # max_length=128 as ALL prior runs.  ONLY the dataset block changes:
-        # yahoo_answers / num_labels=10, plus the 10-class pairwise flip_map
-        # and semantic_probe_size=100 (10 per class).
-        # Companion arms for the Yahoo table reuse the same overrides as the
-        # AG News suite: fedavg+attack, fedavg no-attack, baselines+attack.
-        'experiment_name': 'yahoo-(non-iid0.5)-hmpgae-robusttrust-hallu(localround=1,seed=42,r50,len128)',
+        # Identical to the Yahoo robust-trust run in EVERY key except
+        # defense_method ('hmp_gae' -> 'fedavg'): same 7-client / 2-attacker /
+        # 50-round regime, same seed=42, same per-round randomized flip
+        # (ratio in [0.3, 0.8], reseed derived from (client_id, round) so the
+        # attack realization is bit-identical to the defended run), same
+        # max_length=128 and 10K subset.  This is the missing cell that
+        # quantifies raw attack damage: compare against the Yahoo FedAvg
+        # no-attack ceiling (last-10 0.6426) and the defended arms.
+        'experiment_name': 'yahoo-(non-iid0.5)-fedavg-hallu(localround=1,seed=42,r50,len128)',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
@@ -1227,11 +1227,12 @@ def main(config_overrides: Optional[Dict] = None):
         # defense_method selects the server-side aggregation rule.
         #   'fedavg'  — standard data-size-weighted FedAvg (no-defense baseline)
         #   'hmp_gae' — HMP-GAE immunization (this paper, requires hmp_gae/ subpackage)
-        # Current value is 'hmp_gae': the proposed defense, paired with the
-        # Hallucination attack on non-IID AG News.  The FedAvg no-defense
-        # baseline for this dataset keeps every other key identical and flips
-        # only this field (controlled variable).
-        'defense_method': 'hmp_gae',
+        # Current value is 'fedavg': the no-defense-under-attack arm.  The
+        # defense_config block below is inert in this mode (server skips the
+        # probe forward because _needs_probe requires defense_method='hmp_gae')
+        # and is kept unchanged so switching back to the defended arm is a
+        # one-key flip.
+        'defense_method': 'fedavg',
         'defense_config': {
 
             # config for foolsgold
