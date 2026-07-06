@@ -29,6 +29,36 @@ from fed_resume import (
 
 warnings.filterwarnings('ignore')
 
+
+def _preflight_hf_auth(model_name):
+    """Fail fast when the configured backbone is a gated HF repo (e.g.
+    meta-llama/*) and the current session cannot access it, instead of
+    401-ing deep inside AutoTokenizer.from_pretrained after setup starts.
+    Network/offline errors are ignored — the normal download path decides."""
+    try:
+        from huggingface_hub import auth_check, get_token
+        from huggingface_hub.errors import GatedRepoError
+    except ImportError:
+        return
+    try:
+        auth_check(model_name)
+    except GatedRepoError as e:
+        if get_token() is None:
+            hint = ("当前会话没有 HF token（Colab Step 2 未运行或未找到 HF_TOKEN）。\n"
+                    "  1) 在 https://huggingface.co/{m} 接受许可\n"
+                    "  2) 在 https://huggingface.co/settings/tokens 创建 Read token\n"
+                    "  3) Colab 左侧边栏 🔑 Secrets 添加名为 HF_TOKEN 的 secret 并开启 notebook 访问\n"
+                    "  4) 重新运行 Colab Step 2（自动 login），再跑本 cell")
+        else:
+            hint = ("已有 HF token 但无权访问该仓库：请用同一账号在\n"
+                    "  https://huggingface.co/{m} 接受许可（或等待审核通过）后重试")
+        raise RuntimeError(
+            f"'{model_name}' 是 gated 仓库，当前无法访问。\n" + hint.format(m=model_name)
+        ) from e
+    except Exception:
+        return
+
+
 # Initialize experiment components
 def setup_experiment(config):
     # Set random seeds for reproducibility
@@ -49,6 +79,7 @@ def setup_experiment(config):
 
     # 1. Initialize Data Manager
     # dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers' — select dataset; num_labels and max_length must match (see config below)
+    _preflight_hf_auth(config.get('model_name', 'distilbert-base-uncased'))
     data_manager = DataManager(
         num_clients=config['num_clients'],
         num_attackers=config['num_attackers'],
