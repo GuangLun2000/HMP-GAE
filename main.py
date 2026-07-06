@@ -1090,17 +1090,23 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: backbone-swap arm — Llama-3.2-1B replaces
-        # === Qwen2.5-0.5B; everything else mirrors the Yahoo attack-damage
-        # === regime (FedAvg no-defense vs Hallucination, non-IID 0.5) ===
-        # Same 7-client / 2-attacker / 50-round regime, same seed=42, same
-        # per-round randomized flip (ratio in [0.3, 0.8], reseed derived from
-        # (client_id, round)), same max_length=128 and 10K subset.  Only
-        # model_name differs from the Qwen runs, so any accuracy/CSE delta is
-        # attributable to the backbone.  NOTE: meta-llama/* is a GATED repo —
-        # Colab Step 2 handles HF login (needs HF_TOKEN secret + accepted
-        # Llama 3.2 license).
-        'experiment_name': 'yahoo-(non-iid0.5)-fedavg-hallu(localround=1,seed=42,r50,len128)-llama3.2-1b',
+        # === CURRENT RUN: defended arm — HMP-GAE vs HIGH-strength
+        # === Hallucination on AG News (non-IID 0.5, 4 classes),
+        # === Llama-3.2-1B backbone ===
+        # Held fixed vs ALL prior runs (control variables): 7 clients /
+        # 2 attackers / 50 rounds, seed=42, LoRA r=8, batch 32, lr 5e-5,
+        # max_length=128, 10K subset, Dirichlet(0.5), and the per-round
+        # randomized flip CODE PATH (unchanged — only the sampling interval
+        # moved).  Deviations from the previous Yahoo fedavg-llama arm, each
+        # an intentional axis of this run:
+        #   dataset   yahoo_answers -> ag_news              (4 classes)
+        #   defense   fedavg        -> hmp_gae              (defended arm)
+        #   strength  flip_ratio_range [0.3,0.8] -> [0.6,1.0]  (HIGH arm)
+        # For per-knob attribution, the companion cells to run later are
+        # (a) agnews + fedavg at the same HIGH strength (attack damage) and
+        # (b) agnews + hmpgae at DEFAULT strength (strength ablation).
+        # NOTE: meta-llama/* is a GATED repo — Colab Step 2 handles HF login.
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-hallu(localround=1,seed=42,r50,len128,flip0.6-1.0)-llama3.2-1b',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
@@ -1125,9 +1131,9 @@ def main(config_overrides: Optional[Dict] = None):
         # ========== Dataset Configuration ==========
         # Choose dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers' — set num_labels and max_length accordingly
         # Dataset 1: AG News
-        # 'dataset': 'ag_news',  # news classification (4 classes)
-        # 'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
-        # 'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
+        'dataset': 'ag_news',  # news classification (4 classes)
+        'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
+        'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
         # -------------------------------------------
         # Dataset 2: IMDB
         # 'dataset': 'imdb',   # sentiment (2 classes)
@@ -1140,13 +1146,12 @@ def main(config_overrides: Optional[Dict] = None):
         # 'max_length': 512,
         # -------------------------------------------
         # Dataset 4: Yahoo Answers (10 classes, 1.4M train / 60K test)
-        'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
-        'num_labels': 10,       # Yahoo Answers: 10 classes
-        'max_length': 128,      # Kept at 128 for consistency with ALL prior runs (AG News suite
-                                # and earlier Yahoo runs) — same truncation, same wall-clock,
-                                # same T4/A100 memory envelope.  README's 256 recommendation
-                                # trades 2× compute for fuller answer text; revisit only as a
-                                # separate ablation, not inside the cross-dataset comparison.
+        # 'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
+        # 'num_labels': 10,       # Yahoo Answers: 10 classes
+        # 'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
+        #                         # (same truncation / wall-clock / memory envelope; README's
+        #                         # 256 recommendation is a separate ablation, not part of the
+        #                         # cross-dataset comparison).
         
         # ========== Data Distribution ==========
         # Current regime: non-IID Dirichlet(0.5) — the setting the robust trust
@@ -1214,31 +1219,37 @@ def main(config_overrides: Optional[Dict] = None):
         #
         # ======================================================================
         # [ATTACK-STRENGTH BASELINE — snapshot 2026-07-06]
-        # The values below ARE the canonical DEFAULT strength.  All results to
-        # date were produced with exactly this setting; do not change it except
-        # on explicit request for a higher-strength arm.
+        # Canonical DEFAULT strength (all results before 2026-07-06 used this;
+        # do not change except on explicit request):
         #   num_attackers          = 2 of 7 clients (~28.6% malicious)
         #   hallu_flip_mode        = 'random'
         #   hallu_per_round_reseed = True            (non-stationary flips)
         #   hallu_flip_ratio_range = [0.3, 0.8]      (mean effective flip ~0.55)
         #   hallu_flip_ratio       = 0.5             (inert while ratio_range set)
-        # To raise strength when asked, prefer (in order):
-        #   1) hallu_flip_ratio_range -> e.g. [0.6, 1.0] or [0.8, 1.0]
+        # ACTIVE DEVIATION (requested 2026-07-06): hallu_flip_ratio_range is
+        # currently [0.6, 1.0] — the HIGH-strength arm.  Mean flip 0.55 -> 0.80,
+        # floor 0.3 -> 0.6 (no more weak-attack rounds), interval width kept
+        # comparable (0.5 -> 0.4) so per-round non-stationarity is preserved.
+        # Sampling LOGIC untouched — only the interval moved, keeping results
+        # comparable with default-strength runs.
+        # Escalation ladder if HIGH is still too weak:
+        #   1) hallu_flip_ratio_range -> [0.8, 1.0]  (near-frozen full flip)
         #   2) num_attackers -> 3 (3/7 ≈ 43% malicious; keep N=7)
-        # Tag experiment_name for the stronger arm, then restore this baseline.
+        # Restore [0.3, 0.8] when returning to the DEFAULT regime.
         # ======================================================================
         'hallu_flip_ratio': 0.5,                   # used only when hallu_flip_ratio_range is None
         'hallu_flip_mode': 'random',               # 'pairwise' | 'targeted' | 'random'
-        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4, 6: 7, 7: 6, 8: 9, 9: 8},
+        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2},
                                                    # only consumed in flip_mode='pairwise'.
                                                    # Adjacent-pair bijection sized for the ACTIVE
-                                                   # dataset's num_labels (10 = Yahoo Answers);
-                                                   # shrink to {0:1,1:0,2:3,3:2} for AG News.
+                                                   # dataset's num_labels (4 = AG News); expand to
+                                                   # {0:1,1:0,...,8:9,9:8} for Yahoo Answers.
         'hallu_target_class': None,                # only for flip_mode='targeted'
         'hallu_attack_start_round': 0,
         'hallu_per_round_reseed': True,            # re-sample flipped-label set each round
-        'hallu_flip_ratio_range': [0.3, 0.8],      # per-round flip_ratio sampled uniformly here
-                                                   # (set to None to use the scalar hallu_flip_ratio)
+        'hallu_flip_ratio_range': [0.6, 1.0],      # HIGH-strength arm — DEFAULT is [0.3, 0.8],
+                                                   # see baseline block above.  Per-round flip_ratio
+                                                   # sampled uniformly here (None -> scalar hallu_flip_ratio)
 
         # ---- Classical Byzantine baselines (kept for V2 comparison) ----
         'sign_flip_scale': 10.0,                 # ICML '18: malicious = -scale * g_own
@@ -1252,12 +1263,12 @@ def main(config_overrides: Optional[Dict] = None):
         # defense_method selects the server-side aggregation rule.
         #   'fedavg'  — standard data-size-weighted FedAvg (no-defense baseline)
         #   'hmp_gae' — HMP-GAE immunization (this paper, requires hmp_gae/ subpackage)
-        # Current value is 'fedavg': the no-defense-under-attack arm.  The
-        # defense_config block below is inert in this mode (server skips the
-        # probe forward because _needs_probe requires defense_method='hmp_gae')
-        # and is kept unchanged so switching back to the defended arm is a
-        # one-key flip.
-        'defense_method': 'fedavg',
+        # Current value is 'hmp_gae': the defended arm.  The full defense_config
+        # below is LIVE, including the per-round per-client semantic probe
+        # forward (semantic_weight=1.0 -> gate_signal auto-stays 'combined').
+        # Switch to 'fedavg' for the no-defense attack-damage companion cell;
+        # the block below then goes inert (one-key flip, nothing else to touch).
+        'defense_method': 'hmp_gae',
         'defense_config': {
 
             # config for foolsgold
@@ -1404,9 +1415,10 @@ def main(config_overrides: Optional[Dict] = None):
         },
         # Probe-set size for the semantic-divergence signal (top-level key: the
         # server owns the probe batches; defense_config.semantic_probe_stratified
-        # controls HOW they are sampled).  100 → 10 per class under stratified
-        # sampling on Yahoo's 10 classes (the old default 64 left only 6-7 per
-        # class).  Per-round cost is 7 clients × 100 short forwards — negligible.
+        # controls HOW they are sampled).  100 → 25 per class under stratified
+        # sampling on AG News's 4 classes (10/class on Yahoo's 10; the old
+        # default 64 left only 6-7).  Per-round cost is 7 clients × 100 short
+        # forwards — negligible.
         'semantic_probe_size': 100,
 
         # ========== Hallucination Evaluation (V2 M7) ==========
