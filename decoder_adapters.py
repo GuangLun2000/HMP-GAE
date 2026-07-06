@@ -95,9 +95,47 @@ class Qwen2Adapter(DecoderAdapter):
         causal_lm.load_state_dict(to_load, strict=False)
 
 
+class LlamaAdapter(DecoderAdapter):
+    """Llama-family sequence-classification -> causal LM (shared ``model.*`` backbone).
+
+    Covers meta-llama/Llama-3.2-*, TinyLlama, Sheared-LLaMA, MobileLLaMA — any HF id
+    containing "llama".  Same state-dict layout as Qwen2 (``model.*`` prefix).
+    Tied embeddings (e.g. Llama-3.2-1B) are handled implicitly: transferring
+    ``model.embed_tokens.weight`` updates the tied ``lm_head`` as well.
+    """
+
+    @staticmethod
+    def matches(model_name: str) -> bool:
+        m = (model_name or "").lower()
+        return "llama" in m
+
+    def transfer_backbone(self, seq_cls_inner: nn.Module, causal_lm: nn.Module) -> None:
+        inner = seq_cls_inner
+        if hasattr(inner, "merge_and_unload"):
+            inner = inner.merge_and_unload()
+
+        src_sd = inner.state_dict()
+        dst_sd = causal_lm.state_dict()
+        to_load = {}
+        for k, v in src_sd.items():
+            if not k.startswith("model."):
+                continue
+            if k not in dst_sd or dst_sd[k].shape != v.shape:
+                continue
+            to_load[k] = v.to(device=dst_sd[k].device, dtype=dst_sd[k].dtype)
+
+        if not to_load:
+            raise RuntimeError(
+                "LlamaAdapter: no model.* keys matched between SeqCLS and CausalLM. "
+                "Check model_name and transformers versions."
+            )
+        causal_lm.load_state_dict(to_load, strict=False)
+
+
 # Registry: first match wins (order matters for overlapping patterns).
 ADAPTER_REGISTRY: List[Type[DecoderAdapter]] = [
     Qwen2Adapter,
+    LlamaAdapter,
     PythiaNeoXAdapter,
 ]
 

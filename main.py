@@ -1090,17 +1090,17 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: attack-damage arm — FedAvg (no defense) vs
-        # === Hallucination on Yahoo Answers (non-IID 0.5, 10 classes) ===
-        # Identical to the Yahoo robust-trust run in EVERY key except
-        # defense_method ('hmp_gae' -> 'fedavg'): same 7-client / 2-attacker /
-        # 50-round regime, same seed=42, same per-round randomized flip
-        # (ratio in [0.3, 0.8], reseed derived from (client_id, round) so the
-        # attack realization is bit-identical to the defended run), same
-        # max_length=128 and 10K subset.  This is the missing cell that
-        # quantifies raw attack damage: compare against the Yahoo FedAvg
-        # no-attack ceiling (last-10 0.6426) and the defended arms.
-        'experiment_name': 'yahoo-(non-iid0.5)-fedavg-hallu(localround=1,seed=42,r50,len128)',
+        # === CURRENT RUN: backbone-swap arm — Llama-3.2-1B replaces
+        # === Qwen2.5-0.5B; everything else mirrors the Yahoo attack-damage
+        # === regime (FedAvg no-defense vs Hallucination, non-IID 0.5) ===
+        # Same 7-client / 2-attacker / 50-round regime, same seed=42, same
+        # per-round randomized flip (ratio in [0.3, 0.8], reseed derived from
+        # (client_id, round)), same max_length=128 and 10K subset.  Only
+        # model_name differs from the Qwen runs, so any accuracy/CSE delta is
+        # attributable to the backbone.  NOTE: meta-llama/* is a GATED repo —
+        # Colab Step 2 handles HF login (needs HF_TOKEN secret + accepted
+        # Llama 3.2 license).
+        'experiment_name': 'yahoo-(non-iid0.5)-fedavg-hallu(localround=1,seed=42,r50,len128)-llama3.2-1b',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
@@ -1113,11 +1113,13 @@ def main(config_overrides: Optional[Dict] = None):
         # ========== Training Hyperparameters ==========
         'client_lr': 5e-5,   # Learning rate for local client training
         'server_lr': 1.0,    # Server aggregation lr (fixed at 1.0 for standard FedAvg aggregation)
-        'batch_size': 32,    # 32 is safe for T4 15GB with Qwen2.5-0.5B + seq_len=128; raise to 64 on A100
+        'batch_size': 32,    # Kept at 32 for comparability with all prior runs.  With
+                             # Llama-3.2-1B (fp32) this requires an A100; a T4 15GB cannot
+                             # hold the ~3 GPU-resident 5GB copies regardless of batch size.
         'test_batch_size': 64,   # Inference uses less VRAM; 64 is safe
         'local_epochs': 1,   # 1 epoch per round: 50 rounds × 1 epoch sufficient for LoRA convergence
                              # and keeps total wall-clock time manageable (~3-4 h on T4)
-        'grad_clip_norm': 1.0,  # Qwen2.5-0.5B is typically stable at 1.0; reduce to 0.5 if NaN
+        'grad_clip_norm': 1.0,  # Qwen2.5 / Llama-3.2 are typically stable at 1.0; reduce to 0.5 if NaN
         'alpha': 0.0,  # FedProx μ: 0 = standard FedAvg local step; >0 penalises local drift from global
         
         # ========== Dataset Configuration ==========
@@ -1177,7 +1179,14 @@ def main(config_overrides: Optional[Dict] = None):
         # 'model_name': 'gpt2',                      # GPT-2 124M — stable decoder baseline
         # 'model_name': 'EleutherAI/pythia-160m',    # Pythia-160M (may need grad_clip_norm=0.5)
         # 'model_name': 'facebook/opt-125m',         # OPT-125M (Meta)
-        'model_name': 'Qwen/Qwen2.5-0.5B',  # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning
+        # 'model_name': 'Qwen/Qwen2.5-0.5B',         # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning
+        'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
+                                                  # GATED repo: accept the Llama 3.2 license on HF and provide
+                                                  # HF_TOKEN (Colab Step 2 logs in automatically).
+                                                  # LoRA targets auto-resolve via the "llama" branch in models.py
+                                                  # (q/k/v/o_proj, same as Qwen2); PPL eval uses LlamaAdapter in
+                                                  # decoder_adapters.py.  fp32 footprint ~5GB/copy: fine on A100
+                                                  # (peak ~3 GPU-resident copies ≈ 15GB), does NOT fit a T4 15GB.
         # num_labels and max_length: set above in Dataset Configuration based on chosen dataset
         
 
@@ -1202,6 +1211,22 @@ def main(config_overrides: Optional[Dict] = None):
         # gradients, so attacker CSE / local_acc oscillate across rounds instead of
         # smoothly converging.  Set hallu_per_round_reseed=False to recover the
         # original frozen-100%-flip behaviour from the earlier experiments.
+        #
+        # ======================================================================
+        # [ATTACK-STRENGTH BASELINE — snapshot 2026-07-06]
+        # The values below ARE the canonical DEFAULT strength.  All results to
+        # date were produced with exactly this setting; do not change it except
+        # on explicit request for a higher-strength arm.
+        #   num_attackers          = 2 of 7 clients (~28.6% malicious)
+        #   hallu_flip_mode        = 'random'
+        #   hallu_per_round_reseed = True            (non-stationary flips)
+        #   hallu_flip_ratio_range = [0.3, 0.8]      (mean effective flip ~0.55)
+        #   hallu_flip_ratio       = 0.5             (inert while ratio_range set)
+        # To raise strength when asked, prefer (in order):
+        #   1) hallu_flip_ratio_range -> e.g. [0.6, 1.0] or [0.8, 1.0]
+        #   2) num_attackers -> 3 (3/7 ≈ 43% malicious; keep N=7)
+        # Tag experiment_name for the stronger arm, then restore this baseline.
+        # ======================================================================
         'hallu_flip_ratio': 0.5,                   # used only when hallu_flip_ratio_range is None
         'hallu_flip_mode': 'random',               # 'pairwise' | 'targeted' | 'random'
         'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4, 6: 7, 7: 6, 8: 9, 9: 8},
