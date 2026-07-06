@@ -36,22 +36,43 @@ def _preflight_hf_auth(model_name):
     401-ing deep inside AutoTokenizer.from_pretrained after setup starts.
     Network/offline errors are ignored — the normal download path decides."""
     try:
-        from huggingface_hub import auth_check, get_token
+        from huggingface_hub import auth_check, get_token, login
         from huggingface_hub.errors import GatedRepoError
     except ImportError:
         return
+
+    # Colab fallback: if Step 2 wasn't run (or the runtime restarted and wiped
+    # the login), pull HF_TOKEN from Colab Secrets here so this cell is
+    # self-sufficient. Records the failure reason for the error message below.
+    colab_secret_err = None
+    if get_token() is None:
+        try:
+            from google.colab import userdata
+        except ImportError:
+            pass
+        else:
+            try:
+                login(token=userdata.get("HF_TOKEN"))
+                print("HF login OK（自动从 Colab Secrets 读取 HF_TOKEN）")
+            except Exception as err:
+                colab_secret_err = f"{type(err).__name__}: {err}"
+
     try:
         auth_check(model_name)
     except GatedRepoError as e:
         if get_token() is None:
-            hint = ("当前会话没有 HF token（Colab Step 2 未运行或未找到 HF_TOKEN）。\n"
+            hint = ("当前会话没有 HF token。\n"
                     "  1) 在 https://huggingface.co/{m} 接受许可\n"
                     "  2) 在 https://huggingface.co/settings/tokens 创建 Read token\n"
-                    "  3) Colab 左侧边栏 🔑 Secrets 添加名为 HF_TOKEN 的 secret 并开启 notebook 访问\n"
-                    "  4) 重新运行 Colab Step 2（自动 login），再跑本 cell")
+                    "  3) **Colab** 左侧边栏 🔑 Secrets（不是 GitHub 的 Secrets）添加名为\n"
+                    "     HF_TOKEN 的 secret（全大写），并打开 'Notebook access' 开关\n"
+                    "  4) 重新运行本 cell")
+            if colab_secret_err:
+                hint += f"\n  [从 Colab Secrets 读取失败，原因: {colab_secret_err}]"
         else:
             hint = ("已有 HF token 但无权访问该仓库：请用同一账号在\n"
-                    "  https://huggingface.co/{m} 接受许可（或等待审核通过）后重试")
+                    "  https://huggingface.co/{m} 接受许可（或等待审核通过）后重试；\n"
+                    "  若是 fine-grained token，确认已勾选 gated repo 读取权限")
         raise RuntimeError(
             f"'{model_name}' 是 gated 仓库，当前无法访问。\n" + hint.format(m=model_name)
         ) from e
