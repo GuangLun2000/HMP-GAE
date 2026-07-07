@@ -31,6 +31,16 @@ class NewsDataset(Dataset):
         # compatibility but is unused in the current codebase (grep confirmed).
         self.include_target_mask = include_target_mask
 
+        # Empty dataset (e.g. DataManager.get_empty_loader() for data-agnostic
+        # attackers like AugMP): build zero-row tensors directly. Calling the
+        # fast tokenizer on an empty list raises IndexError on newer
+        # transformers (tokens_and_encodings[0][0]), so short-circuit it.
+        if len(texts) == 0:
+            self._input_ids = torch.empty((0, max_length), dtype=torch.long)
+            self._attention_mask = torch.empty((0, max_length), dtype=torch.long)
+            self._labels = torch.empty((0,), dtype=torch.long)
+            return
+
         # Batch tokenize once. Same args as the old per-item call, so the
         # produced input_ids / attention_mask are identical.
         encoding = tokenizer(
