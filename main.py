@@ -1233,7 +1233,7 @@ def main(config_overrides: Optional[Dict] = None):
         # (a) agnews + fedavg at the same HIGH strength (attack damage) and
         # (b) agnews + hmpgae at DEFAULT strength (strength ablation).
         # NOTE: meta-llama/* is a GATED repo — Colab Step 2 handles HF login.
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-augmp(localround=1,seed=42,r50,len128,psteps30)-llama3.2-1b',
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
@@ -1328,7 +1328,7 @@ def main(config_overrides: Optional[Dict] = None):
         # proposed per-round randomized label-flipping attack. Switch to
         # 'NoAttack' (with num_attackers=0) for the clean ceiling, or to one
         # of the classical-baseline strings for V2 comparison runs.
-        'attack_method': 'AugMP',
+        'attack_method': 'Hallucination',
         'attack_start_round': None,  # None = attack active from round 0 (default)
 
         # ---- Hallucination (label-flipping, this paper's attacker) ----
@@ -1353,16 +1353,11 @@ def main(config_overrides: Optional[Dict] = None):
         #   hallu_per_round_reseed = True            (non-stationary flips)
         #   hallu_flip_ratio_range = [0.3, 0.8]      (mean effective flip ~0.55)
         #   hallu_flip_ratio       = 0.5             (inert while ratio_range set)
-        # ACTIVE DEVIATION (requested 2026-07-06): hallu_flip_ratio_range is
-        # currently [0.6, 1.0] — the HIGH-strength arm.  Mean flip 0.55 -> 0.80,
-        # floor 0.3 -> 0.6 (no more weak-attack rounds), interval width kept
-        # comparable (0.5 -> 0.4) so per-round non-stationarity is preserved.
-        # Sampling LOGIC untouched — only the interval moved, keeping results
-        # comparable with default-strength runs.
-        # Escalation ladder if HIGH is still too weak:
-        #   1) hallu_flip_ratio_range -> [0.8, 1.0]  (near-frozen full flip)
-        #   2) num_attackers -> 3 (3/7 ≈ 43% malicious; keep N=7)
-        # Restore [0.3, 0.8] when returning to the DEFAULT regime.
+        # CURRENTLY at DEFAULT strength [0.3, 0.8] (restored 2026-07-07).
+        # Escalation ladder if the attack proves too weak:
+        #   1) hallu_flip_ratio_range -> [0.6, 1.0]  (HIGH-strength arm)
+        #   2) hallu_flip_ratio_range -> [0.8, 1.0]  (near-frozen full flip)
+        #   3) num_attackers -> 3 (3/7 ≈ 43% malicious; keep N=7)
         # ======================================================================
         'hallu_flip_ratio': 0.5,                   # used only when hallu_flip_ratio_range is None
         'hallu_flip_mode': 'random',               # 'pairwise' | 'targeted' | 'random'
@@ -1374,9 +1369,9 @@ def main(config_overrides: Optional[Dict] = None):
         'hallu_target_class': None,                # only for flip_mode='targeted'
         'hallu_attack_start_round': 0,
         'hallu_per_round_reseed': True,            # re-sample flipped-label set each round
-        'hallu_flip_ratio_range': [0.6, 1.0],      # HIGH-strength arm — DEFAULT is [0.3, 0.8],
-                                                   # see baseline block above.  Per-round flip_ratio
-                                                   # sampled uniformly here (None -> scalar hallu_flip_ratio)
+        'hallu_flip_ratio_range': [0.3, 0.8],      # DEFAULT strength (mean effective flip ~0.55).
+                                                   # Per-round flip_ratio sampled uniformly here
+                                                   # (None -> scalar hallu_flip_ratio)
 
         # ---- Classical Byzantine baselines (kept for V2 comparison) ----
         'sign_flip_scale': 10.0,                 # ICML '18: malicious = -scale * g_own
