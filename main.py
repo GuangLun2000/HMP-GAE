@@ -1233,7 +1233,7 @@ def main(config_overrides: Optional[Dict] = None):
         # (a) agnews + fedavg at the same HIGH strength (attack damage) and
         # (b) agnews + hmpgae at DEFAULT strength (strength ablation).
         # NOTE: meta-llama/* is a GATED repo — Colab Step 2 handles HF login.
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-hallu(localround=1,seed=42,r50,len128,flip0.6-1.0)-llama3.2-1b',
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-augmp(localround=1,seed=42,r50,len128,psteps30)-llama3.2-1b',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
@@ -1328,7 +1328,7 @@ def main(config_overrides: Optional[Dict] = None):
         # proposed per-round randomized label-flipping attack. Switch to
         # 'NoAttack' (with num_attackers=0) for the clean ceiling, or to one
         # of the classical-baseline strings for V2 comparison runs.
-        'attack_method': 'Hallucination',
+        'attack_method': 'AugMP',
         'attack_start_round': None,  # None = attack active from round 0 (default)
 
         # ---- Hallucination (label-flipping, this paper's attacker) ----
