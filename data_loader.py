@@ -385,15 +385,50 @@ class DataManager:
 
     def get_proxy_eval_loader(self, sample_size: int = 128) -> DataLoader:
         """
-        Small clean proxy set for attacker-side F(w'_g) estimation.
-        Uses a deterministic subset of the test set (no label flips).
+        Small clean proxy set for the (omniscient) AugMP attacker's F(w'_g)
+        estimation.
+
+        Fairness (critical): the proxy is drawn from the TRAINING distribution
+        (``self.train_texts``), NEVER from the test set. The attacker must not
+        be able to optimise its malicious direction against the exact samples
+        used to report clean accuracy / PPL, so the proxy pool is disjoint from
+        the evaluation set by construction. This matches the standard FL threat
+        model where a participant holds a small clean dataset (cf. FLTrust's
+        server root set) and keeps the reported metrics honest.
+
+        The selection is deterministic (dedicated seed) and class-stratified for
+        a balanced loss estimate. Only AugMP attackers call this method, and it
+        does not touch ``train_texts`` or the client partition, so existing
+        (Hallucination / fedavg / baseline) experiments are unaffected.
         """
-        if not self.test_texts:
+        if not self.train_texts:
             return self.get_empty_loader()
-        rng = np.random.default_rng(self.test_seed)
-        idx = rng.choice(len(self.test_texts), size=min(sample_size, len(self.test_texts)), replace=False)
-        proxy_texts = [self.test_texts[i] for i in idx]
-        proxy_labels = [self.test_labels[i] for i in idx]
+        # Dedicated seed offset so the proxy selection is independent of the
+        # test-sampling / partition RNGs and reproducible across runs.
+        rng = np.random.default_rng(int(self.test_seed) + 90007)
+        n_train = len(self.train_texts)
+        target = min(int(sample_size), n_train)
+        labels_arr = np.asarray(self.train_labels)
+        classes = np.unique(labels_arr)
+        # Class-stratified quota (balanced proxy -> less biased F(w'_g) estimate).
+        per_class = max(1, target // max(1, len(classes)))
+        chosen: List[int] = []
+        for c in classes:
+            c_idx = np.where(labels_arr == c)[0]
+            take = min(per_class, len(c_idx))
+            if take > 0:
+                chosen.extend(rng.choice(c_idx, size=take, replace=False).tolist())
+        # Top up to `target` from the remaining pool if stratified quota fell short.
+        if len(chosen) < target:
+            remaining = np.setdiff1d(np.arange(n_train), np.asarray(chosen, dtype=int))
+            if len(remaining) > 0:
+                extra = rng.choice(
+                    remaining, size=min(target - len(chosen), len(remaining)), replace=False
+                )
+                chosen.extend(extra.tolist())
+        chosen = sorted(chosen)
+        proxy_texts = [self.train_texts[i] for i in chosen]
+        proxy_labels = [self.train_labels[i] for i in chosen]
         dataset = NewsDataset(proxy_texts, proxy_labels, self.tokenizer, max_length=self.max_length)
         return DataLoader(dataset, batch_size=self.test_batch_size, shuffle=False)
 

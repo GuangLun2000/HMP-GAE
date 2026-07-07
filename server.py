@@ -583,10 +583,26 @@ class Server:
               f"per-class counts={per_class} (seed={self.semantic_probe_seed})")
         return batches
 
-    def evaluate_local_probe_distribution(self, client) -> torch.Tensor:
+    def evaluate_local_probe_distribution(self, client, flat_params: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward the client's local model over a fixed probe subset and return
-        the per-sample softmax probabilities.
+        Forward a client's local model over a fixed probe subset and return the
+        per-sample softmax probabilities (the behavioral-fingerprint / semantic
+        trust signal).
+
+        Args:
+            client: the client whose contribution is being probed.
+            flat_params: optional explicit trainable-flat params to evaluate. When
+                provided, the probe forwards ``w_global + Delta_i`` (the update the
+                client actually SUBMITTED) instead of ``client.model``. This is the
+                principled definition of the signal -- it measures the behavior of
+                each client's contribution. For honest / label-flip attackers the
+                two are numerically identical (client.model == w_global + Delta_i
+                after local_train, so results are unchanged to float precision).
+                For update-forging attackers that do NOT locally train (e.g. AugMP,
+                whose client.model stays == w_global while the malice lives only in
+                the crafted Delta), ``client.model`` would look perfectly benign;
+                passing w_global + Delta_i lets the semantic signal actually see the
+                submitted attack. When None, falls back to ``client.model`` (legacy).
 
         Returns:
             (K, C) tensor on CPU, where K = number of probe samples actually
@@ -596,7 +612,7 @@ class Server:
         Uses the shared GPU-resident self._eval_model (see evaluate_local_metrics).
         """
         batches = self._ensure_probe_batches()
-        flat = client.model.get_flat_params()
+        flat = client.model.get_flat_params() if flat_params is None else flat_params
         self._eval_model.set_flat_params(flat)
         self._eval_model.eval()
         rows: List[torch.Tensor] = []
@@ -719,6 +735,38 @@ class Server:
         print("📡 Broadcasting the global model...")
         self.broadcast_model()
 
+        # Phase 0.5: Constrained-attacker setup (only for update-forging attackers
+        # that advertise crafts_update, i.e. AugMP). Hands each such attacker the
+        # current global params + constraint bounds so it can build the global-loss
+        # proxy F(w'_g) and the distance/cosine-similarity constraints inside
+        # camouflage_update. This whole block is SKIPPED for every existing run
+        # (benign / hallucination / alie / gaussian / sign_flipping), so their code
+        # path is byte-for-byte unchanged. dist_bound / sim_bound_* are read via
+        # getattr (default None = auto-derive from benign statistics); main.py sets
+        # them on the server only for attack_method='AugMP'.
+        needs_constraint_setup = any(getattr(c, 'crafts_update', False) for c in self.clients)
+        if needs_constraint_setup:
+            global_params = self.global_model.get_flat_params()
+            total_data_size = 0.0
+            benign_data_sizes: Dict[int, float] = {}
+            for client in self.clients:
+                if getattr(client, 'is_attacker', False):
+                    total_data_size += float(getattr(client, 'claimed_data_size', 1.0))
+                else:
+                    client_data_size = len(getattr(client, 'data_indices', [])) or 1.0
+                    benign_data_sizes[client.client_id] = client_data_size
+                    total_data_size += client_data_size
+            for client in self.clients:
+                if getattr(client, 'is_attacker', False):
+                    client.set_global_model_params(global_params)
+                    client.set_constraint_params(
+                        dist_bound=getattr(self, 'dist_bound', None),
+                        sim_bound_low=getattr(self, 'sim_bound_low', None),
+                        sim_bound_up=getattr(self, 'sim_bound_up', None),
+                        total_data_size=total_data_size,
+                        benign_data_sizes=benign_data_sizes,
+                    )
+
         # Phase 1: Preparation
         print("\n🔧 Phase 1: Client Preparation")
         for client in self.clients:
@@ -789,12 +837,35 @@ class Server:
         # trust signal. Only computed when the active defense actually consumes it.
         probe_tensor: Optional[torch.Tensor] = None
         if self._needs_probe:
+            # Semantic signal. For every ordinary client (benign, and attackers that
+            # bake their poison into local training such as Hallucination) we probe
+            # client.model EXACTLY as before -- byte-for-byte identical to pre-AugMP
+            # behaviour. Only for update-forging attackers (crafts_update, i.e. AugMP,
+            # whose client.model stays == w_global while the malice lives in the
+            # crafted Delta) do we instead probe w_global + Delta_i, so the semantic
+            # signal can actually see the submitted attack. self.global_model is still
+            # the round-start global here (Phase 4 aggregation happens below).
+            global_flat = None
             probe_rows: List[torch.Tensor] = []
             for cid in sorted_client_ids:
                 client = self.client_dict.get(cid)
                 if client is None:
                     raise KeyError(f"client_id {cid} not registered with server")
-                probe_rows.append(self.evaluate_local_probe_distribution(client))
+                if getattr(client, 'crafts_update', False):
+                    if global_flat is None:
+                        global_flat = self.global_model.get_flat_params()
+                        if global_flat.device.type == "cuda":
+                            global_flat = global_flat.cpu()
+                    submitted = final_updates[cid]
+                    if submitted.device.type == "cuda":
+                        submitted = submitted.cpu()
+                    probe_rows.append(
+                        self.evaluate_local_probe_distribution(
+                            client, flat_params=global_flat + submitted
+                        )
+                    )
+                else:
+                    probe_rows.append(self.evaluate_local_probe_distribution(client))
             # All rows must have identical shape (K, C) -- same probe set, same head.
             probe_tensor = torch.stack(probe_rows, dim=0)  # (N, K, C)
 

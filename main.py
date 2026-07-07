@@ -275,6 +275,15 @@ def setup_experiment(config):
     num_attackers = config.get('num_attackers', 0)  # Allow 0 attackers for baseline experiment
     attack_method = config.get('attack_method', 'Hallucination')
 
+    # AugMP constraint bounds live on the server (server Phase 0.5 forwards them to
+    # each attacker via set_constraint_params). None = auto-derive from benign-update
+    # statistics inside the attacker (recommended). Set only for AugMP so no other
+    # run's server state changes.
+    if attack_method == 'AugMP':
+        server.dist_bound = config.get('dist_bound', None)
+        server.sim_bound_low = config.get('sim_bound_low', None)
+        server.sim_bound_up = config.get('sim_bound_up', None)
+
     # 'NoAttack' is a first-class no-op: it forces every client to be benign even
     # when num_attackers>0, so the (num_attackers=2, attack_method='NoAttack')
     # combo from notebook overrides doesn't fall through the attacker dispatch.
@@ -430,10 +439,76 @@ def setup_experiment(config):
                     grad_clip_norm=config.get('grad_clip_norm', 1.0),
                     gaussian_std_scale=gaussian_std_scale
                 )
+            elif attack_method == 'AugMP':
+                # ========== AugMP (learned VGAE + GSP model-manipulation, stealth baseline) ==========
+                # Data-agnostic / omniscient attacker: performs NO local training
+                # (local_train returns zero); the malicious update is CONSTRUCTED in
+                # camouflage_update from the received benign updates via VGAE + GSP +
+                # Lagrangian constrained proxy optimisation. F(w'_g) is estimated on an
+                # INDEPENDENT clean proxy set (data_manager.get_proxy_eval_loader draws
+                # from the TRAIN distribution, disjoint from the test set). See
+                # attack/augmp.py. Server Phase 0.5 hands it global params + constraint
+                # bounds; Phase 3 drives receive_benign_updates -> camouflage_update.
+                from attack.augmp import AttackerClient
+                print(f"  Client {client_id}: ATTACKER (AugMP - VGAE model manipulation)")
+                print(f"    Claimed data size D'_j(t): {claimed_data_size} (matches assigned data)")
+                use_proxy = config.get('attacker_use_proxy_data', True)
+                if not use_proxy:
+                    print(f"    Proxy data disabled (attacker_use_proxy_data=False); constraint-only optimisation.")
+                client = AttackerClient(
+                    client_id=client_id,
+                    model=global_model,
+                    data_manager=data_manager,
+                    data_indices=client_indices[client_id],
+                    lr=config['client_lr'],
+                    local_epochs=config['local_epochs'],
+                    alpha=config['alpha'],
+                    dim_reduction_size=config.get('dim_reduction_size', 1000),
+                    vgae_epochs=config.get('vgae_epochs', 20),
+                    vgae_lr=config.get('vgae_lr', 0.01),
+                    graph_threshold=config.get('graph_threshold', 0.5),
+                    proxy_step=config.get('proxy_step', 0.001),
+                    claimed_data_size=claimed_data_size,
+                    proxy_sample_size=config.get('proxy_sample_size', 128),
+                    proxy_max_batches_opt=config.get('proxy_max_batches_opt', 1),
+                    proxy_max_batches_eval=config.get('proxy_max_batches_eval', 1),
+                    vgae_hidden_dim=config.get('vgae_hidden_dim', 32),
+                    vgae_latent_dim=config.get('vgae_latent_dim', 16),
+                    vgae_dropout=config.get('vgae_dropout', 0.0),
+                    vgae_kl_weight=config.get('vgae_kl_weight', 0.1),
+                    proxy_steps=config.get('proxy_steps', 30),
+                    grad_clip_norm=config.get('grad_clip_norm', 1.0),
+                    proxy_grad_clip_norm=config.get('attacker_proxy_grad_clip_norm', 1.0),
+                    early_stop_constraint_stability_steps=config.get('early_stop_constraint_stability_steps', 2),
+                    use_proxy_data=use_proxy,
+                )
+                # Lagrangian dual + (optional) augmented Lagrangian constraint wiring.
+                if config.get('use_lagrangian_dual', False):
+                    client.set_lagrangian_params(
+                        use_lagrangian_dual=config['use_lagrangian_dual'],
+                        lambda_dist_init=config.get('lambda_dist_init', 0.1),
+                        lambda_dist_lr=config.get('lambda_dist_lr', 0.01),
+                        use_cosine_similarity_constraint=config.get('use_cosine_similarity_constraint', False),
+                        use_pairwise_similarity_in_constraint=config.get('use_pairwise_similarity_in_constraint', False),
+                        lambda_sim_low_init=config.get('lambda_sim_low_init', 0.1),
+                        lambda_sim_up_init=config.get('lambda_sim_up_init', 0.1),
+                        lambda_sim_low_lr=config.get('lambda_sim_low_lr', 0.01),
+                        lambda_sim_up_lr=config.get('lambda_sim_up_lr', 0.01),
+                        use_augmented_lagrangian=config.get('use_augmented_lagrangian', False),
+                        lambda_update_mode=config.get('lambda_update_mode', 'classic'),
+                        rho_dist_init=config.get('rho_dist_init', 1.0),
+                        rho_sim_low_init=config.get('rho_sim_low_init', 1.0),
+                        rho_sim_up_init=config.get('rho_sim_up_init', 1.0),
+                        rho_adaptive=config.get('rho_adaptive', True),
+                        rho_theta=config.get('rho_theta', 0.5),
+                        rho_increase_factor=config.get('rho_increase_factor', 2.0),
+                        rho_min=config.get('rho_min', 1e-3),
+                        rho_max=config.get('rho_max', 1e3),
+                    )
             else:
                 raise ValueError(
                     f"Unknown attack_method={attack_method!r}. Supported: "
-                    "'NoAttack' | 'Hallucination' | 'SignFlipping' | 'Gaussian' | 'ALIE'."
+                    "'NoAttack' | 'Hallucination' | 'SignFlipping' | 'Gaussian' | 'ALIE' | 'AugMP'."
                 )
 
         server.register_client(client)
@@ -1311,6 +1386,48 @@ def main(config_overrides: Optional[Dict] = None):
         'alie_z_max': None,                      # NeurIPS '19: None = auto by (num_clients, num_attackers)
         'alie_attack_start_round': None,
 
+        # ---- AugMP (learned VGAE+GSP stealth model manipulation; attack_method='AugMP') ----
+        # Only consumed when attack_method='AugMP' (attack/augmp.py). The attacker
+        # performs NO local training; it CONSTRUCTS its update from the received
+        # benign updates via VGAE + GSP + a Lagrangian constrained proxy optimisation
+        # that MAXIMISES the global-loss proxy F(w'_g) subject to distance + two-sided
+        # cosine-similarity constraints (mimics benign updates -> evades geometric
+        # robust-aggregation defenses like krum / median / fltrust). This is the
+        # strong, stealthy baseline for showing HMP-GAE's semantic signal catches
+        # geometry-evading attacks the baselines miss.
+        #
+        # COMPUTE: the proxy loop is the bottleneck (each step = one full LLM
+        # forward+backward). proxy_steps was cut 200 -> 30 (+ early stop) for ~2.2x
+        # faster runs; calibrate with a cheap `fedavg + AugMP` run first and raise to
+        # 50 only if attack damage collapses.
+        'dim_reduction_size': 1000,      # magnitude-ranked param subset for the VGAE graph (auto-clamped to LoRA numel)
+        'vgae_epochs': 20,               # VGAE training epochs (small graph -> cheap; NOT the bottleneck)
+        'vgae_lr': 0.01,
+        'vgae_hidden_dim': 32,
+        'vgae_latent_dim': 16,
+        'vgae_dropout': 0.0,
+        'vgae_kl_weight': 0.1,
+        'graph_threshold': 0.5,          # cosine-sim threshold for the benign-update adjacency matrix
+        'proxy_step': 0.001,             # Adam lr for the proxy-parameter ascent
+        'proxy_steps': 30,               # BOTTLENECK: proxy optimisation steps/round/attacker (200 -> 30)
+        'early_stop_constraint_stability_steps': 2,  # stop after N consecutive constraint-satisfying steps
+        'attacker_use_proxy_data': True, # omniscient: estimate F(w'_g) on an INDEPENDENT clean proxy set
+                                         # (data_loader.get_proxy_eval_loader draws from TRAIN, disjoint from
+                                         # test -- no eval leakage). False = constraint-only (no data access).
+        'proxy_sample_size': 128,        # size of that clean proxy set
+        'proxy_max_batches_opt': 1,      # proxy batches per optimisation step
+        'proxy_max_batches_eval': 1,     # proxy batches for the final evaluation
+        'attacker_proxy_grad_clip_norm': 1.0,
+        'dist_bound': None,              # constraint (4b) distance bound; None = auto from benign-update max
+        'sim_bound_low': None,           # cosine lower bound; None = benign min
+        'sim_bound_up': None,            # cosine upper bound; None = benign mean
+        'use_lagrangian_dual': True,     # constrained-optimisation mechanism (the stealth machinery)
+        'use_cosine_similarity_constraint': True,
+        'use_augmented_lagrangian': True,
+        'lambda_dist_init': 0.1,
+        'lambda_sim_low_init': 0.1,
+        'lambda_sim_up_init': 0.1,
+
         # ========== Defense Configuration (V1: fedavg | hmp_gae) ==========
         # defense_method selects the server-side aggregation rule.
         #   'fedavg'  — standard data-size-weighted FedAvg (no-defense baseline)
@@ -1542,6 +1659,8 @@ def main(config_overrides: Optional[Dict] = None):
             print("Running Sign-Flipping Attack (Model Poisoning Baseline)...")
         elif attack_method == 'Gaussian':
             print("Running Gaussian Attack (Random Model Poisoning Baseline)...")
+        elif attack_method == 'AugMP':
+            print("Running AugMP Attack (VGAE + GSP learned stealth model manipulation)...")
         else:
             print(f"Running attack: {attack_method}")
     else:
