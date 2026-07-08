@@ -1,6 +1,6 @@
 # AGENTS.md — HMP-GNN
 
-> 详细功能/配置/命令见 [README.md](README.md)。本文件只补充无法从代码直接推导出来的上下文与约定。
+> 详细功能/配置/命令见 [README.md](README.md)；算法符号与数学推导见 [MATH_LOGIC.md](MATH_LOGIC.md)。本文件只补充无法从代码直接推导出来的上下文与约定。
 
 ## What this is
 
@@ -21,6 +21,16 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 - macOS 上 `torch.cuda.is_available()` 永远 False——涉及 device 的代码要兼容 CPU 路径
 - 用户自己 commit；改完代码不要主动 git add/commit
 - **唯一 Colab notebook 是 [HMP_GAE_Colab.ipynb](HMP_GAE_Colab.ipynb)**。不要复制/新建 `*_Colab*.ipynb` 变体——Colab 同时只能跑一个，维护多份只会漂移；跑不同配置走 `COLAB_CONFIG_OVERRIDES` 或修改 main.py 的 config
+
+## Verify 一个改动（不训练）
+
+跑不了 FL，但改完有几关可过（秒级、无需 dataset/GPU）：
+
+- `python check_docs.py` —— 文档↔代码一致性守卫（stdlib，~0.1s）。**改任何 `.md` 后必跑**：校验 agent 文档里没有 `main.py:<行号>`、markdown 链接不死、docs 提到的 config key/符号在代码里真存在——是本文件 anti-drift 约定的可执行版本。**纯编辑 Mac 也能跑**。
+- `python -m compileall -q .` —— 全库语法面（只解析不 import，无需 torch）。**改任何 `.py` 后跑**。**纯编辑 Mac 也能跑**。
+- `python tests/test_trust_robustness.py` —— trust-scoring CPU 回归（含 legacy 路径 bit-for-bit），~1s。**碰 `hmp_gae/`（trust_scorer / runtime / hypergraph）后跑**。⚠️ **需要装了 torch 的环境**——纯编辑 Mac 通常没有 torch，这一关交给 CI 或 Colab。
+
+三关全绿 ≠ 训练正确——收敛/精度验证仍在 Colab。
 
 ## Canonical config: [main.py](main.py) 的 `main()` config dict
 
@@ -48,6 +58,10 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 | [attack/augmp.py](attack/augmp.py) | AugMP 攻击（learned VGAE+GSP stealth model-manipulation，~3900 行，从 IoA-Attack-GRMP 移植）；懒加载，仅 `attack_method='AugMP'` 时 import，当前默认实验**不用** |
 | [evaluation_hallucination.py](evaluation_hallucination.py) | 全局 PPL 评估（FL 结束后一次；encoder-only 优雅跳过） |
 | [decoder_adapters.py](decoder_adapters.py) | SeqCLS → CausalLM backbone 迁移（PPL 评估前置） |
+| [models.py](models.py) | `NewsClassifierModel`（SeqCLS + LoRA 装配；`lora_target_modules` 在此） |
+| [data_loader.py](data_loader.py) | `DataManager` / 4 数据集加载 / tokenizer（**IID/non-IID 分区实际在 [main.py](main.py)**） |
+| [fed_resume.py](fed_resume.py) | per-round 断点续跑（Colab 掉线恢复）；fingerprint 校验在此 |
+| [tests/test_trust_robustness.py](tests/test_trust_robustness.py) | trust-scoring CPU 回归（legacy 路径 bit-for-bit）；改 trust_scorer/runtime 后跑 |
 
 > **AugMP 隔离约定（token 节流）**：`attack/augmp.py` 约 3900 行、约 40K token，且当前实验不跑 AugMP（懒加载——`attack_method` 非 `'AugMP'` 时根本不 import，对运行时零成本）。**除非任务明确要改 AugMP，否则不要读取该文件**；全库阅读 / code review 时跳过它。其内部结构（VGAE 代理模型 + 增广拉格朗日约束优化：distance + 双边 cosine 约束）需要时再按需读取。
 
