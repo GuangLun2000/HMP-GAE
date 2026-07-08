@@ -1762,28 +1762,6 @@ class AttackerClient(Client):
                                    other_attacker_updates_gpu: List[torch.Tensor] = None,
                                    other_attacker_updates: List[torch.Tensor] = None,
                                    include_current_attacker: bool = True) -> Tuple[torch.Tensor, float, List[float]]:
-        # #region agent log
-        import json
-        try:
-            with open('/Users/hanlincai/Desktop/Github/IoA-Attack-GRMP/.cursor/debug.log', 'a') as f:
-                log_entry = {
-                    "id": f"log_{int(__import__('time').time())}_{id(self)}",
-                    "timestamp": int(__import__('time').time() * 1000),
-                    "location": "client.py:1552",
-                    "message": "_aggregate_update_no_beta called",
-                    "data": {
-                        "client_id": getattr(self, 'client_id', None),
-                        "has_other_attacker_updates": other_attacker_updates is not None,
-                        "has_other_attacker_updates_list": other_attacker_updates_list is not None,
-                        "has_other_attacker_updates_gpu": other_attacker_updates_gpu is not None
-                    },
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "A"
-                }
-                f.write(json.dumps(log_entry) + '\n')
-        except: pass
-        # #endregion
         # Handle legacy parameter name: other_attacker_updates -> other_attacker_updates_list
         if other_attacker_updates is not None and other_attacker_updates_list is None:
             other_attacker_updates_list = other_attacker_updates
@@ -3941,4 +3919,9 @@ class AttackerClient(Client):
             del malicious_update
         del final_global_loss
         torch.cuda.empty_cache()
+
+        # Return the crafted malicious update (CPU, detached). Without this the
+        # server's Phase 3 (server.py:820) would store None as the attacker
+        # update, crashing aggregation / the semantic probe forward.
+        return malicious_update_final
         

@@ -220,6 +220,6 @@ Output files per run (the `results/` folder is gitignored; paths below are produ
 - V1 still omits comparison baselines (Krum / Median / FLTrust / FLDetector / Safe-FedLLM). Planned for the next V2 milestone.
 - PPL currently evaluates a decoder-only backbone; when `model_name` is encoder-only, PPL is skipped with a reason string in the JSON.
 - Single modality (text) -- the paper's multimodal formulation is simulated via LoRA-only updates; true multimodal encoders are later work.
-- Tuning presets above are calibrated for the N=10 / 2-attackers / AG News regime. For `num_clients <= 4` the defense auto-falls back to FedAvg; for very heterogeneous (`dirichlet_alpha << 0.3`) data, `reject_z_threshold` may need to be raised.
+- Tuning presets above are calibrated for the N=10 / 2-attackers / AG News regime. For `num_clients <= 2` the defense auto-falls back to FedAvg (the hard threshold in `defense/__init__.py::HMPGAEDefense.aggregate`; hypergraph signals are simply weak at small N); for very heterogeneous (`dirichlet_alpha << 0.3`) data, `reject_z_threshold` may need to be raised.
 
 <br>

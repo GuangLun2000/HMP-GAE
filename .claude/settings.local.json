@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(conda env *)",
-      "Bash(pyenv versions *)"
+      "Bash(pyenv versions *)",
+      "Bash(python3 check_docs.py)",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }

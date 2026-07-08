@@ -37,7 +37,7 @@ $$
 - 优化器 Adam(lr = `client_lr` = 5e-5),梯度裁剪 $\lVert g \rVert \le 1.0$,`local_epochs = 1`;
 - 上传量:$\Delta_i^t = w_i^{local} - w_t$(仅 LoRA 可训练参数展平,CPU tensor)。
 
-**多模态模拟说明(V1)**:不接真实多模态 encoder,用 Qwen2.5-0.5B + LoRA($r=8, \alpha_{LoRA}=16$)模拟多模态联邦 LLM 客户端。
+**多模态模拟说明(V1)**:不接真实多模态 encoder,用小型 decoder-only LLM + LoRA($r=8, \alpha_{LoRA}=16$)模拟多模态联邦 LLM 客户端(当前 backbone 见 §8 权威配置)。
 
 ---
 
@@ -424,13 +424,13 @@ $\text{NLL}_j$ = 第 $j$ 条样本的 shifted-label 平均 token 负对数似然
 
 ## 8. 权威默认配置(当前实验)
 
-来源:`main.py: main()` config dict(main.py:1090 起,**唯一权威 config 源**)。当前实验名:`yahoo-(non-iid0.5)-hmpgae-robusttrust-hallu(localround=1,seed=42,r50,len128)`。
+来源:`main.py` 的 `main()` config dict(**唯一权威 config 源**;不标行号——main.py 常改)。**本表是撰写时快照,与 config 现值冲突时一律以 config 为准。** 当前实验名(随 config 变):`yahoo-(non-iid0.5)-hmpgae-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b`。
 
 | 组 | 参数 | 值 |
 |---|---|---|
 | FL | $N$ / attackers / rounds | 7 (5 benign + 2 attacker) / 2 / 50 |
 | FL | client_lr / server_lr / local_epochs / FedProx $\mu$ | 5e-5 / 1.0 / 1 / 0.0 |
-| 模型 | backbone / LoRA | Qwen2.5-0.5B + LoRA($r{=}8$, $\alpha{=}16$, dropout 0.1) |
+| 模型 | backbone / LoRA | Llama-3.2-1B (~1.24B, BASE) + LoRA($r{=}8$, $\alpha{=}16$, dropout 0.1) |
 | 数据 | dataset / 分布 / 规模 | Yahoo Answers($C{=}10$)/ non-IID Dirichlet(0.5) / 10K 子集, max_length 128 |
 | 攻击 | mode / $\rho^t$ / reseed | random flip / $\mathcal{U}[0.3, 0.8]$ / per-round |
 | 超图 | proj_dim / eta_dim / $k$ | 64 / 64 / 2 |

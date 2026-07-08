@@ -24,13 +24,15 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 
 ## Canonical config: [main.py](main.py) 的 `main()` config dict
 
-[main.py:885](main.py#L885) 是**唯一**权威 config 源。任何参数调整都在这里改：
+`main()` 里的 `config` dict 是**唯一**权威 config 源。**不标行号**——main.py 频繁改动，任何行号都会失效；一律用符号定位（`main()` / `run_suite()` / config key 名）。任何参数调整都在这里改：
 
-- 改默认行为 → 改 main() 的 config
-- 对照实验 → 在 Colab Step 3 用 `COLAB_CONFIG_OVERRIDES` 临时覆盖（跑完即恢复），或调用 [main.py:1141](main.py#L1141) 的 `run_suite()`
+- 改默认行为 → 改 `main()` 的 `config`
+- 对照实验 → 在 Colab Step 3 用 `COLAB_CONFIG_OVERRIDES` 临时覆盖（跑完即恢复），或调用 `run_suite()`
 - 不要在 notebook cell 里硬编码超参覆盖（除非临时尝试，跑完即撤）
 
-**当前默认实验** = `hmpgae_hallu_randflip_n7_r50_qwen`：N=7 (5 benign + 2 attackers)，50 轮，Qwen2.5-0.5B + LoRA(r=8)，AG News (IID, 10K subset)，per-round 随机化 label-flip（ratio∈[0.3, 0.8]），hmp_gae 三信号防御。
+**不变的实验骨架**（很少动，可依赖）：N=7（5 benign + 2 attackers），50 轮，LoRA(r=8)，per-round 随机化 label-flip（`hallu_flip_ratio_range`），`attack_method='Hallucination'` + `defense_method='hmp_gae'` 三信号防御。
+
+> **易变 knob（dataset / model_name / flip ratio 等）一律以 `config` dict 现值为准，本文件不复述具体值**——写死的数值随时会过时；需要当前值时读 `config`，不要引用本文件。（撰写本节时现值，仅供参考：Yahoo Answers non-IID(0.5) + Llama-3.2-1B。）
 
 ## 模块速查（哪里改什么）
 
@@ -43,8 +45,11 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 | [client.py](client.py) | `BenignClient` (FedProx) 基类 |
 | [attack/hallucination.py](attack/hallucination.py) | 本论文攻击；per-round 随机化 flip 在此实现 |
 | [attack/{sign_flipping,gaussian,alie}.py](attack/) | 经典 Byzantine baseline——**不要改对外行为**（V2 横向对比锚点） |
+| [attack/augmp.py](attack/augmp.py) | AugMP 攻击（learned VGAE+GSP stealth model-manipulation，~3900 行，从 IoA-Attack-GRMP 移植）；懒加载，仅 `attack_method='AugMP'` 时 import，当前默认实验**不用** |
 | [evaluation_hallucination.py](evaluation_hallucination.py) | 全局 PPL 评估（FL 结束后一次；encoder-only 优雅跳过） |
 | [decoder_adapters.py](decoder_adapters.py) | SeqCLS → CausalLM backbone 迁移（PPL 评估前置） |
+
+> **AugMP 隔离约定（token 节流）**：`attack/augmp.py` 约 3900 行、约 40K token，且当前实验不跑 AugMP（懒加载——`attack_method` 非 `'AugMP'` 时根本不 import，对运行时零成本）。**除非任务明确要改 AugMP，否则不要读取该文件**；全库阅读 / code review 时跳过它。其内部结构（VGAE 代理模型 + 增广拉格朗日约束优化：distance + 双边 cosine 约束）需要时再按需读取。
 
 新算法沿用上表里的符号命名；新符号在对应文件顶部 docstring 简注即可。
 
@@ -54,12 +59,12 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 - **Attacker 的数据语义因 attack 类型而异**：
   - `Hallucination`：**使用**自己的本地数据但训练时翻转 label（dataset-USED with flips）
   - `sign_flipping` / `gaussian` / `alie`：**dataset-free**，不读自己的数据，只伪造 update
-  - main.py:112-114 那条 "attackers do NOT use these local data" 注释**只对后三种成立**——读到这条不要"修正"代码
-- **N ≤ 4 时 HMP-GAE 自动 fallback 到 FedAvg**（[defense/\_\_init\_\_.py](defense/__init__.py)）：超图信号在小 N 下不稳；动这里要同步更新 README 的 limitations
+  - main.py 分区打印处那条 `"attackers do NOT perform local training and do NOT use these local data"` 注释**只对后三种成立**——读到这条不要"修正"代码
+- **N ≤ 2 时 HMP-GAE 自动 fallback 到 FedAvg**（[defense/\_\_init\_\_.py](defense/__init__.py) 的 `HMPGAEDefense.aggregate`，原因写入 `fallback_reason`）：这是代码里**唯一**的硬阈值——早期文档/README 写 N≤4 不准确（小 N 下超图信号确实偏弱，但真正触发回退是 N≤2）；动这里要同步更新 README limitations
 - **`defense_config.device: 'cpu'` 故意的**：HMP-GAE 子模型很小（N=7），CPU 比反复 GPU↔CPU 搬数据快
 - **`semantic_weight > 0` 会触发 server 每轮 per-client probe forward**：从 test_loader 头部确定性取 `semantic_probe_size` 条样本；`semantic_weight=0` 时整条 probe path 跳过
-- **`gate_signal` 在 `semantic_weight > 0` 时自动从 `'graph'` 升级为 `'combined'`**（[hmp_gae/runtime.py:110-114](hmp_gae/runtime.py#L110-L114)），除非显式在 config 设；改信号融合权重时小心这条隐式 promotion
-- **`hallu_flip_map` 的 key 可能是 str**（从 JSON config 读时会变成字符串），[main.py:316](main.py#L316) 有 normalize 逻辑，不要破坏
+- **`gate_signal` 在 `semantic_weight > 0` 时自动从 `'graph'` 升级为 `'combined'`**（[hmp_gae/runtime.py](hmp_gae/runtime.py) 的 `HMPGAERuntime.__init__` 里 gate_signal auto-promotion 段），除非显式在 config 设；改信号融合权重时小心这条隐式 promotion
+- **`hallu_flip_map` 的 key 可能是 str**（从 JSON config 读时会变成字符串），[main.py](main.py) 的 Hallucination 分支有 `{int(k): int(v) ...}` normalize，不要破坏
 - **requirements.txt 受 Colab 镜像约束**：特别是 `torchao` / `peft` / `transformers` 版本兼容（见文件内注释 line 11-13）
 - **LoRA `target_modules=None` 含义是"用 PEFT 默认"**：默认对 DistilBERT 友好；换冷门 backbone 时可能需要显式列出 attn projection 名
 - **CSE 每轮免费**（共享 test forward），**PPL 是 FL 结束后一次性**（需要 checkpoint）——不要把 PPL 计算挪进每轮循环
