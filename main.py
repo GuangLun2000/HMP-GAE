@@ -1217,23 +1217,19 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: defended arm — HMP-GAE vs HIGH-strength
-        # === Hallucination on AG News (non-IID 0.5, 4 classes),
-        # === Llama-3.2-1B backbone ===
+        # === CURRENT RUN: defended arm — HMP-GAE vs Hallucination on
+        # === Yahoo Answers (non-IID 0.5, 10 classes), Llama-3.2-1B backbone ===
         # Held fixed vs ALL prior runs (control variables): 7 clients /
         # 2 attackers / 50 rounds, seed=42, LoRA r=8, batch 32, lr 5e-5,
-        # max_length=128, 10K subset, Dirichlet(0.5), and the per-round
-        # randomized flip CODE PATH (unchanged — only the sampling interval
-        # moved).  Deviations from the previous Yahoo fedavg-llama arm, each
-        # an intentional axis of this run:
-        #   dataset   yahoo_answers -> ag_news              (4 classes)
-        #   defense   fedavg        -> hmp_gae              (defended arm)
-        #   strength  flip_ratio_range [0.3,0.8] -> [0.6,1.0]  (HIGH arm)
-        # For per-knob attribution, the companion cells to run later are
-        # (a) agnews + fedavg at the same HIGH strength (attack damage) and
-        # (b) agnews + hmpgae at DEFAULT strength (strength ablation).
+        # max_length=128, 10K subset, Dirichlet(0.5), DEFAULT attack strength
+        # flip_ratio_range=[0.3,0.8], and the per-round randomized flip code
+        # path.  Exactly ONE axis moves vs each companion cell:
+        #   vs agnews-hmpgae-llama arm : dataset  ag_news -> yahoo_answers
+        #   vs yahoo-fedavg-llama arm  : defense  fedavg  -> hmp_gae
+        # so this cell closes the 2x2 (dataset x defense) factorial at
+        # DEFAULT strength on the Llama backbone.
         # NOTE: meta-llama/* is a GATED repo — Colab Step 2 handles HF login.
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
+        'experiment_name': 'yahoo-(non-iid0.5)-hmpgae-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
@@ -1258,9 +1254,9 @@ def main(config_overrides: Optional[Dict] = None):
         # ========== Dataset Configuration ==========
         # Choose dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers' — set num_labels and max_length accordingly
         # Dataset 1: AG News
-        'dataset': 'ag_news',  # news classification (4 classes)
-        'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
-        'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
+        # 'dataset': 'ag_news',  # news classification (4 classes)
+        # 'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
+        # 'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
         # -------------------------------------------
         # Dataset 2: IMDB
         # 'dataset': 'imdb',   # sentiment (2 classes)
@@ -1273,12 +1269,12 @@ def main(config_overrides: Optional[Dict] = None):
         # 'max_length': 512,
         # -------------------------------------------
         # Dataset 4: Yahoo Answers (10 classes, 1.4M train / 60K test)
-        # 'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
-        # 'num_labels': 10,       # Yahoo Answers: 10 classes
-        # 'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
-        #                         # (same truncation / wall-clock / memory envelope; README's
-        #                         # 256 recommendation is a separate ablation, not part of the
-        #                         # cross-dataset comparison).
+        'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
+        'num_labels': 10,       # Yahoo Answers: 10 classes
+        'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
+                                # (same truncation / wall-clock / memory envelope; README's
+                                # 256 recommendation is a separate ablation, not part of the
+                                # cross-dataset comparison).
         
         # ========== Data Distribution ==========
         # Current regime: non-IID Dirichlet(0.5) — the setting the robust trust
@@ -1290,7 +1286,8 @@ def main(config_overrides: Optional[Dict] = None):
         # 'dataset_size_limit': None,  # Full dataset: AG News ~120K; IMDB 25K; DBpedia 560K; Yahoo Answers 1.4M
         'dataset_size_limit': 10000,  # 10K train → ~1428 samples/client on average (7 clients;
                                       # per-client sizes vary under Dirichlet); test ≤ 1500.
-                                      # Enough for LoRA convergence on AG News; keeps per-round time ~3-5 min on T4
+                                      # Held fixed across ALL datasets for cross-dataset comparability
+                                      # (every loader subsamples with the same seeded rng(42))
 
         # ========== Training Mode Configuration ==========
         'use_lora': True,  # True for LoRA fine-tuning, False for full fine-tuning
@@ -1361,11 +1358,12 @@ def main(config_overrides: Optional[Dict] = None):
         # ======================================================================
         'hallu_flip_ratio': 0.5,                   # used only when hallu_flip_ratio_range is None
         'hallu_flip_mode': 'random',               # 'pairwise' | 'targeted' | 'random'
-        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2},
-                                                   # only consumed in flip_mode='pairwise'.
-                                                   # Adjacent-pair bijection sized for the ACTIVE
-                                                   # dataset's num_labels (4 = AG News); expand to
-                                                   # {0:1,1:0,...,8:9,9:8} for Yahoo Answers.
+        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4, 6: 7, 7: 6, 8: 9, 9: 8},
+                                                   # only consumed in flip_mode='pairwise' (inert in
+                                                   # the active 'random' mode). Adjacent-pair bijection
+                                                   # sized for the ACTIVE dataset's num_labels
+                                                   # (10 = Yahoo Answers); shrink to {0:1,1:0,2:3,3:2}
+                                                   # for AG News.
         'hallu_target_class': None,                # only for flip_mode='targeted'
         'hallu_attack_start_round': 0,
         'hallu_per_round_reseed': True,            # re-sample flipped-label set each round
