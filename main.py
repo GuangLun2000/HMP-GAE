@@ -1217,19 +1217,20 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: defended arm — HMP-GAE vs Hallucination on
-        # === Yahoo Answers (non-IID 0.5, 10 classes), Llama-3.2-1B backbone ===
+        # === CURRENT RUN: no-defense baseline arm — FedAvg vs Hallucination on
+        # === AG News (non-IID 0.5, 4 classes), Llama-3.2-1B backbone ===
         # Held fixed vs ALL prior runs (control variables): 7 clients /
         # 2 attackers / 50 rounds, seed=42, LoRA r=8, batch 32, lr 5e-5,
         # max_length=128, 10K subset, Dirichlet(0.5), DEFAULT attack strength
         # flip_ratio_range=[0.3,0.8], and the per-round randomized flip code
         # path.  Exactly ONE axis moves vs each companion cell:
-        #   vs agnews-hmpgae-llama arm : dataset  ag_news -> yahoo_answers
-        #   vs yahoo-fedavg-llama arm  : defense  fedavg  -> hmp_gae
-        # so this cell closes the 2x2 (dataset x defense) factorial at
-        # DEFAULT strength on the Llama backbone.
+        #   vs agnews-hmpgae-llama arm : defense  hmp_gae       -> fedavg
+        #   vs yahoo-fedavg-llama arm  : dataset  yahoo_answers -> ag_news
+        # This is the attack-damage floor the agnews-hmpgae cell is measured
+        # against in the 2x2 (dataset x defense) factorial at DEFAULT strength
+        # on the Llama backbone.
         # NOTE: meta-llama/* is a GATED repo — Colab Step 2 handles HF login.
-        'experiment_name': 'yahoo-(non-iid0.5)-hmpgae-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
+        'experiment_name': 'agnews-(non-iid0.5)-fedavg-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
@@ -1254,9 +1255,11 @@ def main(config_overrides: Optional[Dict] = None):
         # ========== Dataset Configuration ==========
         # Choose dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers' — set num_labels and max_length accordingly
         # Dataset 1: AG News
-        # 'dataset': 'ag_news',  # news classification (4 classes)
-        # 'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
-        # 'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
+        'dataset': 'ag_news',  # news classification (4 classes)
+        'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
+        'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
+                               # — same 128 as the Yahoo runs: identical truncation /
+                               # wall-clock / memory envelope across the factorial.
         # -------------------------------------------
         # Dataset 2: IMDB
         # 'dataset': 'imdb',   # sentiment (2 classes)
@@ -1269,12 +1272,10 @@ def main(config_overrides: Optional[Dict] = None):
         # 'max_length': 512,
         # -------------------------------------------
         # Dataset 4: Yahoo Answers (10 classes, 1.4M train / 60K test)
-        'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
-        'num_labels': 10,       # Yahoo Answers: 10 classes
-        'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
-                                # (same truncation / wall-clock / memory envelope; README's
-                                # 256 recommendation is a separate ablation, not part of the
-                                # cross-dataset comparison).
+        # 'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
+        # 'num_labels': 10,       # Yahoo Answers: 10 classes
+        # 'max_length': 128,      # Yahoo kept at 128 in the cross-dataset comparison
+        #                         # (README's 256 recommendation is a separate ablation).
         
         # ========== Data Distribution ==========
         # Current regime: non-IID Dirichlet(0.5) — the setting the robust trust
@@ -1358,12 +1359,12 @@ def main(config_overrides: Optional[Dict] = None):
         # ======================================================================
         'hallu_flip_ratio': 0.5,                   # used only when hallu_flip_ratio_range is None
         'hallu_flip_mode': 'random',               # 'pairwise' | 'targeted' | 'random'
-        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4, 6: 7, 7: 6, 8: 9, 9: 8},
+        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2},
                                                    # only consumed in flip_mode='pairwise' (inert in
                                                    # the active 'random' mode). Adjacent-pair bijection
                                                    # sized for the ACTIVE dataset's num_labels
-                                                   # (10 = Yahoo Answers); shrink to {0:1,1:0,2:3,3:2}
-                                                   # for AG News.
+                                                   # (4 = AG News); extend with {...,8:9,9:8} pairs up
+                                                   # to 10 for Yahoo Answers.
         'hallu_target_class': None,                # only for flip_mode='targeted'
         'hallu_attack_start_round': 0,
         'hallu_per_round_reseed': True,            # re-sample flipped-label set each round
@@ -1425,12 +1426,13 @@ def main(config_overrides: Optional[Dict] = None):
         # defense_method selects the server-side aggregation rule.
         #   'fedavg'  — standard data-size-weighted FedAvg (no-defense baseline)
         #   'hmp_gae' — HMP-GAE immunization (this paper, requires hmp_gae/ subpackage)
-        # Current value is 'hmp_gae': the defended arm.  The full defense_config
-        # below is LIVE, including the per-round per-client semantic probe
-        # forward (semantic_weight=1.0 -> gate_signal auto-stays 'combined').
-        # Switch to 'fedavg' for the no-defense attack-damage companion cell;
-        # the block below then goes inert (one-key flip, nothing else to touch).
-        'defense_method': 'hmp_gae',
+        # Current value is 'fedavg': the no-defense attack-damage baseline arm.
+        # The entire defense_config below is INERT — server.py gates the
+        # per-round semantic probe forward on defense_method=='hmp_gae' AND
+        # semantic_weight>0, so no probe forwards run either.  Switch back to
+        # 'hmp_gae' for the defended arm; the block below then goes live
+        # unchanged (one-key flip, nothing else to touch).
+        'defense_method': 'fedavg',
         'defense_config': {
 
             # config for foolsgold
