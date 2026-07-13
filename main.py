@@ -1218,21 +1218,22 @@ def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
         # === CURRENT RUN: no-defense baseline arm — FedAvg vs Hallucination on
-        # === Yahoo Answers (non-IID 0.5, 10 classes), Llama-3.2-1B backbone ===
-        # Attack-only / no-defense: attackers run the per-round randomized
-        # label-flip while the server does plain data-size-weighted FedAvg.
+        # === AG News (non-IID 0.5, 4 classes), Qwen2.5-0.5B backbone ===
+        # Fills the missing AG News cell (fedavg / Hallucination / Qwen) in the
+        # results table.  Attack-only / no-defense: attackers run the per-round
+        # randomized label-flip while the server does plain data-size-weighted
+        # FedAvg.
         # Held fixed vs ALL prior runs (control variables): 7 clients /
         # 2 attackers / 50 rounds, seed=42, LoRA r=8, batch 32, lr 5e-5,
         # max_length=128, 10K subset, Dirichlet(0.5), DEFAULT attack strength
         # flip_ratio_range=[0.3,0.8], and the per-round randomized flip code
         # path.  Exactly ONE axis moves vs each companion cell:
-        #   vs yahoo-hmpgae-llama arm  : defense  hmp_gae -> fedavg
-        #   vs agnews-fedavg-llama arm : dataset  ag_news -> yahoo_answers
-        # This is the attack-damage floor the yahoo-hmpgae cell is measured
-        # against in the 2x2 (dataset x defense) factorial at DEFAULT strength
-        # on the Llama backbone.
-        # NOTE: meta-llama/* is a GATED repo — Colab Step 2 handles HF login.
-        'experiment_name': 'yahoo-(non-iid0.5)-fedavg-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
+        #   vs agnews-hmpgae-qwen arm  : defense  hmp_gae -> fedavg
+        #   vs agnews-fedavg-llama arm : model    llama-3.2-1b -> qwen2.5-0.5b
+        # Model is pinned EXPLICITLY to Qwen/Qwen2.5-0.5B — since 2026-07-09 the
+        # repo default drifted to Llama-3.2-1B, so do not rely on defaults here.
+        # NOTE: Qwen/Qwen2.5-0.5B is NOT gated — no HF login required.
+        'experiment_name': 'agnews-(non-iid0.5)-fedavg-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
@@ -1257,9 +1258,10 @@ def main(config_overrides: Optional[Dict] = None):
         # ========== Dataset Configuration ==========
         # Choose dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers' — set num_labels and max_length accordingly
         # Dataset 1: AG News
-        # 'dataset': 'ag_news',  # news classification (4 classes)
-        # 'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
-        # 'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
+        'dataset': 'ag_news',  # news classification (4 classes)
+        'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
+        'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
+                               # (128 also matches ALL prior cross-dataset runs' truncation envelope)
         # -------------------------------------------
         # Dataset 2: IMDB
         # 'dataset': 'imdb',   # sentiment (2 classes)
@@ -1272,9 +1274,9 @@ def main(config_overrides: Optional[Dict] = None):
         # 'max_length': 512,
         # -------------------------------------------
         # Dataset 4: Yahoo Answers (10 classes, 1.4M train / 60K test)
-        'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
-        'num_labels': 10,       # Yahoo Answers: 10 classes
-        'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
+        # 'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
+        # 'num_labels': 10,       # Yahoo Answers: 10 classes
+        # 'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
                                 # (same truncation / wall-clock / memory envelope; README's
                                 # 256 recommendation is a separate ablation, not part of the
                                 # cross-dataset comparison).
@@ -1311,8 +1313,11 @@ def main(config_overrides: Optional[Dict] = None):
         # 'model_name': 'gpt2',                      # GPT-2 124M — stable decoder baseline
         # 'model_name': 'EleutherAI/pythia-160m',    # Pythia-160M (may need grad_clip_norm=0.5)
         # 'model_name': 'facebook/opt-125m',         # OPT-125M (Meta)
-        # 'model_name': 'Qwen/Qwen2.5-0.5B',         # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning
-        'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
+        'model_name': 'Qwen/Qwen2.5-0.5B',         # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning.
+                                                   # Explicit pin for the AG News fedavg cell: repo default drifted to
+                                                   # Llama-3.2-1B on 2026-07-09, but the AG results-table rows are all
+                                                   # on the Qwen backbone. NOT gated; fits a T4 15GB comfortably.
+        # 'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
                                                   # GATED repo: accept the Llama 3.2 license on HF and provide
                                                   # HF_TOKEN (Colab Step 2 logs in automatically).
                                                   # LoRA targets auto-resolve via the "llama" branch in models.py
@@ -1361,12 +1366,12 @@ def main(config_overrides: Optional[Dict] = None):
         # ======================================================================
         'hallu_flip_ratio': 0.5,                   # used only when hallu_flip_ratio_range is None
         'hallu_flip_mode': 'random',               # 'pairwise' | 'targeted' | 'random'
-        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4, 6: 7, 7: 6, 8: 9, 9: 8},
+        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2},
                                                    # only consumed in flip_mode='pairwise' (inert in
                                                    # the active 'random' mode). Adjacent-pair bijection
                                                    # sized for the ACTIVE dataset's num_labels
-                                                   # (10 = Yahoo Answers); shrink to {0:1,1:0,2:3,3:2}
-                                                   # for AG News.
+                                                   # (4 = AG News); extend to {...,8:9,9:8} for
+                                                   # Yahoo Answers (10 classes).
         'hallu_target_class': None,                # only for flip_mode='targeted'
         'hallu_attack_start_round': 0,
         'hallu_per_round_reseed': True,            # re-sample flipped-label set each round
