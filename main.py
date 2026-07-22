@@ -1217,28 +1217,30 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: no-defense baseline arm — FedAvg vs Hallucination on
-        # === AG News (non-IID 0.5, 4 classes), Qwen2.5-0.5B backbone ===
-        # Fills the missing AG News cell (fedavg / Hallucination / Qwen) in the
-        # results table.  Attack-only / no-defense: attackers run the per-round
-        # randomized label-flip while the server does plain data-size-weighted
-        # FedAvg.
-        # Held fixed vs ALL prior runs (control variables): 7 clients /
-        # 2 attackers / 50 rounds, seed=42, LoRA r=8, batch 32, lr 5e-5,
+        # === CURRENT RUN: FoolsGold single-attacker arm — FoolsGold vs
+        # === Hallucination on Yahoo Answers (non-IID 0.5, 10 classes),
+        # === Llama-3.2-1B backbone, 6 benign + 1 attacker ===
+        # Probes FoolsGold's known blind spot: its signal is cross-attacker
+        # cosine similarity of accumulated updates (sybil coordination), so a
+        # SINGLE attacker has no coordinating peer to correlate with.
+        # Held fixed vs the Yahoo/Llama companion cells (control variables):
+        # 7 clients / 50 rounds, seed=42, LoRA r=8, batch 32, lr 5e-5,
         # max_length=128, 10K subset, Dirichlet(0.5), DEFAULT attack strength
-        # flip_ratio_range=[0.3,0.8], and the per-round randomized flip code
-        # path.  Exactly ONE axis moves vs each companion cell:
-        #   vs agnews-hmpgae-qwen arm  : defense  hmp_gae -> fedavg
-        #   vs agnews-fedavg-llama arm : model    llama-3.2-1b -> qwen2.5-0.5b
-        # Model is pinned EXPLICITLY to Qwen/Qwen2.5-0.5B — since 2026-07-09 the
-        # repo default drifted to Llama-3.2-1B, so do not rely on defaults here.
-        # NOTE: Qwen/Qwen2.5-0.5B is NOT gated — no HF login required.
-        'experiment_name': 'agnews-(non-iid0.5)-fedavg-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
+        # flip_ratio_range=[0.3,0.8], per-round randomized flip code path.
+        # Exactly ONE axis moves vs the companion cell:
+        #   vs yahoo-foolsgold-llama (2-attacker) arm : num_attackers 2 -> 1
+        # num_attackers=1 deviates from the canonical 2-of-7 attack-strength
+        # baseline BY EXPLICIT REQUEST (single-attacker FoolsGold arm); the
+        # `atk1` tag in experiment_name marks it.
+        # NOTE: meta-llama/Llama-3.2-1B is GATED — accept the license on HF and
+        # provide HF_TOKEN (Colab Step 2 logs in automatically). Needs A100
+        # (fp32 ~5GB/copy; does NOT fit a T4 15GB).
+        'experiment_name': 'yahoo-(non-iid0.5)-foolsgold-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8,atk1)-llama3.2-1b',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
-        'num_clients': 7,    # Total clients: 5 benign, 2 attackers (Y2 config)
-        'num_attackers': 2,  # 2 attackers (C5/C6), per-round randomized label-flip
+        'num_clients': 7,    # Total clients: 6 benign, 1 attacker (single-attacker arm)
+        'num_attackers': 1,  # 1 attacker (C6, the last client), per-round randomized label-flip
         'num_rounds': 50,    # 50 × 1 local epoch = the paper regime (~3-4 h on T4).
                              # Also gives the suspicion EMA (β=0.6, ~2-3 round lag)
                              # a long steady state; 10-round runs are smoke tests.
@@ -1258,9 +1260,9 @@ def main(config_overrides: Optional[Dict] = None):
         # ========== Dataset Configuration ==========
         # Choose dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers' — set num_labels and max_length accordingly
         # Dataset 1: AG News
-        'dataset': 'ag_news',  # news classification (4 classes)
-        'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
-        'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
+        # 'dataset': 'ag_news',  # news classification (4 classes)
+        # 'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
+        # 'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
                                # (128 also matches ALL prior cross-dataset runs' truncation envelope)
         # -------------------------------------------
         # Dataset 2: IMDB
@@ -1274,9 +1276,9 @@ def main(config_overrides: Optional[Dict] = None):
         # 'max_length': 512,
         # -------------------------------------------
         # Dataset 4: Yahoo Answers (10 classes, 1.4M train / 60K test)
-        # 'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
-        # 'num_labels': 10,       # Yahoo Answers: 10 classes
-        # 'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
+        'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
+        'num_labels': 10,       # Yahoo Answers: 10 classes
+        'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
                                 # (same truncation / wall-clock / memory envelope; README's
                                 # 256 recommendation is a separate ablation, not part of the
                                 # cross-dataset comparison).
@@ -1313,11 +1315,10 @@ def main(config_overrides: Optional[Dict] = None):
         # 'model_name': 'gpt2',                      # GPT-2 124M — stable decoder baseline
         # 'model_name': 'EleutherAI/pythia-160m',    # Pythia-160M (may need grad_clip_norm=0.5)
         # 'model_name': 'facebook/opt-125m',         # OPT-125M (Meta)
-        'model_name': 'Qwen/Qwen2.5-0.5B',         # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning.
-                                                   # Explicit pin for the AG News fedavg cell: repo default drifted to
-                                                   # Llama-3.2-1B on 2026-07-09, but the AG results-table rows are all
-                                                   # on the Qwen backbone. NOT gated; fits a T4 15GB comfortably.
-        # 'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
+        # 'model_name': 'Qwen/Qwen2.5-0.5B',       # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning.
+                                                   # NOT gated; fits a T4 15GB comfortably.  Backbone of the
+                                                   # AG News results-table rows.
+        'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
                                                   # GATED repo: accept the Llama 3.2 license on HF and provide
                                                   # HF_TOKEN (Colab Step 2 logs in automatically).
                                                   # LoRA targets auto-resolve via the "llama" branch in models.py
@@ -1329,10 +1330,11 @@ def main(config_overrides: Optional[Dict] = None):
 
         # ========== Attack Configuration ==========
         # Supported: 'NoAttack' | 'Hallucination' (this paper) | 'SignFlipping' | 'Gaussian' | 'ALIE'
-        # Current value is 'Hallucination' (paired with num_attackers=2): the
-        # proposed per-round randomized label-flipping attack. Switch to
-        # 'NoAttack' (with num_attackers=0) for the clean ceiling, or to one
-        # of the classical-baseline strings for V2 comparison runs.
+        # Current value is 'Hallucination' (paired with num_attackers=1, the
+        # single-attacker FoolsGold arm): the proposed per-round randomized
+        # label-flipping attack. Switch to 'NoAttack' (with num_attackers=0)
+        # for the clean ceiling, or to one of the classical-baseline strings
+        # for V2 comparison runs.
         'attack_method': 'Hallucination',
         'attack_start_round': None,  # None = attack active from round 0 (default)
 
@@ -1366,12 +1368,12 @@ def main(config_overrides: Optional[Dict] = None):
         # ======================================================================
         'hallu_flip_ratio': 0.5,                   # used only when hallu_flip_ratio_range is None
         'hallu_flip_mode': 'random',               # 'pairwise' | 'targeted' | 'random'
-        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2},
+        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4, 6: 7, 7: 6, 8: 9, 9: 8},
                                                    # only consumed in flip_mode='pairwise' (inert in
                                                    # the active 'random' mode). Adjacent-pair bijection
                                                    # sized for the ACTIVE dataset's num_labels
-                                                   # (4 = AG News); extend to {...,8:9,9:8} for
-                                                   # Yahoo Answers (10 classes).
+                                                   # (10 = Yahoo Answers); shrink to {0:1,1:0,2:3,3:2}
+                                                   # for AG News (4 classes).
         'hallu_target_class': None,                # only for flip_mode='targeted'
         'hallu_attack_start_round': 0,
         'hallu_per_round_reseed': True,            # re-sample flipped-label set each round
@@ -1429,17 +1431,19 @@ def main(config_overrides: Optional[Dict] = None):
         'lambda_sim_low_init': 0.1,
         'lambda_sim_up_init': 0.1,
 
-        # ========== Defense Configuration (V1: fedavg | hmp_gae) ==========
+        # ========== Defense Configuration ==========
         # defense_method selects the server-side aggregation rule.
-        #   'fedavg'  — standard data-size-weighted FedAvg (no-defense baseline)
-        #   'hmp_gae' — HMP-GAE immunization (this paper, requires hmp_gae/ subpackage)
-        # Current value is 'fedavg': the no-defense attack-damage baseline arm.
-        # The entire defense_config below is INERT — server.py gates the
-        # per-round semantic probe forward on defense_method=='hmp_gae' AND
-        # semantic_weight>0, so no probe forwards run either.  Switch back to
-        # 'hmp_gae' for the defended arm; the block below then goes live
-        # unchanged (one-key flip, nothing else to touch).
-        'defense_method': 'fedavg',
+        #   'fedavg'    — standard data-size-weighted FedAvg (no-defense baseline)
+        #   'hmp_gae'   — HMP-GAE immunization (this paper, requires hmp_gae/ subpackage)
+        #   'foolsgold' — FoolsGold (RAID '20), baseline defense
+        # Current value is 'foolsgold': cross-attacker cosine similarity of
+        # accumulated updates.  It consumes ONLY defense_config.epsilon; every
+        # other key below (HMP-GAE knobs, fltrust anchor, krum num_byzantine)
+        # is INERT for this run.  server.py gates the per-round semantic probe
+        # forward on defense_method=='hmp_gae' AND semantic_weight>0, so no
+        # probe forwards run either.  Switch to 'hmp_gae' for the defended
+        # arm; the block below then goes live unchanged.
+        'defense_method': 'foolsgold',
         'defense_config': {
 
             # config for foolsgold
