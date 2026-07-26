@@ -1219,28 +1219,37 @@ def main(config_overrides: Optional[Dict] = None):
         # ========== Experiment Configuration ==========
         # === CURRENT RUN: FoolsGold single-attacker arm — FoolsGold vs
         # === Hallucination on Yahoo Answers (non-IID 0.5, 10 classes),
-        # === Llama-3.2-1B backbone, 6 benign + 1 attacker ===
+        # === Llama-3.2-1B backbone, 5 benign + 1 attacker (N=6) ===
         # Probes FoolsGold's known blind spot: its signal is cross-attacker
         # cosine similarity of accumulated updates (sybil coordination), so a
         # SINGLE attacker has no coordinating peer to correlate with.
-        # Held fixed vs the Yahoo/Llama companion cells (control variables):
-        # 7 clients / 50 rounds, seed=42, LoRA r=8, batch 32, lr 5e-5,
-        # max_length=128, 10K subset, Dirichlet(0.5), DEFAULT attack strength
+        # Control-variable strategy: hold the BENIGN COHORT at 5 (same as the
+        # canonical 5-benign+2-attacker config) and remove one attacker, so
+        # N drops 7 -> 6.  Held fixed vs the Yahoo/Llama companion cells:
+        # 50 rounds, seed=42, LoRA r=8, batch 32, lr 5e-5, max_length=128,
+        # 10K subset, Dirichlet(0.5), DEFAULT attack strength
         # flip_ratio_range=[0.3,0.8], per-round randomized flip code path.
-        # Exactly ONE axis moves vs the companion cell:
-        #   vs yahoo-foolsgold-llama (2-attacker) arm : num_attackers 2 -> 1
-        # num_attackers=1 deviates from the canonical 2-of-7 attack-strength
-        # baseline BY EXPLICIT REQUEST (single-attacker FoolsGold arm); the
-        # `atk1` tag in experiment_name marks it.
+        # Intended single moving axis:
+        #   vs yahoo-foolsgold-llama 2-attacker arm : one attacker removed
+        #     (benign cohort unchanged at 5; num_attackers 2 -> 1, N 7 -> 6)
+        # CAVEAT (inherent to changing N): the Dirichlet partition splits the
+        # same 10K pool over 6 instead of 7 clients, so per-client shards
+        # (~1667 vs ~1428 avg) differ from EVERY N=7 cell even at seed=42.
+        # Attacker fraction is 1/6 ≈ 16.7% (vs 2/7 ≈ 28.6% canonical).
+        # num_attackers=1 deviates from the canonical attack-strength baseline
+        # BY EXPLICIT REQUEST (single-attacker FoolsGold arm); the `n6,atk1`
+        # tags in experiment_name mark it (distinct from the earlier N=7
+        # 6-benign+1-attacker `atk1` arm).
         # NOTE: meta-llama/Llama-3.2-1B is GATED — accept the license on HF and
         # provide HF_TOKEN (Colab Step 2 logs in automatically). Needs A100
         # (fp32 ~5GB/copy; does NOT fit a T4 15GB).
-        'experiment_name': 'yahoo-(non-iid0.5)-foolsgold-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8,atk1)-llama3.2-1b',
+        'experiment_name': 'yahoo-(non-iid0.5)-foolsgold-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8,n6,atk1)-llama3.2-1b',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
-        'num_clients': 7,    # Total clients: 6 benign, 1 attacker (single-attacker arm)
-        'num_attackers': 1,  # 1 attacker (C6, the last client), per-round randomized label-flip
+        'num_clients': 6,    # Total clients: 5 benign, 1 attacker (benign cohort
+                             # matches the canonical 5b+2a config; N=6)
+        'num_attackers': 1,  # 1 attacker (C5, the last client), per-round randomized label-flip
         'num_rounds': 50,    # 50 × 1 local epoch = the paper regime (~3-4 h on T4).
                              # Also gives the suspicion EMA (β=0.6, ~2-3 round lag)
                              # a long steady state; 10-round runs are smoke tests.
@@ -1291,7 +1300,7 @@ def main(config_overrides: Optional[Dict] = None):
         'data_distribution': 'non-iid',  # 'iid' uniform, 'non-iid' Dirichlet-heterogeneous
         'dirichlet_alpha': 0.5,          # Only used when data_distribution='non-iid'. Lower = more heterogeneous.
         # 'dataset_size_limit': None,  # Full dataset: AG News ~120K; IMDB 25K; DBpedia 560K; Yahoo Answers 1.4M
-        'dataset_size_limit': 10000,  # 10K train → ~1428 samples/client on average (7 clients;
+        'dataset_size_limit': 10000,  # 10K train → ~1667 samples/client on average (6 clients;
                                       # per-client sizes vary under Dirichlet); test ≤ 1500.
                                       # Held fixed across ALL datasets for cross-dataset comparability
                                       # (every loader subsamples with the same seeded rng(42))
@@ -1592,7 +1601,7 @@ def main(config_overrides: Optional[Dict] = None):
         # server owns the probe batches; defense_config.semantic_probe_stratified
         # controls HOW they are sampled).  100 → 25 per class under stratified
         # sampling on AG News's 4 classes (10/class on Yahoo's 10; the old
-        # default 64 left only 6-7).  Per-round cost is 7 clients × 100 short
+        # default 64 left only 6-7).  Per-round cost is N clients × 100 short
         # forwards — negligible.
         'semantic_probe_size': 100,
 
