@@ -82,6 +82,7 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 - **requirements.txt 受 Colab 镜像约束**：特别是 `torchao` / `peft` / `transformers` 版本兼容（见文件内注释 line 11-13）
 - **LoRA `target_modules=None` 含义是"用 PEFT 默认"**：默认对 DistilBERT 友好；换冷门 backbone 时可能需要显式列出 attn projection 名
 - **CSE 每轮免费**（共享 test forward），**PPL 是 FL 结束后一次性**（需要 checkpoint）——不要把 PPL 计算挪进每轮循环
+- **`trust_mode: 'v4_cse_reject'`（V4，2026-07-28）改变 server 的评估时序**：server 会在**聚合前**对每个 client 做 full-test local eval（`Server._needs_local_cse`），并强制每轮 local eval（覆盖 `eval_local_every_n_rounds`）；缺 `local_cse` 会 loud crash（defense 层在 FedAvg-fallback try 之前校验，不会静默回退）。rank cap **复用 `num_byzantine`**（要求 < N/2，runtime 构造时校验）；`v4_tau_ratio=1.85` 是预注册值，跑完实验**不许回调**。与 AugMP（crafts_update）不兼容（local CSE 看不到伪造 update）。V4 信号**绝不过 `_zscore`**——被否决的替代方案与理由记录在 [docs/DECISION.md](docs/DECISION.md)
 
 ## Out of Scope（V1 不主动做，除非明说）
 

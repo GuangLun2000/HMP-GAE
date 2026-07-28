@@ -1217,39 +1217,29 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: FoolsGold single-attacker arm — FoolsGold vs
-        # === Hallucination on Yahoo Answers (non-IID 0.5, 10 classes),
-        # === Llama-3.2-1B backbone, 5 benign + 1 attacker (N=6) ===
-        # Probes FoolsGold's known blind spot: its signal is cross-attacker
-        # cosine similarity of accumulated updates (sybil coordination), so a
-        # SINGLE attacker has no coordinating peer to correlate with.
-        # Control-variable strategy: hold the BENIGN COHORT at 5 (same as the
-        # canonical 5-benign+2-attacker config) and remove one attacker, so
-        # N drops 7 -> 6.  Held fixed vs the Yahoo/Llama companion cells:
-        # 50 rounds, seed=42, LoRA r=8, batch 32, lr 5e-5, max_length=128,
-        # 10K subset, Dirichlet(0.5), DEFAULT attack strength
-        # flip_ratio_range=[0.3,0.8], per-round randomized flip code path.
-        # Intended single moving axis:
-        #   vs yahoo-foolsgold-llama 2-attacker arm : one attacker removed
-        #     (benign cohort unchanged at 5; num_attackers 2 -> 1, N 7 -> 6)
-        # CAVEAT (inherent to changing N): the Dirichlet partition splits the
-        # same 10K pool over 6 instead of 7 clients, so per-client shards
-        # (~1667 vs ~1428 avg) differ from EVERY N=7 cell even at seed=42.
-        # Attacker fraction is 1/6 ≈ 16.7% (vs 2/7 ≈ 28.6% canonical).
-        # num_attackers=1 deviates from the canonical attack-strength baseline
-        # BY EXPLICIT REQUEST (single-attacker FoolsGold arm); the `n6,atk1`
-        # tags in experiment_name mark it (distinct from the earlier N=7
-        # 6-benign+1-attacker `atk1` arm).
+        # === CURRENT RUN: canonical HMP-GAE arm — HMP-GAE vs Hallucination
+        # === on Yahoo Answers (non-IID 0.5, 10 classes), Llama-3.2-1B
+        # === backbone, 5 benign + 2 attackers (N=7) ===
+        # Restored 2026-07-28 (was temporarily the FoolsGold n6/atk1 arm):
+        # this is the arm every archived 7-client/2-attacker HMP-GAE run is
+        # comparable to. Held fixed (canonical skeleton): 50 rounds, seed=42,
+        # LoRA r=8, batch 32, lr 5e-5, max_length=128, 10K subset,
+        # Dirichlet(0.5), DEFAULT attack strength flip_ratio_range=[0.3,0.8],
+        # per-round randomized flip code path.
+        # V4 delta (trust_mode='v4_cse_reject' + Qwen backbone for the
+        # confirmatory run) goes through COLAB_CONFIG_OVERRIDES / run_suite(),
+        # NOT by editing this dict or notebook cells — defense_config merges
+        # one level deep in main(), so a single-key override like
+        # {'defense_config': {'trust_mode': 'v4_cse_reject'}} works.
         # NOTE: meta-llama/Llama-3.2-1B is GATED — accept the license on HF and
         # provide HF_TOKEN (Colab Step 2 logs in automatically). Needs A100
         # (fp32 ~5GB/copy; does NOT fit a T4 15GB).
-        'experiment_name': 'yahoo-(non-iid0.5)-foolsgold-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8,n6,atk1)-llama3.2-1b',
+        'experiment_name': 'yahoo-(non-iid0.5)-hmpgae-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
-        'num_clients': 6,    # Total clients: 5 benign, 1 attacker (benign cohort
-                             # matches the canonical 5b+2a config; N=6)
-        'num_attackers': 1,  # 1 attacker (C5, the last client), per-round randomized label-flip
+        'num_clients': 7,    # Total clients: 5 benign + 2 attackers (canonical arm)
+        'num_attackers': 2,  # 2 attackers (C5, C6 — the last clients), per-round randomized label-flip
         'num_rounds': 50,    # 50 × 1 local epoch = the paper regime (~3-4 h on T4).
                              # Also gives the suspicion EMA (β=0.6, ~2-3 round lag)
                              # a long steady state; 10-round runs are smoke tests.
@@ -1300,7 +1290,7 @@ def main(config_overrides: Optional[Dict] = None):
         'data_distribution': 'non-iid',  # 'iid' uniform, 'non-iid' Dirichlet-heterogeneous
         'dirichlet_alpha': 0.5,          # Only used when data_distribution='non-iid'. Lower = more heterogeneous.
         # 'dataset_size_limit': None,  # Full dataset: AG News ~120K; IMDB 25K; DBpedia 560K; Yahoo Answers 1.4M
-        'dataset_size_limit': 10000,  # 10K train → ~1667 samples/client on average (6 clients;
+        'dataset_size_limit': 10000,  # 10K train → ~1428 samples/client on average (7 clients;
                                       # per-client sizes vary under Dirichlet); test ≤ 1500.
                                       # Held fixed across ALL datasets for cross-dataset comparability
                                       # (every loader subsamples with the same seeded rng(42))
@@ -1339,8 +1329,8 @@ def main(config_overrides: Optional[Dict] = None):
 
         # ========== Attack Configuration ==========
         # Supported: 'NoAttack' | 'Hallucination' (this paper) | 'SignFlipping' | 'Gaussian' | 'ALIE'
-        # Current value is 'Hallucination' (paired with num_attackers=1, the
-        # single-attacker FoolsGold arm): the proposed per-round randomized
+        # Current value is 'Hallucination' (paired with num_attackers=2, the
+        # canonical 5-benign+2-attacker arm): the proposed per-round randomized
         # label-flipping attack. Switch to 'NoAttack' (with num_attackers=0)
         # for the clean ceiling, or to one of the classical-baseline strings
         # for V2 comparison runs.
@@ -1445,14 +1435,13 @@ def main(config_overrides: Optional[Dict] = None):
         #   'fedavg'    — standard data-size-weighted FedAvg (no-defense baseline)
         #   'hmp_gae'   — HMP-GAE immunization (this paper, requires hmp_gae/ subpackage)
         #   'foolsgold' — FoolsGold (RAID '20), baseline defense
-        # Current value is 'foolsgold': cross-attacker cosine similarity of
-        # accumulated updates.  It consumes ONLY defense_config.epsilon; every
-        # other key below (HMP-GAE knobs, fltrust anchor, krum num_byzantine)
-        # is INERT for this run.  server.py gates the per-round semantic probe
-        # forward on defense_method=='hmp_gae' AND semantic_weight>0, so no
-        # probe forwards run either.  Switch to 'hmp_gae' for the defended
-        # arm; the block below then goes live unchanged.
-        'defense_method': 'foolsgold',
+        # Current value is 'hmp_gae' (this paper, the canonical defended arm):
+        # the full defense_config block below is live.  server.py gates the
+        # per-round semantic probe forward on defense_method=='hmp_gae' AND
+        # semantic_weight>0.  The foolsgold/fltrust/krum keys below are INERT
+        # under hmp_gae (krum's num_byzantine is REUSED by the V4 rule as its
+        # rank cap — see the V4 block below).
+        'defense_method': 'hmp_gae',
         'defense_config': {
 
             # config for foolsgold
@@ -1550,7 +1539,37 @@ def main(config_overrides: Optional[Dict] = None):
             #   'reject_then_fedavg': hard binary rejection (gate_signal > threshold),
             #       then FedAvg.  Calibrated for 8B/2A; fragile on other configs.
             #   'softmax': pure softmax of trust logits (concentrates on 1-2 clients).
+            #   'v4_cse_reject' (V4, 2026-07-28): rejection driven by the
+            #       ABSOLUTE per-client full-test CSE, pool-median normalised
+            #       and rank-capped (trust_scorer.v4_cse_reject_weights):
+            #         r_i = local_cse_i / median(local_cse);
+            #         flag the top-num_byzantine clients by r with r >
+            #         v4_tau_ratio; flagged weight ×= v4_reject_mult;
+            #         final = normalize(mult × n_k).
+            #       The four geometry channels stay computed + logged as
+            #       diagnostics. The server then evaluates per-client local
+            #       CSE BEFORE aggregation every round (identical values to
+            #       the legacy post-aggregation eval — client models are
+            #       untouched by aggregation — so no extra eval cost at
+            #       eval_local_every_n_rounds=1). Requires num_byzantine < N/2
+            #       (validated at runtime construction). NOT supported with
+            #       update-forging attackers (AugMP).
             'trust_mode': 'soft_reject_fedavg',
+            # --- V4 CSE rejection knobs (INERT unless trust_mode='v4_cse_reject') ---
+            # v4_tau_ratio: pre-registered 1.85 (zero-FP plateau [1.785, 1.90]
+            #   over 51 archived runs / 17,850 client-round decisions,
+            #   including all 5 no-attacker baselines). Do NOT re-tune after
+            #   seeing a confirmatory run. Headroom is thin (max clean-run
+            #   ratio observed 1.7833) and Qwen-only — a Llama no-attack
+            #   baseline (validation plan Run 0) is the missing check.
+            # v4_reject_mult: SOFT rejection multiplier — 0.10, not 0.0 (hard
+            #   zeroing is FoolsGold's mechanism: worst archive PPL 1549 on
+            #   Qwen Yahoo). Not separately validated — the first knob to
+            #   sweep if a confirmatory run shows residual attacker mass.
+            # The rank cap REUSES 'num_byzantine' above (no new key); keep_min
+            #   below also applies.
+            'v4_tau_ratio': 1.85,
+            'v4_reject_mult': 0.10,
             # --- Robust suspicion scale (2026-07-04) ---
             # zscore_mode 'mad': median/MAD z-scores.  mean/std gets polluted
             #   as the attacker fraction grows (attackers drag the mean toward
@@ -1576,10 +1595,29 @@ def main(config_overrides: Optional[Dict] = None):
             # Legacy behavior = {'zscore_mode': 'std', 'gate_rezscore': True,
             #   'sus_ema_beta': 0.0, 'reject_z_threshold': 0.75,
             #   'semantic_reference': 'pairwise',
-            #   'semantic_probe_stratified': False} — override these six keys
-            #   to reproduce pre-2026-07 runs bit-for-bit.
+            #   'semantic_probe_stratified': False, 'graph_min_distinct': 0}
+            #   — override these seven keys to reproduce pre-2026-07 runs
+            #   bit-for-bit. (C1 2026-07-28 caveat: bit-for-bit holds because
+            #   the legacy set uses zscore_mode='std', where the relative
+            #   MAD-degeneracy guard is inert and std-z is self-bounded below
+            #   zscore_clip; zscore_mode='mad' runs are NOT bit-reproducible
+            #   across the C1 change — the old per-channel-clip/absolute-guard
+            #   behavior was the bug being fixed.)
             'zscore_mode': 'mad',
+            # zscore_clip now bounds the FUSED score s (post-fusion, C1
+            # 2026-07-28), not each channel: per-channel clipping pinned a
+            # near-degenerate channel's attacker AND benign z at exactly ±10
+            # (an exact rank tie in 100% of saturated Yahoo rounds).
             'zscore_clip': 10.0,
+            # C1 (2026-07-28): zero the graph channel (and drop its weight
+            # from the gate's weight_norm) in rounds where graph_residual
+            # resolves fewer than this many distinct values across clients.
+            # With knn_k=2 and N=7 it takes only 4-5 discrete levels
+            # (multiples of 1/6); its MAD was exactly 0 in 33-44 of 50 Yahoo
+            # rounds, silently falling back to std. Do NOT re-tune knn_k
+            # instead. 0 = off (legacy). Diagnostics-only under
+            # trust_mode='v4_cse_reject' (geometry no longer drives rejection).
+            'graph_min_distinct': 4,
             'gate_rezscore': False,
             'sus_ema_beta': 0.6,
             'reject_z_threshold': 2.5,   # sigmoid midpoint, in per-signal robust-z
@@ -1660,7 +1698,18 @@ def main(config_overrides: Optional[Dict] = None):
 
     }
     if config_overrides:
-        config.update(config_overrides)
+        overrides = dict(config_overrides)
+        # Merge defense_config ONE level deep: an override like
+        # {'defense_config': {'trust_mode': 'v4_cse_reject'}} adjusts single
+        # knobs without silently dropping every other defense key (a plain
+        # dict.update would replace the whole sub-dict, and the runtime's
+        # code-level defaults differ from this dict's tuned values).
+        dc_override = overrides.pop('defense_config', None)
+        if dc_override:
+            merged_dc = dict(config.get('defense_config') or {})
+            merged_dc.update(dc_override)
+            config['defense_config'] = merged_dc
+        config.update(overrides)
 
     # Run experiment (attack if num_attackers > 0 AND attack_method != 'NoAttack',
     # otherwise baseline). 'NoAttack' overrides num_attackers (see setup_experiment).

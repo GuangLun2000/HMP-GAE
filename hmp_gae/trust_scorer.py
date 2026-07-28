@@ -29,11 +29,16 @@
 #     attacker has to *both* match update statistics *and* produce benign-like
 #     per-sample probabilities, which is incompatible with hallucination).
 #   - tau -> 0 = Krum-like hard selection; tau in [0.05, 0.5] = soft rejection.
+#
+# V4 (2026-07-28): trust_mode='v4_cse_reject' replaces the four channels above
+# as the REJECTION signal with an absolute per-client statistic — full-test
+# local CSE, pool-median normalised and rank-capped (v4_cse_reject_weights).
+# The four channels keep being computed and logged as diagnostics.
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -66,6 +71,10 @@ class TrustResult:
     # rescaling / enabling additional signals (otherwise adding a signal
     # would silently tighten the same numeric threshold).
     weight_norm: float = 1.0
+    # True when the graph channel was zeroed this round because it resolved
+    # fewer than `graph_min_distinct` distinct values across clients (its
+    # weight is then also excluded from weight_norm). See compute_trust_weights.
+    graph_gated: bool = False
 
 
 def _zscore(
@@ -82,10 +91,18 @@ def _zscore(
         and their own z-scores back into the benign range.
     mode='mad': robust (x - median) / (1.4826 * MAD). The median/MAD are
         computed from the (benign) majority, so attacker z-scores stay large
-        up to a ~50% attacker fraction. When MAD degenerates to 0 (e.g. the
-        coarsely-quantized graph_residual where the benign majority ties
-        exactly), fall back to the std scale rather than dividing by eps --
-        otherwise a single one-quantum deviation would explode to z ~ 1e5.
+        up to a ~50% attacker fraction. Degeneracy guard (RELATIVE since
+        2026-07-28, V4/C1): a scale is degenerate when it is negligible
+        relative to the channel's own magnitude (scale < 1e-3 * max|x|), not
+        merely below an absolute eps -- the old absolute guard never fired on
+        near-degenerate channels like recon_residual (client spread ~1e-4
+        around ~0.49), so z exploded to 18-36x and the clip pinned attacker
+        AND benign at the bound, an exact rank tie. Handling:
+          * MAD-scale degenerate -> fall back to the std scale (a lone genuine
+            outlier above a tied benign majority stays resolvable, and std-z
+            is self-bounded by (N-1)/sqrt(N) so nothing explodes);
+          * std ALSO degenerate  -> the channel carries no within-round
+            information; return all zeros instead of amplifying noise.
 
     clip: optional symmetric bound on |z|. Keeps a genuinely extreme outlier
         from dominating the weighted signal sum by orders of magnitude.
@@ -97,8 +114,11 @@ def _zscore(
         med = x.median()
         mad = (x - med).abs().median()
         scale = 1.4826 * mad
-        if float(scale) < eps:
+        degenerate = max(1e-3 * float(x.abs().max()), eps)
+        if float(scale) < degenerate:
             scale = x.std(unbiased=False)
+            if float(scale) < degenerate:
+                return torch.zeros_like(x)
         z = (x - med) / scale.clamp(min=eps)
     elif m == "std":
         mean = x.mean()
@@ -210,6 +230,7 @@ def compute_trust_weights(
     zscore_clip: Optional[float] = None,
     semantic_reference: str = "pairwise",
     semantic_confidence_weight: bool = False,
+    graph_min_distinct: int = 0,
 ) -> TrustResult:
     """
     Compute closed-form trust weights for N clients.
@@ -232,6 +253,17 @@ def compute_trust_weights(
         Z:      (N, d) latent embeddings from the HMP encoder.
         Z_hist: (N, d) EMA history embeddings (None on cold start).
         H:      (N, M) incidence matrix (optional; required for graph signal).
+        zscore_clip: symmetric bound applied to the FUSED score s (post-fusion
+            since 2026-07-28, V4/C1). Per-channel clipping used to pin a
+            near-degenerate channel's attacker AND benign z at exactly +/-clip
+            (an exact rank tie); the per-channel *_z diagnostics are now
+            unclipped and only the weighted sum is bounded.
+        graph_min_distinct: gate the graph channel out of s (z := 0, weight
+            excluded from weight_norm) in rounds where graph_residual resolves
+            fewer than this many distinct values across clients. With knn_k=2
+            and N=7 the channel takes only 4-5 discrete levels (multiples of
+            1/6), so its within-round MAD is often exactly 0 and it degrades
+            to quantization noise. 0 = off (legacy behavior, default).
 
     Returns:
         TrustResult with alpha (N,) and diagnostic tensors.
@@ -292,14 +324,29 @@ def compute_trust_weights(
         hist_dev = (Z - Z_hist_d).norm(dim=1)
         use_hist = True
 
-    graph_residual_z = _zscore(graph_residual, mode=zscore_mode, clip=zscore_clip)
-    recon_residual_z = _zscore(recon_residual, mode=zscore_mode, clip=zscore_clip)
+    # Resolution gating for the coarsely-quantized graph channel: when the
+    # round resolves too few distinct levels, the channel is quantization
+    # noise, not signal — zero it and drop its weight from weight_norm (a
+    # zeroed channel whose weight stays in the norm would silently RAISE the
+    # effective gate threshold; cf. the active_sq bookkeeping below).
+    use_graph = True
+    if graph_min_distinct and int(graph_min_distinct) > 0 and N > 1:
+        if int(torch.unique(graph_residual).numel()) < int(graph_min_distinct):
+            use_graph = False
+
+    # Per-channel z-scores are intentionally UNCLIPPED (diagnostics keep the
+    # true magnitudes); zscore_clip is applied to the fused s below.
+    graph_residual_z = (
+        _zscore(graph_residual, mode=zscore_mode)
+        if use_graph else torch.zeros_like(graph_residual)
+    )
+    recon_residual_z = _zscore(recon_residual, mode=zscore_mode)
     sem_div_z = (
-        _zscore(sem_div, mode=zscore_mode, clip=zscore_clip)
+        _zscore(sem_div, mode=zscore_mode)
         if use_sem else torch.zeros_like(sem_div)
     )
     hist_dev_z = (
-        _zscore(hist_dev, mode=zscore_mode, clip=zscore_clip)
+        _zscore(hist_dev, mode=zscore_mode)
         if use_hist else torch.zeros_like(hist_dev)
     )
 
@@ -309,12 +356,20 @@ def compute_trust_weights(
         + semantic_weight * sem_div_z
         + hist_weight_beta * hist_dev_z
     )
+    # Post-fusion bound (moved here from the per-channel calls, 2026-07-28):
+    # caps a genuinely extreme outlier's dominance without manufacturing
+    # exact +/-clip ties inside a single channel.
+    if zscore_clip is not None:
+        c = abs(float(zscore_clip))
+        s = s.clamp(min=-c, max=c)
 
     # L2 norm of the weights of the signals that actually contributed to s.
     # The gate_rezscore=False path divides the suspicion score by this so the
     # rejection threshold is expressed in per-signal z units and stays valid
     # when signal weights are rescaled or extra signals are switched on.
-    active_sq = float(graph_weight) ** 2 + float(residual_weight_alpha) ** 2
+    active_sq = float(residual_weight_alpha) ** 2
+    if use_graph:
+        active_sq += float(graph_weight) ** 2
     if use_sem:
         active_sq += float(semantic_weight) ** 2
     if use_hist:
@@ -338,7 +393,103 @@ def compute_trust_weights(
         hist_dev=hist_dev,
         hist_dev_z=hist_dev_z,
         weight_norm=weight_norm,
+        graph_gated=not use_graph,
     )
+
+
+def v4_cse_reject_weights(
+    local_cse: torch.Tensor,
+    data_sizes: torch.Tensor,
+    tau_ratio: float = 1.85,
+    k_cap: int = 2,
+    reject_mult: float = 0.10,
+    keep_min: int = 1,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    V4 rejection rule (2026-07-28): per-client CSE, pool-median normalised,
+    rank-capped. Replaces the four geometry channels AS THE REJECTION SIGNAL
+    (they stay computed and logged as diagnostics in the runtime).
+
+        r_i     = local_cse_i / max(median(local_cse), eps)
+        flagged = { top-k_cap clients by r }  INTERSECT  { r > tau_ratio }
+        m_i     = reject_mult if flagged else 1.0
+        w       = normalize(m_i * n_i)
+
+    Both conditions are required: the rank cap alone is what makes the rule
+    zero-false-positive on the archived no-attacker baselines (at tau=1.85
+    with NO cap there are 36 benign false-flags; with k_cap=2, zero), and the
+    ratio floor alone is what keeps a clean federation from always flagging
+    its top-k. Validated by replay over 51 archived runs / 17,850 client-round
+    decisions: ~89-90% exact-detection rounds, 0 false positives including all
+    5 no-attacker baselines. Residual errors are cold-start false negatives
+    (78% in rounds <= 5).
+
+    Design constraints honoured here (see HMP-GAE-V4-coding-brief.md):
+      * local_cse must be the ABSOLUTE per-client statistic (full-test CSE) —
+        do NOT route it through _zscore: pool-relative scoring has no absolute
+        floor and scapegoats the most heterogeneous benign client in a clean
+        federation (fails test_no_attack_no_scapegoat).
+      * reject_mult is SOFT (0.10), not 0.0 — hard zeroing is FoolsGold's
+        mechanism and carries the archive's worst PPL for Qwen Yahoo.
+      * tau_ratio=1.85 is pre-registered (zero-FP plateau [1.785, 1.90]); do
+        not re-tune it after seeing a confirmatory run.
+      * k_cap reuses defense_config.num_byzantine; the rule is sound only for
+        #attackers <= k_cap < N/2 (the pool median must be benign-controlled;
+        majority-poisoned federations invert it). The runtime validates this
+        at construction.
+
+    Args:
+        local_cse:  (N,) per-client CSE (absolute scale, NOT z-scored).
+        data_sizes: (N,) raw data-size prior n_i (unchanged, uncapped —
+                    changing n_i would alter the rule for every run and break
+                    FedAvg comparability).
+        keep_min:   defensive floor on unflagged clients (structurally
+                    guaranteed anyway while k_cap < N/2).
+
+    Returns:
+        (weights, diag) where weights is (N,) summing to 1 and diag carries
+        'ratio' (N,), 'flagged' (N,) bool, 'multiplier' (N,), 'median' float.
+    """
+    x = local_cse.detach().to(dtype=torch.float32)
+    N = int(x.numel())
+    if N == 0:
+        raise ValueError("v4_cse_reject_weights received an empty local_cse")
+    ds = data_sizes.detach().to(device=x.device, dtype=torch.float32)
+    if int(ds.numel()) != N:
+        raise ValueError(
+            f"data_sizes length {int(ds.numel())} != local_cse length {N}"
+        )
+
+    med = x.median()
+    ratio = x / med.clamp(min=eps)
+
+    order = torch.argsort(ratio, descending=True)
+    max_flags = min(max(0, int(k_cap)), max(0, N - max(1, int(keep_min))))
+    flagged = torch.zeros(N, dtype=torch.bool, device=x.device)
+    for j in order[:max_flags].tolist():
+        if float(ratio[j]) > float(tau_ratio):
+            flagged[j] = True
+
+    mult = torch.where(
+        flagged,
+        torch.full_like(x, float(reject_mult)),
+        torch.ones_like(x),
+    )
+    w = mult * ds
+    total = w.sum()
+    if float(total) <= 0.0:
+        w = mult.clone()
+        total = w.sum().clamp(min=1.0)
+    w = w / total
+
+    diag: Dict[str, Any] = {
+        "ratio": ratio,
+        "flagged": flagged,
+        "multiplier": mult,
+        "median": float(med),
+    }
+    return w, diag
 
 
 def weighted_aggregate(updates, alpha: torch.Tensor) -> torch.Tensor:

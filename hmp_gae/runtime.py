@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,7 +32,14 @@ from .hypergraph import knn_hypergraph
 from .encoder import HMPEncoder
 from .decoder import inner_product_decoder, HyperedgeDecoder
 from .losses import total_loss
-from .trust_scorer import compute_trust_weights, weighted_aggregate, reject_then_weighted, reject_soft_weighted, gate_diagnostics
+from .trust_scorer import (
+    compute_trust_weights,
+    weighted_aggregate,
+    reject_then_weighted,
+    reject_soft_weighted,
+    gate_diagnostics,
+    v4_cse_reject_weights,
+)
 
 
 class HMPGAERuntime:
@@ -131,7 +139,60 @@ class HMPGAERuntime:
         #     then data-size FedAvg among kept clients.  Fragile near threshold.
         #   'softmax': pure softmax on trust logits; tends to concentrate
         #     weight on 1-2 benign clients when residuals are tied.
-        self.trust_mode = str(self.cfg.get("trust_mode", "soft_reject_fedavg"))
+        #   'v4_cse_reject' (V4, 2026-07-28): rejection driven by the ABSOLUTE
+        #     per-client full-test CSE, pool-median normalised and rank-capped
+        #     (see trust_scorer.v4_cse_reject_weights). The four geometry
+        #     channels stay computed + logged as diagnostics but no longer
+        #     drive rejection. Requires the server to evaluate local CSE
+        #     BEFORE aggregation and pass it via aggregate(local_cse=...).
+        self.trust_mode = str(
+            self.cfg.get("trust_mode", "soft_reject_fedavg")
+        ).strip().lower()
+        # Unknown values used to silently fall into the 'softmax' catch-all
+        # branch — a typo'd mode (e.g. 'v4_cse_rejects') would quietly run a
+        # different aggregation rule for 50 rounds. Fail loudly instead.
+        _known_modes = {
+            "soft_reject_fedavg", "reject_then_fedavg", "softmax",
+            "v4_cse_reject",
+        }
+        if self.trust_mode not in _known_modes:
+            raise ValueError(
+                f"Unknown trust_mode={self.trust_mode!r}; expected one of "
+                f"{sorted(_known_modes)}"
+            )
+        # --- V4 knobs (inert unless trust_mode == 'v4_cse_reject') ---
+        #   v4_tau_ratio  : pre-registered 1.85 (zero-FP plateau [1.785, 1.90]
+        #                   over 51 archived runs); do NOT re-tune post hoc.
+        #   k_cap         : REUSES defense_config.num_byzantine — no new
+        #                   hyperparameter. Rule is sound only for
+        #                   #attackers <= k_cap < N/2 (validated below).
+        #   v4_reject_mult: soft rejection multiplier, 0.10 — NOT 0.0 (hard
+        #                   zeroing is FoolsGold's mechanism, the archive's
+        #                   worst PPL); first knob to sweep if a confirmatory
+        #                   run shows residual attacker mass.
+        self.v4_tau_ratio = float(self.cfg.get("v4_tau_ratio", 1.85))
+        self.v4_reject_mult = float(self.cfg.get("v4_reject_mult", 0.10))
+        self.v4_k_cap = int(self.cfg.get("num_byzantine", 2))
+        if self.trust_mode == "v4_cse_reject":
+            # The pool median must be benign-controlled: majority-poisoned
+            # federations invert the rule. Raise (not assert) so a bad config
+            # fails loudly at construction — _lazy_init runs OUTSIDE the
+            # FedAvg-fallback try/except in HMPGAEDefense.aggregate.
+            if not (0 < self.v4_k_cap and 2 * self.v4_k_cap < self.num_clients):
+                raise ValueError(
+                    "trust_mode='v4_cse_reject' requires "
+                    f"0 < num_byzantine < N/2; got num_byzantine={self.v4_k_cap} "
+                    f"with N={self.num_clients}"
+                )
+            if not (self.v4_tau_ratio > 1.0):
+                raise ValueError(
+                    f"v4_tau_ratio must be > 1.0, got {self.v4_tau_ratio}"
+                )
+            if not (0.0 < self.v4_reject_mult < 1.0):
+                raise ValueError(
+                    "v4_reject_mult must be in (0, 1) — 0.0 is FoolsGold-style "
+                    f"hard zeroing (rejected); got {self.v4_reject_mult}"
+                )
         # reject_z_threshold: midpoint of the sigmoid gate for soft_reject_fedavg,
         # or the hard cutoff for reject_then_fedavg.  Same scale (gr_z units)
         # for both modes so switching is a single config-key change.
@@ -151,6 +212,12 @@ class HMPGAERuntime:
         else:
             self.gate_signal = str(cfg_gate)
         self.hist_ema_beta = float(self.cfg.get("hist_ema_beta", 0.9))
+        # graph_min_distinct: zero the graph channel (and drop its weight from
+        # weight_norm) in rounds where graph_residual resolves fewer than this
+        # many distinct values across clients. With knn_k=2 and N=7 the channel
+        # takes only 4-5 discrete levels (multiples of 1/6) and its MAD is
+        # exactly 0 in most Yahoo rounds. 0 = off (legacy behavior).
+        self.graph_min_distinct = int(self.cfg.get("graph_min_distinct", 0))
         self.proj_seed = int(self.cfg.get("random_proj_seed", 42))
         # Cold-start policy: Signal 1 (graph_residual from k-NN hypergraph)
         # is computed from raw projected updates and does NOT need Z_hist.
@@ -270,6 +337,7 @@ class HMPGAERuntime:
         data_sizes: List[float],
         round_num: int,
         probe_distributions: "torch.Tensor | None" = None,
+        local_cse: "List[float] | None" = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         t0 = time.perf_counter()
 
@@ -380,6 +448,7 @@ class HMPGAERuntime:
                 zscore_clip=self.zscore_clip,
                 semantic_reference=self.semantic_reference,
                 semantic_confidence_weight=self.semantic_confidence_weight,
+                graph_min_distinct=self.graph_min_distinct,
             )
 
         # ---- 3b) Suspicion score + cross-round EMA smoothing ---- #
@@ -413,9 +482,40 @@ class HMPGAERuntime:
         use_cold_start_fallback = (
             self.cold_start_fallback and (not has_hist)
         )
+        v4_diag: "Dict[str, Any] | None" = None
+        v4_cse_t: "torch.Tensor | None" = None
         if use_cold_start_fallback:
             used_alpha = alpha_cold
             used_mode = "cold_start_fedavg"
+        elif self.trust_mode == "v4_cse_reject":
+            # V4: rejection driven by the absolute per-client full-test CSE.
+            # local_cse is required — do NOT silently fall back (the defense
+            # facade also validates this BEFORE its FedAvg-fallback net).
+            # Deliberately routed AROUND _zscore: pool-relative scoring has no
+            # absolute floor and scapegoats the most heterogeneous benign
+            # client in a clean federation.
+            if local_cse is None:
+                raise ValueError(
+                    "trust_mode='v4_cse_reject' requires per-client local_cse; "
+                    "the server must evaluate local CSE BEFORE aggregation "
+                    "(see Server._needs_local_cse)."
+                )
+            v4_cse_t = torch.as_tensor(
+                list(local_cse), dtype=torch.float32, device=self.device
+            )
+            if v4_cse_t.numel() != N:
+                raise ValueError(
+                    f"local_cse must have length N={N}, got {v4_cse_t.numel()}"
+                )
+            used_alpha, v4_diag = v4_cse_reject_weights(
+                local_cse=v4_cse_t,
+                data_sizes=ds_tensor,
+                tau_ratio=self.v4_tau_ratio,
+                k_cap=self.v4_k_cap,
+                reject_mult=self.v4_reject_mult,
+                keep_min=self.keep_min,
+            )
+            used_mode = "v4_cse_reject"
         elif self.trust_mode == "soft_reject_fedavg":
             # Soft sigmoid gate on the suspicion z-score selected by gate_signal,
             # then data-size FedAvg among the (continuously) trusted clients.
@@ -519,8 +619,35 @@ class HMPGAERuntime:
             "has_history": bool(has_hist),
             "cold_start_fallback_used": bool(use_cold_start_fallback),
             "trust_mode_used": used_mode,
+            # C1 diagnostics: whether the coarsely-quantized graph channel was
+            # zeroed this round (resolution below graph_min_distinct).
+            "graph_channel_gated": bool(trust.graph_gated),
+            "graph_min_distinct": int(self.graph_min_distinct),
             "defense_time_ms": float(elapsed_ms),
         }
+        # V4 per-round diagnostics (only in trust_mode='v4_cse_reject').
+        if v4_diag is not None and v4_cse_t is not None:
+            stats["v4_cse"] = v4_cse_t.detach().cpu().tolist()
+            stats["v4_ratio"] = v4_diag["ratio"].detach().cpu().tolist()
+            stats["v4_flagged"] = [
+                int(b) for b in v4_diag["flagged"].detach().cpu().tolist()
+            ]
+            stats["v4_multiplier"] = v4_diag["multiplier"].detach().cpu().tolist()
+            stats["v4_median_cse"] = float(v4_diag["median"])
+            stats["v4_tau_ratio"] = float(self.v4_tau_ratio)
+            stats["v4_k_cap"] = int(self.v4_k_cap)
+            stats["v4_reject_mult"] = float(self.v4_reject_mult)
+        # Probe-entropy diagnostic (V4 brief, decision (d)): the mean
+        # per-sample entropy on the K-sample probe is the "free" pre-agg
+        # statistic under option (ii). Logged whenever the probe exists so a
+        # single run shows whether it agrees with the full-test local CSE
+        # (v4_cse) at the tau threshold. Diagnostic only — never drives
+        # rejection.
+        if probe_arg is not None:
+            Pp = probe_arg.clamp(min=1e-8)
+            Pp = Pp / Pp.sum(dim=-1, keepdim=True)
+            probe_cse = -(Pp * Pp.log()).sum(dim=-1).mean(dim=1)
+            stats["probe_cse"] = probe_cse.detach().cpu().tolist()
         if last_loss_bundle is not None:
             stats["L_rec"] = float(last_loss_bundle.L_rec_H.item())
             stats["L_smooth"] = float(last_loss_bundle.L_smooth.item())
@@ -539,13 +666,29 @@ class HMPGAERuntime:
     # the Adam optimizer, and the EMA latent cache z_hist.  The fixed random
     # projection and all hyperparameters are reconstructed deterministically
     # from config + random_proj_seed at __init__, so they are not stored.
+    # The V4 rule (trust_mode='v4_cse_reject') is deliberately STATELESS
+    # across rounds (per-round median ratio, no EMA), so it adds nothing here;
+    # if it ever grows cross-round state, serialize it alongside sus_ema or
+    # resumed runs will silently restart it.
 
     def state_dict(self) -> Dict[str, Any]:
+        # Deep-copy the module/optimizer payloads: torch's .state_dict()
+        # returns LIVE tensor references, and Optimizer.load_state_dict's
+        # .to(dtype/device) is a no-op for same-dtype CPU tensors — so an
+        # in-memory snapshot/restore used to end up SHARING the Adam moment
+        # tensors (exp_avg / exp_avg_sq / step) with the live optimizer.
+        # Two runtimes then double-updated the shared moments and a "resumed"
+        # runtime silently diverged from the uninterrupted one (caught by
+        # test_runtime_ema_and_state_roundtrip). The on-disk path
+        # (torch.save -> torch.load in fed_resume) broke the aliasing by
+        # serialization, so Colab resumes were unaffected — this makes the
+        # in-memory contract match, and keeps a held snapshot immutable
+        # instead of being polluted by later training steps.
         return {
-            "node_encoder": self.node_encoder.state_dict(),
-            "hmp_encoder": self.hmp_encoder.state_dict(),
-            "hyperedge_decoder": self.hyperedge_decoder.state_dict(),
-            "optim": self.optim.state_dict(),
+            "node_encoder": copy.deepcopy(self.node_encoder.state_dict()),
+            "hmp_encoder": copy.deepcopy(self.hmp_encoder.state_dict()),
+            "hyperedge_decoder": copy.deepcopy(self.hyperedge_decoder.state_dict()),
+            "optim": copy.deepcopy(self.optim.state_dict()),
             "z_hist": {int(k): v.detach().cpu().clone()
                        for k, v in self.z_hist.items()},
             "sus_ema": {int(k): float(v) for k, v in self.sus_ema.items()},

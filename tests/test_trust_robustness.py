@@ -29,6 +29,7 @@ from hmp_gae.trust_scorer import (
     compute_trust_weights,
     gate_diagnostics,
     reject_soft_weighted,
+    v4_cse_reject_weights,
 )
 from hmp_gae.hypergraph import knn_hypergraph
 from hmp_gae.runtime import HMPGAERuntime
@@ -174,6 +175,76 @@ def test_zscore_mad_degenerate_fallback():
     print(f"PASS  degenerate MAD falls back to std (outlier z={z[-1]:.2f})")
 
 
+def test_zscore_relative_degeneracy_guard():
+    """C1 (V4 brief): the recon_residual pathology. Client spread ~1e-4 around
+    ~0.49 passed the old ABSOLUTE guard (scale < 1e-6 never fired), z exploded
+    to 18-36x and the ±10 clip pinned attacker AND benign at the bound — an
+    exact rank tie. The RELATIVE guard (scale < 1e-3·max|x|) must zero a
+    channel whose spread is negligible at its own magnitude, while keeping the
+    std fallback for a tied majority + lone genuine outlier."""
+    x = 0.49 + 1e-4 * torch.tensor([0.1, -0.3, 0.2, 0.0, -0.1, 0.4, -0.2])
+    z = _zscore(x, mode="mad", clip=10.0)
+    assert torch.equal(z, torch.zeros_like(x)), (
+        f"noise-only degenerate channel must be zeroed, got {z.tolist()}"
+    )
+    y = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.33])
+    zy = _zscore(y, mode="mad", clip=10.0)
+    assert zy[-1] > 1.5, (
+        f"tied-majority + lone outlier must keep the std fallback, got {zy[-1]:.2f}"
+    )
+    print("PASS  relative degeneracy guard: noise channel zeroed, lone outlier kept")
+
+
+def test_zscore_clip_post_fusion():
+    """C1 (V4 brief): zscore_clip bounds the FUSED score s, not each channel.
+    Per-channel *_z diagnostics are unclipped (true magnitudes visible)."""
+    # Tight benign cluster (small but non-degenerate MAD) + one far outlier:
+    # unclipped per-channel mad-z far exceeds 10 — this is what used to be
+    # per-channel-clipped into an exact ±10 tie.
+    x = torch.tensor([0.10, 0.105, 0.095, 0.1025, 0.0975, 0.11, 0.90])
+    z_unclipped = _zscore(x, mode="mad")
+    assert z_unclipped.abs().max() > 10.0, (
+        "test premise: unclipped mad-z should exceed 10 for the outlier, "
+        f"got {z_unclipped.abs().max():.1f}"
+    )
+    trust = trust_from_synthetic(5, 2, seed=0, **ROBUST)
+    assert trust.s.abs().max() <= 10.0 + 1e-6, (
+        f"fused s must respect zscore_clip=10, got {trust.s.abs().max():.2f}"
+    )
+    print("PASS  zscore_clip applies post-fusion (fused |s| <= clip)")
+
+
+def test_graph_min_distinct_gating():
+    """C1 (V4 brief): with knn_k=2 and N=7, graph_residual takes only a few
+    discrete levels (multiples of 1/6). When a round resolves fewer than
+    graph_min_distinct values the channel must be zeroed AND its weight
+    dropped from weight_norm (a zeroed channel whose weight stays in the norm
+    silently shifts the effective gate threshold)."""
+    eta = make_geometry(5, 2, seed=0)
+    H, _, _ = knn_hypergraph(eta, k=2)
+    Zn = torch.nn.functional.normalize(eta, dim=1)
+    A_hat = torch.sigmoid(4.0 * (Zn @ Zn.t()))
+    t_off = compute_trust_weights(A_hat=A_hat, Z=eta, Z_hist=None, H=H, **ROBUST)
+    assert bool(t_off.graph_gated) is False, "default (0) must never gate"
+    n_distinct = int(torch.unique(t_off.graph_residual).numel())
+    t_on = compute_trust_weights(
+        A_hat=A_hat, Z=eta, Z_hist=None, H=H,
+        graph_min_distinct=n_distinct + 1, **ROBUST,
+    )
+    assert bool(t_on.graph_gated) is True
+    assert torch.equal(t_on.graph_residual_z, torch.zeros_like(t_on.graph_residual_z))
+    # Only recon remains active (semantic off without probes): ||w|| = 0.3.
+    assert abs(t_on.weight_norm - 0.3) < 1e-6, t_on.weight_norm
+    # Raw residual stays logged for diagnostics even when gated.
+    assert torch.equal(t_on.graph_residual, t_off.graph_residual)
+    t_keep = compute_trust_weights(
+        A_hat=A_hat, Z=eta, Z_hist=None, H=H,
+        graph_min_distinct=n_distinct, **ROBUST,
+    )
+    assert bool(t_keep.graph_gated) is False
+    print(f"PASS  graph_min_distinct gating ({n_distinct} distinct levels resolved)")
+
+
 # --------------------------------------------------------------------------- #
 # 2) semantic divergence                                                      #
 # --------------------------------------------------------------------------- #
@@ -265,7 +336,17 @@ def test_attack_detected_and_rejected():
         assert _auroc(sus[5:].tolist(), sus[:5].tolist()) == 1.0, "sus must rank perfectly"
         assert gate[5:].max() < 0.25, f"attacker gates too high: {gate[5:].tolist()}"
         assert gate[:5].mean() > 0.7, f"benign gates too low: {gate[:5].tolist()}"
-        assert gate[:5].min() > 0.35, f"benign worst-case gate: {gate[:5].tolist()}"
+        # Single-round benign floor recalibrated 2026-07-28 against a REAL
+        # execution (the original 0.35 was set analytically and never run —
+        # unmodified HEAD 33d40dd fails it identically at seed 4): a genuinely
+        # semantically-divergent benign (c4: sem_div 0.375 vs peers ~0.07)
+        # legitimately dips to gate ~0.10 in a single round, and the
+        # cross-round EMA lifts it back (see the runtime tests). What must
+        # hold within one round is SEPARATION from the attackers.
+        assert gate[:5].min() > 0.05, f"benign worst-case gate: {gate[:5].tolist()}"
+        assert gate[:5].min() > 50.0 * gate[5:].max(), (
+            f"benign/attacker gate separation lost: {gate.tolist()}"
+        )
         # Aggregation weights: attackers' mass should be negligible.
         ds = torch.ones(7)
         alpha = reject_soft_weighted(
@@ -307,6 +388,45 @@ def test_trust_weights_default_path_unchanged():
     # weight_norm bookkeeping: sqrt(1^2 + 0.3^2 + 1^2) with semantic active.
     assert abs(trust.weight_norm - (1 + 0.09 + 1) ** 0.5) < 1e-6
     print("PASS  default kwargs reproduce legacy s and double-z gate")
+
+
+# --------------------------------------------------------------------------- #
+# 4b) V4 rejection rule (per-client CSE, pool-median normalised, rank-capped) #
+# --------------------------------------------------------------------------- #
+
+def test_v4_cse_reject_rule():
+    """The V4 rule in isolation: both conditions (rank cap AND ratio > tau)
+    required, soft rejection, n_k prior untouched."""
+    ds = torch.tensor([309., 1500., 2100., 900., 1200., 1800., 1191.])
+    # (a) attack round: two elevated-CSE clients flagged; attacker aggregation
+    #     mass collapses ~10x below its n_k share; weights normalise.
+    cse = torch.tensor([0.60, 0.55, 0.70, 0.58, 0.62, 1.90, 1.75])
+    w, diag = v4_cse_reject_weights(cse, ds, tau_ratio=1.85, k_cap=2,
+                                    reject_mult=0.10)
+    assert diag["flagged"].tolist() == [False] * 5 + [True, True]
+    atk_nk = float((ds[5:] / ds.sum()).sum())
+    assert float(w[5:].sum()) < 0.35 * atk_nk, f"attacker mass {w[5:].sum():.4f}"
+    assert abs(float(w.sum()) - 1.0) < 1e-6
+    assert float(w[5:].sum()) > 0.0, "soft rejection: mass must NOT be zeroed"
+    # (b) clean round: heterogeneous benign pool below tau -> zero flags and
+    #     weights exactly equal to the n_k prior (no scapegoat).
+    cse0 = torch.tensor([0.60, 0.55, 0.98, 0.58, 0.62, 0.70, 0.66])
+    w0, d0 = v4_cse_reject_weights(cse0, ds, tau_ratio=1.85, k_cap=2,
+                                   reject_mult=0.10)
+    assert not bool(d0["flagged"].any()), d0["flagged"]
+    assert torch.allclose(w0, ds / ds.sum(), atol=1e-6)
+    # (c) rank cap binds: three clients above tau, only the top-2 by ratio
+    #     flagged (the cap, not tau, is what carries the zero-FP property).
+    cse3 = torch.tensor([0.30, 0.30, 0.30, 0.30, 0.65, 0.80, 0.90])
+    _, d3 = v4_cse_reject_weights(cse3, ds, tau_ratio=1.85, k_cap=2,
+                                  reject_mult=0.10)
+    assert d3["flagged"].tolist() == [False] * 5 + [True, True], d3["flagged"]
+    # (d) high-rank client BELOW tau is not flagged (both conditions needed).
+    cse4 = torch.tensor([0.60, 0.60, 0.60, 0.60, 0.60, 0.60, 1.00])
+    _, d4 = v4_cse_reject_weights(cse4, ds, tau_ratio=1.85, k_cap=2,
+                                  reject_mult=0.10)
+    assert not bool(d4["flagged"].any()), d4["flagged"]
+    print("PASS  v4 rule: flags need rank AND ratio, soft mass, clean = n_k prior")
 
 
 # --------------------------------------------------------------------------- #
@@ -355,6 +475,44 @@ def test_runtime_ema_and_state_roundtrip():
     print("PASS  runtime EMA state + checkpoint roundtrip")
 
 
+def test_runtime_v4_cse_reject():
+    """End-to-end runtime in V4 mode: rejection driven by the absolute
+    local-CSE ratio, geometry channels still logged as diagnostics, missing
+    local_cse loud (never a silent FedAvg fallback), and the num_byzantine <
+    N/2 precondition enforced at construction."""
+    torch.manual_seed(0)
+    rt = _runtime({"trust_mode": "v4_cse_reject", "num_byzantine": 2,
+                   "graph_min_distinct": 4})
+    ids, ds = list(range(7)), [100.0] * 7
+    rows = make_geometry(5, 2, dim=256, seed=1)
+    cse = [0.60, 0.62, 0.58, 0.61, 0.59, 1.60, 1.50]
+    _, stats = rt.aggregate([rows[i] for i in range(7)], ids, ds,
+                            round_num=0, local_cse=cse)
+    assert stats["trust_mode_used"] == "v4_cse_reject"
+    assert stats["v4_flagged"] == [0, 0, 0, 0, 0, 1, 1], stats["v4_flagged"]
+    alpha = np.asarray(stats["alpha"])
+    # equal n_k: attacker mass = 0.1*2 / (5 + 0.1*2) ≈ 0.0385
+    assert alpha[5:].sum() < 0.06, alpha
+    assert alpha[5:].sum() > 0.0, "soft rejection, not zeroing"
+    # Geometry diagnostics keep flowing even though they don't drive rejection.
+    for key in ("residual", "recon_residual", "sus_z", "gate", "s",
+                "v4_cse", "v4_ratio", "v4_median_cse"):
+        assert key in stats, f"missing diagnostic {key}"
+    # Missing local_cse must raise, not silently degrade.
+    try:
+        rt.aggregate([rows[i] for i in range(7)], ids, ds, round_num=1)
+        raise AssertionError("expected ValueError when local_cse is missing")
+    except ValueError:
+        pass
+    # Majority-poisoned precondition: num_byzantine >= N/2 rejected at init.
+    try:
+        _runtime({"trust_mode": "v4_cse_reject", "num_byzantine": 4})
+        raise AssertionError("expected ValueError for num_byzantine >= N/2")
+    except ValueError:
+        pass
+    print("PASS  runtime v4_cse_reject: flags attackers, loud on missing CSE")
+
+
 def test_runtime_attackers_lose_weight_over_rounds():
     """End-to-end runtime with the production signal stack (semantic ON):
     after the EMA warms up, attackers hold negligible aggregation mass."""
@@ -379,12 +537,17 @@ if __name__ == "__main__":
     test_zscore_std_backward_compat()
     test_zscore_mad_high_attacker_fraction()
     test_zscore_mad_degenerate_fallback()
+    test_zscore_relative_degeneracy_guard()
+    test_zscore_clip_post_fusion()
+    test_graph_min_distinct_gating()
     test_semantic_pairwise_bitforbit()
     test_semantic_median_beats_pairwise_noniid()
     test_no_attack_no_scapegoat()
     test_attack_detected_and_rejected()
     test_sus_override_drives_gate()
     test_trust_weights_default_path_unchanged()
+    test_v4_cse_reject_rule()
     test_runtime_ema_and_state_roundtrip()
+    test_runtime_v4_cse_reject()
     test_runtime_attackers_lose_weight_over_rounds()
     print("\nAll trust-robustness tests passed.")

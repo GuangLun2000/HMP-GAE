@@ -194,6 +194,7 @@ class HMPGAEDefense(Defense):
         round_num: int,
         device: torch.device,
         probe_distributions: Optional[torch.Tensor] = None,
+        local_cse: Optional[List[float]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         if len(updates) == 0:
             raise ValueError("HMPGAEDefense.aggregate received 0 updates")
@@ -208,6 +209,18 @@ class HMPGAEDefense(Defense):
             stats["fallback_reason"] = f"N={len(updates)} <= 2"
             return agg, stats
 
+        # V4 (trust_mode='v4_cse_reject') hard-requires the per-client CSE
+        # vector. Validate BEFORE the runtime try/except below: a missing
+        # vector is a server-plumbing bug and must crash the run loudly, not
+        # silently degrade to FedAvg for 50 rounds.
+        if (str(self.cfg.get("trust_mode", "")).lower() == "v4_cse_reject"
+                and local_cse is None):
+            raise RuntimeError(
+                "HMPGAEDefense: trust_mode='v4_cse_reject' but no local_cse "
+                "vector was provided — the server must evaluate per-client "
+                "local CSE BEFORE aggregation (see Server._needs_local_cse)."
+            )
+
         if not self._initialized:
             self._lazy_init(int(updates[0].numel()), torch.device("cpu"))
 
@@ -218,6 +231,7 @@ class HMPGAEDefense(Defense):
                 data_sizes=data_sizes,
                 round_num=round_num,
                 probe_distributions=probe_distributions,
+                local_cse=local_cse,
             )
         except Exception as e:  # noqa: BLE001 - runtime safety net
             # Numerical / shape issues: fall back silently to FedAvg so the FL

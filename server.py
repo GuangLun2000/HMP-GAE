@@ -91,10 +91,28 @@ class Server:
         self._probe_batches: Optional[List[Dict[str, torch.Tensor]]] = None
         # Whether the active defense actually consumes probe distributions.
         # HMP-GAE will use them when defense_config.semantic_weight > 0.
+        # NOTE (V4): trust_mode='v4_cse_reject' does NOT depend on this probe —
+        # its rejection signal is the full-test local CSE (_needs_local_cse
+        # below), so a semantic_weight=0 ablation cannot silently disable the
+        # V4 signal; it only drops the sem_div/probe_cse diagnostics.
         sem_w = float((self.defense_config or {}).get('semantic_weight', 0.0))
         self._needs_probe = (
             self.defense_method in ('hmp_gae', 'hmpgae', 'hmp-gae')
             and sem_w > 0.0
+        )
+        # Whether the active defense consumes the per-client local CSE vector
+        # BEFORE aggregation (HMP-GAE V4 rejection rule). When True, run_round
+        # evaluates local metrics pre-aggregation EVERY round (client models
+        # are untouched by aggregation, so the values are identical to the
+        # legacy post-aggregation evaluation — computed once and reused for
+        # the round log, i.e. no duplicate eval cost when
+        # eval_local_every_n_rounds == 1).
+        trust_mode_cfg = str(
+            (self.defense_config or {}).get('trust_mode', '')
+        ).lower()
+        self._needs_local_cse = (
+            self.defense_method in ('hmp_gae', 'hmpgae', 'hmp-gae')
+            and trust_mode_cfg == 'v4_cse_reject'
         )
 
         # Track historical data
@@ -323,7 +341,8 @@ class Server:
 
     def aggregate_updates(self, updates: List[torch.Tensor],
                           client_ids: List[int],
-                          probe_distributions: Optional[torch.Tensor] = None) -> Dict:
+                          probe_distributions: Optional[torch.Tensor] = None,
+                          local_cse: Optional[List[float]] = None) -> Dict:
         # Store client_ids for similarity display
         self._current_client_ids = client_ids
         self._sorted_client_ids = client_ids
@@ -332,6 +351,12 @@ class Server:
         raw_weights = self._compute_raw_weights(client_ids)
 
         # Delegate to the configured defense strategy.
+        # local_cse (per-client full-test CSE, aligned with client_ids) is only
+        # computed and only forwarded for the HMP-GAE V4 rule — baseline
+        # defenses keep their narrower signature and never see the kwarg.
+        defense_kwargs = {}
+        if local_cse is not None:
+            defense_kwargs['local_cse'] = local_cse
         aggregated_update, defense_stats = self.defense.aggregate(
             updates=updates,
             client_ids=client_ids,
@@ -339,6 +364,7 @@ class Server:
             round_num=self._current_round,
             device=self.device,
             probe_distributions=probe_distributions,
+            **defense_kwargs,
         )
         # Ensure aggregated update is on the server device with consistent dtype.
         aggregated_update = aggregated_update.to(device=self.device, dtype=updates[0].dtype)
@@ -403,6 +429,24 @@ class Server:
             )
             print(f"  🚪 gate:         {gate_summary}")
 
+        # V4 rejection-rule diagnostics (trust_mode='v4_cse_reject' only):
+        # per-client CSE/median ratio and which clients were flagged this round.
+        v4_ratio_list = defense_stats.get('v4_ratio')
+        v4_flagged_list = defense_stats.get('v4_flagged')
+        if isinstance(v4_ratio_list, list) and len(v4_ratio_list) == len(client_ids):
+            ratio_summary = ", ".join(
+                f"c{cid}={v:.3f}" for cid, v in zip(client_ids, v4_ratio_list)
+            )
+            print(f"  🧪 v4 cse/med:   {ratio_summary}")
+        if isinstance(v4_flagged_list, list) and len(v4_flagged_list) == len(client_ids):
+            flagged_ids = [cid for cid, f in zip(client_ids, v4_flagged_list) if f]
+            print(
+                f"  ⛔ v4 flagged:   {flagged_ids if flagged_ids else 'none'} "
+                f"(tau={defense_stats.get('v4_tau_ratio')}, "
+                f"k_cap={defense_stats.get('v4_k_cap')}, "
+                f"mult={defense_stats.get('v4_reject_mult')})"
+            )
+
         # Compute similarity and distance metrics for visualization (unchanged).
         mode = getattr(self, 'similarity_mode', 'local_vs_global')
         if mode == 'local_vs_global':
@@ -440,6 +484,10 @@ class Server:
                   'semantic_weight', 'hist_weight_beta_effective',
                   'zscore_mode', 'gate_rezscore', 'sus_ema_beta',
                   'semantic_reference',
+                  'trust_mode_used', 'graph_channel_gated', 'graph_min_distinct',
+                  'probe_cse',
+                  'v4_cse', 'v4_ratio', 'v4_flagged', 'v4_multiplier',
+                  'v4_median_cse', 'v4_tau_ratio', 'v4_k_cap', 'v4_reject_mult',
                   'L_rec', 'L_smooth', 'L_hist',
                   'fallback_reason', 'defense_time_ms'):
             if k in defense_stats:
@@ -504,6 +552,33 @@ class Server:
         """Backward-compatible wrapper; prefer evaluate_local_metrics."""
         acc, _ = self.evaluate_local_metrics(client)
         return acc
+
+    def _collect_local_metrics(self) -> Tuple[Dict[int, float], Dict[int, float]]:
+        """
+        Evaluate every client's (local accuracy, local CSE) on the server test
+        set and append to history. Shared by the legacy post-aggregation eval
+        and the V4 pre-aggregation eval in run_round — client models are not
+        modified by aggregation (only self.global_model is), so the values are
+        identical regardless of when in the round this runs.
+        """
+        local_accs: Dict[int, float] = {}
+        local_cses: Dict[int, float] = {}
+        for client in self.clients:
+            try:
+                local_acc, local_cse = self.evaluate_local_metrics(client)
+                local_accs[client.client_id] = local_acc
+                local_cses[client.client_id] = local_cse
+
+                if client.client_id not in self.history['local_accuracies']:
+                    self.history['local_accuracies'][client.client_id] = []
+                self.history['local_accuracies'][client.client_id].append(local_acc)
+
+                if client.client_id not in self.history['local_cse']:
+                    self.history['local_cse'][client.client_id] = []
+                self.history['local_cse'][client.client_id].append(local_cse)
+            except Exception as e:
+                print(f"  ⚠️  Could not evaluate local metrics for client {client.client_id}: {e}")
+        return local_accs, local_cses
 
     def _ensure_probe_batches(self) -> List[Dict[str, torch.Tensor]]:
         """Lazily snapshot a fixed subset of test_loader for probing clients."""
@@ -869,9 +944,38 @@ class Server:
             # All rows must have identical shape (K, C) -- same probe set, same head.
             probe_tensor = torch.stack(probe_rows, dim=0)  # (N, K, C)
 
+        # Optional Phase 3.6: pre-aggregation per-client local metrics for the
+        # V4 CSE trust rule (trust_mode='v4_cse_reject'). Client models are
+        # untouched by aggregation, so these values are identical to the
+        # legacy post-aggregation evaluation — computed once here and reused
+        # for the round log below (no duplicate eval cost).
+        local_accs_this_round: Dict[int, float] = {}
+        local_cse_this_round: Dict[int, float] = {}
+        local_cse_vector: Optional[List[float]] = None
+        if self._needs_local_cse:
+            if any(getattr(c, 'crafts_update', False) for c in self.clients):
+                raise RuntimeError(
+                    "trust_mode='v4_cse_reject' is not supported with update-"
+                    "forging attackers (crafts_update, e.g. AugMP): local CSE "
+                    "evaluates client.model, which such attackers leave "
+                    "looking benign (the poison lives only in the crafted "
+                    "update)."
+                )
+            local_accs_this_round, local_cse_this_round = self._collect_local_metrics()
+            missing = [cid for cid in sorted_client_ids
+                       if cid not in local_cse_this_round]
+            if missing:
+                raise RuntimeError(
+                    "trust_mode='v4_cse_reject': local CSE evaluation failed "
+                    f"for clients {missing}; cannot aggregate without it."
+                )
+            local_cse_vector = [float(local_cse_this_round[cid])
+                                for cid in sorted_client_ids]
+
         aggregation_log = self.aggregate_updates(
             final_update_list, sorted_client_ids,
             probe_distributions=probe_tensor,
+            local_cse=local_cse_vector,
         )
 
         # Evaluate the global model (compute accuracy, loss and CSE in one pass).
@@ -889,24 +993,13 @@ class Server:
             or is_final_round
             or ((round_num + 1) % n_eval == 0)
         )
-        local_accs_this_round = {}
-        local_cse_this_round = {}
-        if do_local_eval:
-            for client in self.clients:
-                try:
-                    local_acc, local_cse = self.evaluate_local_metrics(client)
-                    local_accs_this_round[client.client_id] = local_acc
-                    local_cse_this_round[client.client_id] = local_cse
-
-                    if client.client_id not in self.history['local_accuracies']:
-                        self.history['local_accuracies'][client.client_id] = []
-                    self.history['local_accuracies'][client.client_id].append(local_acc)
-
-                    if client.client_id not in self.history['local_cse']:
-                        self.history['local_cse'][client.client_id] = []
-                    self.history['local_cse'][client.client_id].append(local_cse)
-                except Exception as e:
-                    print(f"  ⚠️  Could not evaluate local metrics for client {client.client_id}: {e}")
+        if self._needs_local_cse:
+            # V4 path: local metrics were already evaluated pre-aggregation
+            # this round (every round — the trust rule needs them even when
+            # eval_local_every_n_rounds would skip); reuse those values here.
+            pass
+        elif do_local_eval:
+            local_accs_this_round, local_cse_this_round = self._collect_local_metrics()
         else:
             print(f"  ⏭  Skipping per-client local eval this round "
                   f"(eval_local_every_n_rounds={n_eval}).")
