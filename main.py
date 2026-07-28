@@ -1217,24 +1217,27 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: canonical HMP-GAE arm — HMP-GAE vs Hallucination
-        # === on Yahoo Answers (non-IID 0.5, 10 classes), Llama-3.2-1B
-        # === backbone, 5 benign + 2 attackers (N=7) ===
-        # Restored 2026-07-28 (was temporarily the FoolsGold n6/atk1 arm):
-        # this is the arm every archived 7-client/2-attacker HMP-GAE run is
-        # comparable to. Held fixed (canonical skeleton): 50 rounds, seed=42,
-        # LoRA r=8, batch 32, lr 5e-5, max_length=128, 10K subset,
-        # Dirichlet(0.5), DEFAULT attack strength flip_ratio_range=[0.3,0.8],
-        # per-round randomized flip code path.
-        # V4 delta (trust_mode='v4_cse_reject' + Qwen backbone for the
-        # confirmatory run) goes through COLAB_CONFIG_OVERRIDES / run_suite(),
-        # NOT by editing this dict or notebook cells — defense_config merges
-        # one level deep in main(), so a single-key override like
-        # {'defense_config': {'trust_mode': 'v4_cse_reject'}} works.
-        # NOTE: meta-llama/Llama-3.2-1B is GATED — accept the license on HF and
-        # provide HF_TOKEN (Colab Step 2 logs in automatically). Needs A100
-        # (fp32 ~5GB/copy; does NOT fit a T4 15GB).
-        'experiment_name': 'yahoo-(non-iid0.5)-hmpgae-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
+        # === CURRENT RUN: V4 CONFIRMATORY (validation plan Run 1) — HMP-GAE
+        # === V4 (trust_mode='v4_cse_reject') vs Hallucination on Yahoo
+        # === Answers (non-IID 0.5, 10 classes), Qwen2.5-0.5B backbone,
+        # === 5 benign + 2 attackers (N=7) ===
+        # Single-knob protocol: reproduces the archived Qwen Yahoo non-IID V3
+        # run (2-non-iid-20260706-汉霖v3) with ONE aggregation-behavior change:
+        # trust_mode 'soft_reject_fedavg' -> 'v4_cse_reject'. Held fixed
+        # (canonical skeleton): 50 rounds, seed=42, LoRA r=8, batch 32,
+        # lr 5e-5, max_length=128, 10K subset, Dirichlet(0.5), DEFAULT attack
+        # strength flip_ratio_range=[0.3,0.8], per-round randomized flip path,
+        # semantic_weight=1.0, num_byzantine=2 (= V4 rank cap).
+        # (C1 z-score hygiene + graph_min_distinct=4 also differ from the
+        # archived V3 code, but under V4 the geometry gate is DIAGNOSTICS-ONLY
+        # — aggregation weights depend solely on the V4 CSE rule, so the one
+        # measured delta stays trust_mode.)
+        # Success criteria (pre-registered, ALL FOUR — never rank by one
+        # scalar): final CSE ≈ 0.29-0.35 (V3: 0.6915); PPL ≤ ~1060 (V3:
+        # 1061.74, <7% is noise — must NOT drift toward FoolsGold's 1549);
+        # ppl_class_std ≤ ~350 (V3: 344.41); accuracy ≈ 0.6533.
+        # v4_tau_ratio=1.85 is PRE-REGISTERED — do not re-tune after results.
+        'experiment_name': 'yahoo-(non-iid0.5)-hmpgae-v4-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
         'seed': 42,  # Random seed for reproducibility
 
         # ========== Federated Learning Setup ==========
@@ -1314,10 +1317,11 @@ def main(config_overrides: Optional[Dict] = None):
         # 'model_name': 'gpt2',                      # GPT-2 124M — stable decoder baseline
         # 'model_name': 'EleutherAI/pythia-160m',    # Pythia-160M (may need grad_clip_norm=0.5)
         # 'model_name': 'facebook/opt-125m',         # OPT-125M (Meta)
-        # 'model_name': 'Qwen/Qwen2.5-0.5B',       # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning.
-                                                   # NOT gated; fits a T4 15GB comfortably.  Backbone of the
-                                                   # AG News results-table rows.
-        'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
+        'model_name': 'Qwen/Qwen2.5-0.5B',       # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning.
+                                                 # NOT gated; fits a T4 15GB comfortably.  Backbone of the
+                                                 # AG News results-table rows AND of the archived Qwen Yahoo
+                                                 # non-IID V3 baseline this V4 confirmatory run reproduces.
+        # 'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
                                                   # GATED repo: accept the Llama 3.2 license on HF and provide
                                                   # HF_TOKEN (Colab Step 2 logs in automatically).
                                                   # LoRA targets auto-resolve via the "llama" branch in models.py
@@ -1554,7 +1558,10 @@ def main(config_overrides: Optional[Dict] = None):
             #       eval_local_every_n_rounds=1). Requires num_byzantine < N/2
             #       (validated at runtime construction). NOT supported with
             #       update-forging attackers (AugMP).
-            'trust_mode': 'soft_reject_fedavg',
+            # CURRENT RUN: 'v4_cse_reject' — the ONE aggregation-behavior knob
+            # changed vs the archived Qwen Yahoo V3 baseline. Set back to
+            # 'soft_reject_fedavg' to reproduce V3 gating.
+            'trust_mode': 'v4_cse_reject',
             # --- V4 CSE rejection knobs (INERT unless trust_mode='v4_cse_reject') ---
             # v4_tau_ratio: pre-registered 1.85 (zero-FP plateau [1.785, 1.90]
             #   over 51 archived runs / 17,850 client-round decisions,
