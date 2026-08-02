@@ -1217,37 +1217,33 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: V4 REGRESSION GUARD (validation plan Run 2) —
+        # === CURRENT RUN: V4 CONFIRMATORY, SEED REPLICATE (seed=0) —
         # === HMP-GAE V4 (trust_mode='v4_cse_reject') vs Hallucination on
-        # === AG News (non-IID 0.5, 4 classes), Llama-3.2-1B backbone,
+        # === Yahoo Answers (non-IID 0.5, 10 classes), Qwen2.5-0.5B backbone,
         # === 5 benign + 2 attackers (N=7) ===
-        # Single-knob protocol: reproduces the archived Llama AG News non-IID
-        # HMP arm with ONE aggregation-behavior change: trust_mode
-        # 'soft_reject_fedavg' -> 'v4_cse_reject'. Held fixed (canonical
-        # skeleton): 50 rounds, seed=42, LoRA r=8, batch 32, lr 5e-5,
-        # max_length=128, 10K subset, Dirichlet(0.5), DEFAULT attack strength
-        # flip_ratio_range=[0.3,0.8], per-round randomized flip path,
-        # semantic_weight=1.0, num_byzantine=2 (= V4 rank cap).
-        # (C1 z-score hygiene + graph_min_distinct=4 also differ from the
-        # archived V3 code, but under V4 the geometry gate is DIAGNOSTICS-ONLY
-        # — aggregation weights depend solely on the V4 CSE rule, so the one
-        # measured delta stays trust_mode.)
-        # PURPOSE: Llama AG is the block with all four columns currently BEST
-        # in the archive (V2 final CSE 0.0441; HMP PPL ~51.7 vs FedAvg 72.1;
-        # attacker mass already −78%) and the one V4 most endangers — replay
-        # predicts V4 buys it ~nothing (steady attacker mass 0.0421 -> ~0.006)
-        # while changing aggregation semantics. SUCCESS = NO REGRESSION on
-        # ALL FOUR of CSE + PPL + ppl_class_std + accuracy (never rank by one
-        # scalar; <7% PPL differences are replicate noise).
-        # Detection context: AG is V4's easy regime — replay rank AUC 0.972,
-        # probe has 25 samples/class here (vs 10 on Yahoo). Cold-start misses
-        # in rounds <= 5 are expected (78% of replay false negatives).
+        # Seed replicate of the V4 confirmatory cell (validation plan Run 1:
+        # Qwen Yahoo non-IID V4, seed=42) toward the roadmap's multi-seed
+        # mean±std reporting. Exactly ONE axis moves vs that cell:
+        #   seed 42 -> 0
+        # What seed=0 DOES change: Dirichlet partition (per-client shards),
+        # model/LoRA init, training shuffles, per-round flip randomization,
+        # stratified probe sampling (seeded by config['seed']).
+        # What it does NOT change: the 10K train pool and the test set — both
+        # are subsampled with a HARDCODED rng(42)/random_state=42 in
+        # data_loader.py, so metrics across seed arms are computed on the
+        # IDENTICAL test set and are directly comparable.
+        # Held fixed (canonical skeleton): 50 rounds, LoRA r=8, batch 32,
+        # lr 5e-5, max_length=128, 10K subset, Dirichlet(0.5), DEFAULT attack
+        # strength flip_ratio_range=[0.3,0.8], per-round randomized flip path,
+        # semantic_weight=1.0, num_byzantine=2 (= V4 rank cap, < N/2 OK).
         # v4_tau_ratio=1.85 is PRE-REGISTERED — do not re-tune after results.
-        # NOTE: meta-llama/Llama-3.2-1B is GATED — accept the license on HF
-        # and provide HF_TOKEN (Colab Step 2 logs in automatically). Needs
-        # A100 (fp32 ~5GB/copy; does NOT fit a T4 15GB).
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v4-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
-        'seed': 42,  # Random seed for reproducibility
+        # Seed-42 confirmatory success criteria (CSE ≈0.29-0.35, PPL <=~1060,
+        # ppl_class_std <=~350, acc ≈0.653) are the reference band; this arm
+        # reports its own numbers for mean±std, not pass/fail against them.
+        # NOTE: Qwen/Qwen2.5-0.5B is NOT gated — no HF login required; fits a
+        # T4 15GB (A100 not needed for this arm).
+        'experiment_name': 'yahoo-(non-iid0.5)-hmpgae-v4-hallu(localround=1,seed=0,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
+        'seed': 0,  # Random seed — the ONE moving axis of this arm (seed replicate; 42 = the confirmatory cell)
 
         # ========== Federated Learning Setup ==========
         'num_clients': 7,    # Total clients: 5 benign + 2 attackers (canonical arm)
@@ -1271,9 +1267,9 @@ def main(config_overrides: Optional[Dict] = None):
         # ========== Dataset Configuration ==========
         # Choose dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers' — set num_labels and max_length accordingly
         # Dataset 1: AG News
-        'dataset': 'ag_news',  # news classification (4 classes)
-        'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
-        'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
+        # 'dataset': 'ag_news',  # news classification (4 classes)
+        # 'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
+        # 'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
                                # (128 also matches ALL prior cross-dataset runs' truncation envelope)
         # -------------------------------------------
         # Dataset 2: IMDB
@@ -1287,9 +1283,9 @@ def main(config_overrides: Optional[Dict] = None):
         # 'max_length': 512,
         # -------------------------------------------
         # Dataset 4: Yahoo Answers (10 classes, 1.4M train / 60K test)
-        # 'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
-        # 'num_labels': 10,       # Yahoo Answers: 10 classes
-        # 'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
+        'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
+        'num_labels': 10,       # Yahoo Answers: 10 classes
+        'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
                                 # (same truncation / wall-clock / memory envelope; README's
                                 # 256 recommendation is a separate ablation, not part of the
                                 # cross-dataset comparison).
@@ -1326,11 +1322,11 @@ def main(config_overrides: Optional[Dict] = None):
         # 'model_name': 'gpt2',                      # GPT-2 124M — stable decoder baseline
         # 'model_name': 'EleutherAI/pythia-160m',    # Pythia-160M (may need grad_clip_norm=0.5)
         # 'model_name': 'facebook/opt-125m',         # OPT-125M (Meta)
-        # 'model_name': 'Qwen/Qwen2.5-0.5B',       # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning.
+        'model_name': 'Qwen/Qwen2.5-0.5B',         # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning.
                                                    # NOT gated; fits a T4 15GB comfortably.  Backbone of the
                                                    # AG News results-table rows and the archived Qwen Yahoo
                                                    # non-IID V3 baseline (the Qwen V4 confirmatory arm).
-        'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
+        # 'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
                                                   # GATED repo: accept the Llama 3.2 license on HF and provide
                                                   # HF_TOKEN (Colab Step 2 logs in automatically).
                                                   # LoRA targets auto-resolve via the "llama" branch in models.py
@@ -1380,12 +1376,12 @@ def main(config_overrides: Optional[Dict] = None):
         # ======================================================================
         'hallu_flip_ratio': 0.5,                   # used only when hallu_flip_ratio_range is None
         'hallu_flip_mode': 'random',               # 'pairwise' | 'targeted' | 'random'
-        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2},
+        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4, 6: 7, 7: 6, 8: 9, 9: 8},
                                                    # only consumed in flip_mode='pairwise' (inert in
                                                    # the active 'random' mode). Adjacent-pair bijection
                                                    # sized for the ACTIVE dataset's num_labels
-                                                   # (4 = AG News); expand to {0:1,1:0,...,8:9,9:8}
-                                                   # for Yahoo Answers (10 classes).
+                                                   # (10 = Yahoo Answers); shrink to {0:1,1:0,2:3,3:2}
+                                                   # for AG News (4 classes).
         'hallu_target_class': None,                # only for flip_mode='targeted'
         'hallu_attack_start_round': 0,
         'hallu_per_round_reseed': True,            # re-sample flipped-label set each round
