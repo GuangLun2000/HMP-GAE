@@ -1217,33 +1217,33 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: V4 CONFIRMATORY, SEED REPLICATE (seed=0) —
-        # === HMP-GAE V4 (trust_mode='v4_cse_reject') vs Hallucination on
-        # === Yahoo Answers (non-IID 0.5, 10 classes), Qwen2.5-0.5B backbone,
-        # === 5 benign + 2 attackers (N=7) ===
-        # Seed replicate of the V4 confirmatory cell (validation plan Run 1:
-        # Qwen Yahoo non-IID V4, seed=42) toward the roadmap's multi-seed
-        # mean±std reporting. Exactly ONE axis moves vs that cell:
-        #   seed 42 -> 0
-        # What seed=0 DOES change: Dirichlet partition (per-client shards),
-        # model/LoRA init, training shuffles, per-round flip randomization,
-        # stratified probe sampling (seeded by config['seed']).
-        # What it does NOT change: the 10K train pool and the test set — both
-        # are subsampled with a HARDCODED rng(42)/random_state=42 in
-        # data_loader.py, so metrics across seed arms are computed on the
-        # IDENTICAL test set and are directly comparable.
+        # === CURRENT RUN: FLTrust baseline arm (seed=0) — FLTrust vs
+        # === Hallucination on Yahoo Answers (non-IID 0.5, 10 classes),
+        # === Qwen2.5-0.5B backbone, 5 benign + 2 attackers (N=7) ===
+        # Roadmap baseline defense (FLTrust, NDSS '21) at seed=0.  Exactly ONE
+        # axis moves vs the companion cell:
+        #   vs yahoo-hmpgae-v4-qwen seed=0 arm : defense hmp_gae(V4) -> fltrust
+        # (paired with it for the defense column of the seed-0 replicate row;
+        # a future fltrust seed=42 run pairs on the seed axis instead.)
+        # FLTrust here consumes ONLY defense_config.anchor='median' — the
+        # documented no-root-data variant (cosine to the coordinate-wise
+        # median anchor + ReLU clip + magnitude normalization); every other
+        # defense_config key (HMP-GAE/V4 knobs, foolsgold epsilon, krum
+        # num_byzantine) is INERT for this run.  No semantic probe forwards
+        # and no V4 pre-aggregation local-CSE path run under fltrust;
+        # eval_local_every_n_rounds=1 keeps per-round local metrics logging
+        # identical to the V4 arm anyway.
+        # What seed=0 changes vs seed-42 cells: Dirichlet partition, model/
+        # LoRA init, training shuffles, per-round flip randomization.  The
+        # 10K train pool and the test set are HARDCODED rng(42) in
+        # data_loader.py — identical eval data across all arms.
         # Held fixed (canonical skeleton): 50 rounds, LoRA r=8, batch 32,
         # lr 5e-5, max_length=128, 10K subset, Dirichlet(0.5), DEFAULT attack
-        # strength flip_ratio_range=[0.3,0.8], per-round randomized flip path,
-        # semantic_weight=1.0, num_byzantine=2 (= V4 rank cap, < N/2 OK).
-        # v4_tau_ratio=1.85 is PRE-REGISTERED — do not re-tune after results.
-        # Seed-42 confirmatory success criteria (CSE ≈0.29-0.35, PPL <=~1060,
-        # ppl_class_std <=~350, acc ≈0.653) are the reference band; this arm
-        # reports its own numbers for mean±std, not pass/fail against them.
+        # strength flip_ratio_range=[0.3,0.8], per-round randomized flip path.
         # NOTE: Qwen/Qwen2.5-0.5B is NOT gated — no HF login required; fits a
         # T4 15GB (A100 not needed for this arm).
-        'experiment_name': 'yahoo-(non-iid0.5)-hmpgae-v4-hallu(localround=1,seed=0,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
-        'seed': 0,  # Random seed — the ONE moving axis of this arm (seed replicate; 42 = the confirmatory cell)
+        'experiment_name': 'yahoo-(non-iid0.5)-fltrust-hallu(localround=1,seed=0,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
+        'seed': 0,  # Random seed — kept at 0 to pair with the hmpgae-v4 seed=0 arm (defense is the only moving axis)
 
         # ========== Federated Learning Setup ==========
         'num_clients': 7,    # Total clients: 5 benign + 2 attackers (canonical arm)
@@ -1444,13 +1444,16 @@ def main(config_overrides: Optional[Dict] = None):
         #   'fedavg'    — standard data-size-weighted FedAvg (no-defense baseline)
         #   'hmp_gae'   — HMP-GAE immunization (this paper, requires hmp_gae/ subpackage)
         #   'foolsgold' — FoolsGold (RAID '20), baseline defense
-        # Current value is 'hmp_gae' (this paper, the canonical defended arm):
-        # the full defense_config block below is live.  server.py gates the
-        # per-round semantic probe forward on defense_method=='hmp_gae' AND
-        # semantic_weight>0.  The foolsgold/fltrust/krum keys below are INERT
-        # under hmp_gae (krum's num_byzantine is REUSED by the V4 rule as its
-        # rank cap — see the V4 block below).
-        'defense_method': 'hmp_gae',
+        #   'fltrust'   — FLTrust (NDSS '21), baseline defense
+        # Current value is 'fltrust': cosine-to-anchor trust bootstrapping
+        # with anchor='median' (no-root-data variant; see defense/fltrust.py).
+        # It consumes ONLY defense_config.anchor — every other key below
+        # (HMP-GAE/V4 knobs, foolsgold epsilon, krum num_byzantine) is INERT
+        # for this run.  server.py gates the per-round semantic probe forward
+        # on defense_method=='hmp_gae', so no probe forwards run; the V4
+        # pre-aggregation local-CSE path is likewise inactive.  Switch back to
+        # 'hmp_gae' for the defended arm; the block below goes live unchanged.
+        'defense_method': 'fltrust',
         'defense_config': {
 
             # config for foolsgold
