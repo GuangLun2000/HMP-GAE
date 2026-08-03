@@ -1217,14 +1217,12 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: FLTrust baseline arm (seed=0) — FLTrust vs
-        # === Hallucination on Yahoo Answers (non-IID 0.5, 10 classes),
-        # === Qwen2.5-0.5B backbone, 5 benign + 2 attackers (N=7) ===
-        # Roadmap baseline defense (FLTrust, NDSS '21) at seed=0.  Exactly ONE
-        # axis moves vs the companion cell:
-        #   vs yahoo-hmpgae-v4-qwen seed=0 arm : defense hmp_gae(V4) -> fltrust
-        # (paired with it for the defense column of the seed-0 replicate row;
-        # a future fltrust seed=42 run pairs on the seed axis instead.)
+        # === CURRENT RUN: FLTrust baseline arm, SEED REPLICATE (seed=42069)
+        # === — FLTrust vs Hallucination on Yahoo Answers (non-IID 0.5,
+        # === 10 classes), Qwen2.5-0.5B backbone, 5 benign + 2 attackers (N=7)
+        # Seed replicate of the FLTrust cell toward multi-seed mean±std.
+        # Exactly ONE axis moves vs the companion cell:
+        #   vs yahoo-fltrust-qwen seed=0 arm : seed 0 -> 42069
         # FLTrust here consumes ONLY defense_config.anchor='median' — the
         # documented no-root-data variant (cosine to the coordinate-wise
         # median anchor + ReLU clip + magnitude normalization); every other
@@ -1233,7 +1231,7 @@ def main(config_overrides: Optional[Dict] = None):
         # and no V4 pre-aggregation local-CSE path run under fltrust;
         # eval_local_every_n_rounds=1 keeps per-round local metrics logging
         # identical to the V4 arm anyway.
-        # What seed=0 changes vs seed-42 cells: Dirichlet partition, model/
+        # What the seed changes across seed arms: Dirichlet partition, model/
         # LoRA init, training shuffles, per-round flip randomization.  The
         # 10K train pool and the test set are HARDCODED rng(42) in
         # data_loader.py — identical eval data across all arms.
@@ -1242,8 +1240,8 @@ def main(config_overrides: Optional[Dict] = None):
         # strength flip_ratio_range=[0.3,0.8], per-round randomized flip path.
         # NOTE: Qwen/Qwen2.5-0.5B is NOT gated — no HF login required; fits a
         # T4 15GB (A100 not needed for this arm).
-        'experiment_name': 'yahoo-(non-iid0.5)-fltrust-hallu(localround=1,seed=0,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
-        'seed': 0,  # Random seed — kept at 0 to pair with the hmpgae-v4 seed=0 arm (defense is the only moving axis)
+        'experiment_name': 'yahoo-(non-iid0.5)-fltrust-hallu(localround=1,seed=42069,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
+        'seed': 42069,  # Random seed — the ONE moving axis of this arm (seed replicate; 0 = the companion fltrust cell)
 
         # ========== Federated Learning Setup ==========
         'num_clients': 7,    # Total clients: 5 benign + 2 attackers (canonical arm)
