@@ -1217,23 +1217,25 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: FoolsGold baseline arm, AG NEWS cell (seed=42069)
-        # === — FoolsGold vs Hallucination on AG News (non-IID 0.5, 4
-        # === classes), Qwen2.5-0.5B backbone, 5 benign + 2 attackers (N=7)
-        # Fills the AG News column of the FoolsGold baseline row at
-        # seed=42069.  Exactly ONE axis moves vs the companion cell:
-        #   vs agnews-fltrust-qwen seed=42069 arm : defense fltrust ->
-        #     foolsgold
-        # (Backbone deliberately Qwen, matching all AG News results-table
-        # rows — keeping Llama would move TWO axes vs every existing cell.)
-        # FoolsGold consumes ONLY defense_config.epsilon: cross-client cosine
-        # similarity of historically ACCUMULATED updates -> pardoning ->
-        # logit-transformed weights (defense/foolsgold.py).  Every other
-        # defense_config key (HMP-GAE/V4 knobs, fltrust anchor, krum
-        # num_byzantine) is INERT for this run.  No semantic probe forwards
-        # and no V4 pre-aggregation local-CSE path run under foolsgold;
-        # eval_local_every_n_rounds=1 keeps per-round local metrics logging
-        # identical to the V4 arm anyway.
+        # === CURRENT RUN: HMP-GAE V4 defended arm, AG NEWS cell (seed=42069)
+        # === — HMP-GAE V4 (trust_mode='v4_cse_reject') vs Hallucination on
+        # === AG News (non-IID 0.5, 4 classes), Qwen2.5-0.5B backbone,
+        # === 5 benign + 2 attackers (N=7) ===
+        # Fills the HMP-GAE (proposed) column of the AG News seed=42069 row.
+        # Exactly ONE axis moves vs each companion cell:
+        #   vs agnews-foolsgold-qwen seed=42069 arm : defense foolsgold ->
+        #     hmp_gae(V4)
+        #   vs agnews-fltrust-qwen  seed=42069 arm : defense fltrust ->
+        #     hmp_gae(V4)
+        # (completes the defense column set {fltrust, foolsgold, hmpgae-v4}
+        # on AG News at this seed.)
+        # The full defense_config block below is LIVE: per-round semantic
+        # probe forwards run (semantic_weight=1.0, stratified probe — AG News
+        # gives 25 samples/class, V4's easy regime), and the V4 rule
+        # evaluates per-client full-test local CSE BEFORE aggregation every
+        # round.  V4 rank cap reuses num_byzantine=2 (< N/2, OK for N=7).
+        # v4_tau_ratio=1.85 is PRE-REGISTERED (Qwen-validated) — do not
+        # re-tune after results.
         # What the seed changes across seed arms of the SAME dataset:
         # Dirichlet partition, model/LoRA init, training shuffles, per-round
         # flip randomization.  The 10K train pool and the test set are
@@ -1244,8 +1246,8 @@ def main(config_overrides: Optional[Dict] = None):
         # strength flip_ratio_range=[0.3,0.8], per-round randomized flip path.
         # NOTE: Qwen/Qwen2.5-0.5B is NOT gated — no HF login required; fits a
         # T4 15GB (A100 not needed for this arm).
-        'experiment_name': 'agnews-(non-iid0.5)-foolsgold-hallu(localround=1,seed=42069,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
-        'seed': 42069,  # Random seed — held fixed; defense is the only moving axis vs the agnews-fltrust-qwen seed=42069 arm
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v4-hallu(localround=1,seed=42069,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
+        'seed': 42069,  # Random seed — held fixed; defense is the only moving axis vs the agnews fltrust/foolsgold seed=42069 arms
 
         # ========== Federated Learning Setup ==========
         'num_clients': 7,    # Total clients: 5 benign + 2 attackers (canonical arm)
@@ -1447,16 +1449,13 @@ def main(config_overrides: Optional[Dict] = None):
         #   'hmp_gae'   — HMP-GAE immunization (this paper, requires hmp_gae/ subpackage)
         #   'foolsgold' — FoolsGold (RAID '20), baseline defense
         #   'fltrust'   — FLTrust (NDSS '21), baseline defense
-        # Current value is 'foolsgold': cross-client cosine similarity of
-        # historically accumulated updates -> pardoning -> logit weights
-        # (defense/foolsgold.py).  It consumes ONLY defense_config.epsilon —
-        # every other key below (HMP-GAE/V4 knobs, fltrust anchor, krum
-        # num_byzantine) is INERT for this run.  server.py gates the
-        # per-round semantic probe forward on defense_method=='hmp_gae', so
-        # no probe forwards run; the V4 pre-aggregation local-CSE path is
-        # likewise inactive.  Switch back to 'hmp_gae' for the defended arm;
-        # the block below goes live unchanged.
-        'defense_method': 'foolsgold',
+        # Current value is 'hmp_gae' (this paper, the canonical defended arm):
+        # the full defense_config block below is live.  server.py gates the
+        # per-round semantic probe forward on defense_method=='hmp_gae' AND
+        # semantic_weight>0.  The foolsgold/fltrust/krum keys below are INERT
+        # under hmp_gae (krum's num_byzantine is REUSED by the V4 rule as its
+        # rank cap — see the V4 block below).
+        'defense_method': 'hmp_gae',
         'defense_config': {
 
             # config for foolsgold
