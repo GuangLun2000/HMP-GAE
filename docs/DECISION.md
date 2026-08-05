@@ -67,6 +67,61 @@ run doubles as the (i)-vs-(ii) agreement check.
 - When V4 is enabled, per-client local eval runs **every round** regardless of
   `eval_local_every_n_rounds` (the rule needs it pre-aggregation).
 
+## V5 graded rejection (2026-08-06)
+
+**Adopted:** `trust_mode='v5_cse_reject'` — V4's flag decision **byte-identical**
+(top-`num_byzantine` by ratio AND `r > v4_tau_ratio`), but the flagged-client
+multiplier is a **linear ramp in the CSE ratio** instead of the constant
+`v4_reject_mult`. Implemented in `hmp_gae/trust_scorer.py::v5_cse_reject_weights`:
+
+```text
+t    = clamp((r - tau) / (v5_r_hard - tau), 0, 1)
+mult = v5_m_floor + (1 - v5_m_floor) * (1 - t)
+```
+
+- **Primary motivation is false-positive cost containment**, not per-cell
+  tuning: archived benign max ratios reach 1.89 (Llama AG) and 2.73 (Qwen AG,
+  seed 42069) — above tau, shielded only by the rank cap. A borderline
+  mis-flag costs ~90% of the client's weight under V4 but ~5-20% under the
+  ramp. Restores V3's graded-response virtue on V4's absolute-scale signal.
+- `v5_r_hard = 2.5` is **pre-registered** (2026-08-06, before any V5 run),
+  calibrated from the archived V4 runs' steady-state (rounds > 5) attacker
+  ratio minima: 2.38/2.43 (Llama Yahoo 2atk/1atk), 3.72 (Llama AG), 4.09
+  (Qwen AG), 2.02 (Qwen Yahoo s42). Steady-state attackers therefore
+  saturate to `m_floor` — for those rounds V5 is float-exactly V4 with
+  `reject_mult = m_floor` (tested: `test_v5_saturation_equals_v4`) — so the
+  admitted attacker mass stays ≈V4-equal by construction and the CSE risk of
+  the softer ramp is bounded. Do **not** re-tune after a confirmatory run.
+- `v5_m_floor = 0.10` inherits `v4_reject_mult`'s role and rules: never 0.0
+  (hard zeroing rejected, see V4 entry), and it remains the pre-authorized
+  sweep knob ({0.05, 0.02}) — under V5 the sweep deepens the penalty ONLY
+  for high-ratio (clearly guilty) attackers, a strictly better risk profile
+  than sweeping V4's uniform constant.
+- Everything else carries over from V4 unchanged: tau=1.85 pre-registration,
+  rank cap semantics (`num_byzantine < N/2`, construction-validated), the
+  no-`_zscore` rule, pre-aggregation full-test local CSE (`_needs_local_cse`),
+  AugMP incompatibility, and the every-round local eval behavior.
+
+### Rejected: alternative ramp shapes
+
+Exponential decay (`exp(-beta(r-tau))`) and rational (`(tau/r)^p`) forms were
+considered: both need a shape parameter with no natural calibration anchor and
+neither reproduces V4 exactly in the saturated regime (the equivalence that
+makes V5's CSE risk arguable a priori). The linear ramp has two interpretable,
+replay-calibratable parameters and exact V4 saturation equivalence.
+
+### What V5 deliberately does NOT do
+
+- No coverage-aware reweighting and no per-class/head-row trust: the Y18
+  regression (Qwen Yahoo V4 acc −2.1pp tail-mean below V3, PPL above floor
+  AND ceiling) is a **label-coverage** problem orthogonal to penalty
+  softness — Qwen-Yahoo attackers sit at ratio ≈3.5 median, NOT near tau, so
+  the ramp barely touches them. Y18 gets its queued diagnosis first; any
+  coverage mechanism is a separate, new decision.
+- No sticky flags / hysteresis (variance lever, needs its own replay
+  validation of a `tau_hold`), no cold-start holdback (new prereg + clean
+  ceiling reruns). Both remain future work.
+
 ## C1 z-score hygiene (2026-07-28)
 
 - `_zscore` MAD degeneracy guard is **relative** (`scale < 1e-3·max|x|`), with

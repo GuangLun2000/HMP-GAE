@@ -83,6 +83,7 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 - **LoRA `target_modules=None` 含义是"用 PEFT 默认"**：默认对 DistilBERT 友好；换冷门 backbone 时可能需要显式列出 attn projection 名
 - **CSE 每轮免费**（共享 test forward），**PPL 是 FL 结束后一次性**（需要 checkpoint）——不要把 PPL 计算挪进每轮循环
 - **`trust_mode: 'v4_cse_reject'`（V4，2026-07-28）改变 server 的评估时序**：server 会在**聚合前**对每个 client 做 full-test local eval（`Server._needs_local_cse`），并强制每轮 local eval（覆盖 `eval_local_every_n_rounds`）；缺 `local_cse` 会 loud crash（defense 层在 FedAvg-fallback try 之前校验，不会静默回退）。rank cap **复用 `num_byzantine`**（要求 < N/2，runtime 构造时校验）；`v4_tau_ratio=1.85` 是预注册值，跑完实验**不许回调**。与 AugMP（crafts_update）不兼容（local CSE 看不到伪造 update）。V4 信号**绝不过 `_zscore`**——被否决的替代方案与理由记录在 [docs/DECISION.md](docs/DECISION.md)
+- **`trust_mode: 'v5_cse_reject'`（V5，2026-08-06）= V4 的 flag 判定 + 连续惩罚 ramp**：flag 规则与 V4 逐字节相同，只把被 flag 客户端的乘子从常数 `v4_reject_mult` 换成 CSE ratio 的线性 ramp（`trust_scorer.v5_cse_reject_weights`；τ 附近 ≈1.0，`v5_r_hard` 以上饱和到 `v5_m_floor`）。评估时序 / local_cse 硬要求 / AugMP 不兼容 / rank cap 全部继承 V4。`v5_r_hard=2.5` 是预注册值（由归档 V4 run 的稳态 attacker ratio 最小值标定），`v5_m_floor` 禁 0（硬归零已被否决）——设计决策与标定依据见 [docs/DECISION.md](docs/DECISION.md)。V5 尚未跑过确证实验；诊断 CSV 复用 `v4_*` 通道族
 
 ## Out of Scope（V1 不主动做，除非明说）
 

@@ -39,6 +39,7 @@ from .trust_scorer import (
     reject_soft_weighted,
     gate_diagnostics,
     v4_cse_reject_weights,
+    v5_cse_reject_weights,
 )
 
 
@@ -145,6 +146,11 @@ class HMPGAERuntime:
         #     channels stay computed + logged as diagnostics but no longer
         #     drive rejection. Requires the server to evaluate local CSE
         #     BEFORE aggregation and pass it via aggregate(local_cse=...).
+        #   'v5_cse_reject' (V5, 2026-08-06): V4's flag decision byte-identical,
+        #     but the flagged-client multiplier is a linear ramp in the CSE
+        #     ratio (trust_scorer.v5_cse_reject_weights): mild just past tau,
+        #     v5_m_floor at ratio >= v5_r_hard. Same local-CSE requirement and
+        #     server eval timing as V4.
         self.trust_mode = str(
             self.cfg.get("trust_mode", "soft_reject_fedavg")
         ).strip().lower()
@@ -153,7 +159,7 @@ class HMPGAERuntime:
         # different aggregation rule for 50 rounds. Fail loudly instead.
         _known_modes = {
             "soft_reject_fedavg", "reject_then_fedavg", "softmax",
-            "v4_cse_reject",
+            "v4_cse_reject", "v5_cse_reject",
         }
         if self.trust_mode not in _known_modes:
             raise ValueError(
@@ -173,14 +179,26 @@ class HMPGAERuntime:
         self.v4_tau_ratio = float(self.cfg.get("v4_tau_ratio", 1.85))
         self.v4_reject_mult = float(self.cfg.get("v4_reject_mult", 0.10))
         self.v4_k_cap = int(self.cfg.get("num_byzantine", 2))
-        if self.trust_mode == "v4_cse_reject":
+        # --- V5 knobs (inert unless trust_mode == 'v5_cse_reject') ---
+        #   v5_m_floor: multiplier floor — plays v4_reject_mult's role at
+        #               ratio >= v5_r_hard and inherits its rules (never 0.0;
+        #               the pre-authorized {0.05, 0.02} sweep knob).
+        #   v5_r_hard : ratio where the ramp saturates. Pre-registered 2.5
+        #               from the archived V4 runs' steady-state attacker
+        #               ratio minima (2.38 Llama-Yahoo / 3.72 Llama-AG /
+        #               4.09 Qwen-AG): steady-state attackers saturate to
+        #               m_floor (≈V4 behavior, CSE risk bounded) while
+        #               borderline flags near tau stay mild.
+        self.v5_m_floor = float(self.cfg.get("v5_m_floor", 0.10))
+        self.v5_r_hard = float(self.cfg.get("v5_r_hard", 2.5))
+        if self.trust_mode in ("v4_cse_reject", "v5_cse_reject"):
             # The pool median must be benign-controlled: majority-poisoned
             # federations invert the rule. Raise (not assert) so a bad config
             # fails loudly at construction — _lazy_init runs OUTSIDE the
             # FedAvg-fallback try/except in HMPGAEDefense.aggregate.
             if not (0 < self.v4_k_cap and 2 * self.v4_k_cap < self.num_clients):
                 raise ValueError(
-                    "trust_mode='v4_cse_reject' requires "
+                    f"trust_mode='{self.trust_mode}' requires "
                     f"0 < num_byzantine < N/2; got num_byzantine={self.v4_k_cap} "
                     f"with N={self.num_clients}"
                 )
@@ -188,10 +206,23 @@ class HMPGAERuntime:
                 raise ValueError(
                     f"v4_tau_ratio must be > 1.0, got {self.v4_tau_ratio}"
                 )
+        if self.trust_mode == "v4_cse_reject":
             if not (0.0 < self.v4_reject_mult < 1.0):
                 raise ValueError(
                     "v4_reject_mult must be in (0, 1) — 0.0 is FoolsGold-style "
                     f"hard zeroing (rejected); got {self.v4_reject_mult}"
+                )
+        if self.trust_mode == "v5_cse_reject":
+            if not (0.0 < self.v5_m_floor < 1.0):
+                raise ValueError(
+                    "v5_m_floor must be in (0, 1) — 0.0 is FoolsGold-style "
+                    f"hard zeroing (rejected); got {self.v5_m_floor}"
+                )
+            if not (self.v5_r_hard > self.v4_tau_ratio):
+                raise ValueError(
+                    "v5_r_hard must be > v4_tau_ratio (the ramp divides by "
+                    f"their difference); got v5_r_hard={self.v5_r_hard}, "
+                    f"v4_tau_ratio={self.v4_tau_ratio}"
                 )
         # reject_z_threshold: midpoint of the sigmoid gate for soft_reject_fedavg,
         # or the hard cutoff for reject_then_fedavg.  Same scale (gr_z units)
@@ -487,8 +518,8 @@ class HMPGAERuntime:
         if use_cold_start_fallback:
             used_alpha = alpha_cold
             used_mode = "cold_start_fedavg"
-        elif self.trust_mode == "v4_cse_reject":
-            # V4: rejection driven by the absolute per-client full-test CSE.
+        elif self.trust_mode in ("v4_cse_reject", "v5_cse_reject"):
+            # V4/V5: rejection driven by the absolute per-client full-test CSE.
             # local_cse is required — do NOT silently fall back (the defense
             # facade also validates this BEFORE its FedAvg-fallback net).
             # Deliberately routed AROUND _zscore: pool-relative scoring has no
@@ -496,9 +527,9 @@ class HMPGAERuntime:
             # client in a clean federation.
             if local_cse is None:
                 raise ValueError(
-                    "trust_mode='v4_cse_reject' requires per-client local_cse; "
-                    "the server must evaluate local CSE BEFORE aggregation "
-                    "(see Server._needs_local_cse)."
+                    f"trust_mode='{self.trust_mode}' requires per-client "
+                    "local_cse; the server must evaluate local CSE BEFORE "
+                    "aggregation (see Server._needs_local_cse)."
                 )
             v4_cse_t = torch.as_tensor(
                 list(local_cse), dtype=torch.float32, device=self.device
@@ -507,15 +538,28 @@ class HMPGAERuntime:
                 raise ValueError(
                     f"local_cse must have length N={N}, got {v4_cse_t.numel()}"
                 )
-            used_alpha, v4_diag = v4_cse_reject_weights(
-                local_cse=v4_cse_t,
-                data_sizes=ds_tensor,
-                tau_ratio=self.v4_tau_ratio,
-                k_cap=self.v4_k_cap,
-                reject_mult=self.v4_reject_mult,
-                keep_min=self.keep_min,
-            )
-            used_mode = "v4_cse_reject"
+            if self.trust_mode == "v4_cse_reject":
+                used_alpha, v4_diag = v4_cse_reject_weights(
+                    local_cse=v4_cse_t,
+                    data_sizes=ds_tensor,
+                    tau_ratio=self.v4_tau_ratio,
+                    k_cap=self.v4_k_cap,
+                    reject_mult=self.v4_reject_mult,
+                    keep_min=self.keep_min,
+                )
+            else:
+                # V5: same flag decision, graded multiplier (linear ramp in
+                # the CSE ratio between tau and v5_r_hard).
+                used_alpha, v4_diag = v5_cse_reject_weights(
+                    local_cse=v4_cse_t,
+                    data_sizes=ds_tensor,
+                    tau_ratio=self.v4_tau_ratio,
+                    k_cap=self.v4_k_cap,
+                    m_floor=self.v5_m_floor,
+                    r_hard=self.v5_r_hard,
+                    keep_min=self.keep_min,
+                )
+            used_mode = self.trust_mode
         elif self.trust_mode == "soft_reject_fedavg":
             # Soft sigmoid gate on the suspicion z-score selected by gate_signal,
             # then data-size FedAvg among the (continuously) trusted clients.
@@ -625,7 +669,10 @@ class HMPGAERuntime:
             "graph_min_distinct": int(self.graph_min_distinct),
             "defense_time_ms": float(elapsed_ms),
         }
-        # V4 per-round diagnostics (only in trust_mode='v4_cse_reject').
+        # V4/V5 per-round diagnostics (trust_mode 'v4_cse_reject' or
+        # 'v5_cse_reject'). The "v4_" prefix names the shared CSE-reject
+        # diagnostic channel family — V5 reuses it so the archive-side CSV
+        # tooling works unchanged; V5-only extras carry a "v5_" prefix.
         if v4_diag is not None and v4_cse_t is not None:
             stats["v4_cse"] = v4_cse_t.detach().cpu().tolist()
             stats["v4_ratio"] = v4_diag["ratio"].detach().cpu().tolist()
@@ -636,7 +683,12 @@ class HMPGAERuntime:
             stats["v4_median_cse"] = float(v4_diag["median"])
             stats["v4_tau_ratio"] = float(self.v4_tau_ratio)
             stats["v4_k_cap"] = int(self.v4_k_cap)
-            stats["v4_reject_mult"] = float(self.v4_reject_mult)
+            if self.trust_mode == "v4_cse_reject":
+                stats["v4_reject_mult"] = float(self.v4_reject_mult)
+            else:
+                stats["v5_m_floor"] = float(self.v5_m_floor)
+                stats["v5_r_hard"] = float(self.v5_r_hard)
+                stats["v5_ramp_t"] = v4_diag["ramp_t"].detach().cpu().tolist()
         # Probe-entropy diagnostic (V4 brief, decision (d)): the mean
         # per-sample entropy on the K-sample probe is the "free" pre-agg
         # statistic under option (ii). Logged whenever the probe exists so a
@@ -666,10 +718,11 @@ class HMPGAERuntime:
     # the Adam optimizer, and the EMA latent cache z_hist.  The fixed random
     # projection and all hyperparameters are reconstructed deterministically
     # from config + random_proj_seed at __init__, so they are not stored.
-    # The V4 rule (trust_mode='v4_cse_reject') is deliberately STATELESS
-    # across rounds (per-round median ratio, no EMA), so it adds nothing here;
-    # if it ever grows cross-round state, serialize it alongside sus_ema or
-    # resumed runs will silently restart it.
+    # The V4/V5 rules ('v4_cse_reject' / 'v5_cse_reject') are deliberately
+    # STATELESS across rounds (per-round median ratio; V5's ramp is a pure
+    # per-round function of that ratio), so they add nothing here; if either
+    # ever grows cross-round state (e.g. sticky flags), serialize it
+    # alongside sus_ema or resumed runs will silently restart it.
 
     def state_dict(self) -> Dict[str, Any]:
         # Deep-copy the module/optimizer payloads: torch's .state_dict()

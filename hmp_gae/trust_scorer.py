@@ -34,6 +34,16 @@
 # as the REJECTION signal with an absolute per-client statistic — full-test
 # local CSE, pool-median normalised and rank-capped (v4_cse_reject_weights).
 # The four channels keep being computed and logged as diagnostics.
+#
+# V5 (2026-08-06): trust_mode='v5_cse_reject' keeps V4's flag decision
+# byte-identical (top-k by ratio AND ratio > tau) but turns the flagged-client
+# multiplier from the constant v4_reject_mult into a linear ramp in the CSE
+# ratio r (v5_cse_reject_weights): evidence just past tau -> mild penalty,
+# clear evidence -> v5_m_floor. Restores V3's graded-response virtue on top of
+# V4's absolute-scale detection; primary motivation is false-positive cost
+# containment (archived benign max ratios reach 1.89-2.73 in the AG cells —
+# only the rank cap keeps them unflagged; a borderline mis-flag under V4
+# costs 90% of that client's weight, under V5 nearly nothing).
 
 from __future__ import annotations
 
@@ -487,6 +497,123 @@ def v4_cse_reject_weights(
         "ratio": ratio,
         "flagged": flagged,
         "multiplier": mult,
+        "median": float(med),
+    }
+    return w, diag
+
+
+def v5_cse_reject_weights(
+    local_cse: torch.Tensor,
+    data_sizes: torch.Tensor,
+    tau_ratio: float = 1.85,
+    k_cap: int = 2,
+    m_floor: float = 0.10,
+    r_hard: float = 2.5,
+    keep_min: int = 1,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    V5 graded-rejection rule (2026-08-06): V4's flag decision, byte-identical
+    (top-k_cap by ratio AND ratio > tau_ratio), but the flagged-client
+    multiplier is a linear ramp in the CSE ratio instead of a constant:
+
+        r_i     = local_cse_i / max(median(local_cse), eps)
+        flagged = { top-k_cap clients by r }  INTERSECT  { r > tau_ratio }
+        t_i     = clamp((r_i - tau_ratio) / (r_hard - tau_ratio), 0, 1)
+        m_i     = m_floor + (1 - m_floor) * (1 - t_i)   if flagged else 1.0
+        w       = normalize(m_i * n_i)
+
+    Rationale (see docs/DECISION.md, V5 entry):
+      * Flag decision unchanged -> V4's zero-false-positive replay record and
+        the tau=1.85 pre-registration carry over untouched.
+      * Graded penalty: a client flagged at r just past tau (ambiguous
+        evidence) keeps most of its weight; a client at r >= r_hard (clear
+        evidence) gets exactly m_floor — for inputs where every flagged
+        client sits at r >= r_hard, V5 output equals V4 output with
+        reject_mult = m_floor (float-exact; the ramp term is multiplied by
+        an exact 0.0).
+      * Primary motivation is false-positive cost containment: archived
+        benign max ratios reach 1.89 (Llama AG) / 2.73 (Qwen AG, seed 42069)
+        — above tau, shielded only by the rank cap. A borderline mis-flag
+        costs ~90% of the client's weight under V4 but almost nothing under
+        V5's ramp.
+      * Calibration (archived V4 runs, steady-state rounds > 5): attacker
+        ratio minima are 2.38/2.43 (Llama Yahoo), 3.72 (Llama AG), 4.09
+        (Qwen AG), 2.02 (Qwen Yahoo seed 42) — with the pre-registered
+        r_hard = 2.5, steady-state attackers overwhelmingly saturate to
+        m_floor, so V5's admitted attacker mass stays ~V4-equal by
+        construction (CSE risk bounded); only genuinely ambiguous flags
+        (cold-start entry rounds, borderline benign) are treated mildly.
+      * m_floor plays v4_reject_mult's role and inherits its rules: the
+        runtime rejects m_floor <= 0 (hard zeroing is FoolsGold's mechanism,
+        rejected) and m_floor is the pre-authorized sweep knob ({0.05, 0.02})
+        — under V5 the sweep deepens the penalty ONLY for high-ratio
+        (clearly guilty) attackers, a strictly better risk profile than
+        sweeping V4's uniform constant.
+
+    Args:
+        local_cse:  (N,) per-client full-test CSE (absolute scale, NOT
+                    z-scored — same contract as V4).
+        data_sizes: (N,) raw data-size prior n_i (unchanged, uncapped).
+        tau_ratio:  flag threshold on r (pre-registered 1.85; NOT re-tuned).
+        k_cap:      rank cap, reuses defense_config.num_byzantine (< N/2).
+        m_floor:    multiplier floor in (0, 1); validated by the runtime.
+        r_hard:     ratio at which the ramp saturates to m_floor; must be
+                    > tau_ratio (validated here — the ramp divides by
+                    r_hard - tau_ratio).
+        keep_min:   defensive floor on unflagged clients (as in V4).
+
+    Returns:
+        (weights, diag) where weights is (N,) summing to 1 and diag carries
+        'ratio' (N,), 'flagged' (N,) bool, 'multiplier' (N,), 'ramp_t' (N,),
+        'median' float.
+    """
+    if not (float(r_hard) > float(tau_ratio)):
+        raise ValueError(
+            f"v5_cse_reject_weights requires r_hard > tau_ratio; got "
+            f"r_hard={r_hard} tau_ratio={tau_ratio}"
+        )
+    x = local_cse.detach().to(dtype=torch.float32)
+    N = int(x.numel())
+    if N == 0:
+        raise ValueError("v5_cse_reject_weights received an empty local_cse")
+    ds = data_sizes.detach().to(device=x.device, dtype=torch.float32)
+    if int(ds.numel()) != N:
+        raise ValueError(
+            f"data_sizes length {int(ds.numel())} != local_cse length {N}"
+        )
+
+    # --- Flag decision: byte-identical to v4_cse_reject_weights ---------- #
+    med = x.median()
+    ratio = x / med.clamp(min=eps)
+
+    order = torch.argsort(ratio, descending=True)
+    max_flags = min(max(0, int(k_cap)), max(0, N - max(1, int(keep_min))))
+    flagged = torch.zeros(N, dtype=torch.bool, device=x.device)
+    for j in order[:max_flags].tolist():
+        if float(ratio[j]) > float(tau_ratio):
+            flagged[j] = True
+
+    # --- V5 delta: graded multiplier instead of a constant --------------- #
+    ramp_t = torch.clamp(
+        (ratio - float(tau_ratio)) / (float(r_hard) - float(tau_ratio)),
+        min=0.0, max=1.0,
+    )
+    graded = float(m_floor) + (1.0 - float(m_floor)) * (1.0 - ramp_t)
+    mult = torch.where(flagged, graded, torch.ones_like(x))
+
+    w = mult * ds
+    total = w.sum()
+    if float(total) <= 0.0:
+        w = mult.clone()
+        total = w.sum().clamp(min=1.0)
+    w = w / total
+
+    diag: Dict[str, Any] = {
+        "ratio": ratio,
+        "flagged": flagged,
+        "multiplier": mult,
+        "ramp_t": ramp_t,
         "median": float(med),
     }
     return w, diag

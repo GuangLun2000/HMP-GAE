@@ -30,6 +30,7 @@ from hmp_gae.trust_scorer import (
     gate_diagnostics,
     reject_soft_weighted,
     v4_cse_reject_weights,
+    v5_cse_reject_weights,
 )
 from hmp_gae.hypergraph import knn_hypergraph
 from hmp_gae.runtime import HMPGAERuntime
@@ -429,6 +430,83 @@ def test_v4_cse_reject_rule():
     print("PASS  v4 rule: flags need rank AND ratio, soft mass, clean = n_k prior")
 
 
+def test_v5_cse_reject_rule():
+    """The V5 graded rule in isolation: flag set identical to V4, multiplier
+    is a monotone ramp in the ratio (mild just past tau, m_floor at r_hard),
+    clean rounds keep the exact n_k prior."""
+    ds = torch.tensor([309., 1500., 2100., 900., 1200., 1800., 1191.])
+    # (a) graded penalty: median = 0.62; r5 = 1.28/0.62 ≈ 2.065 (ramp zone),
+    #     r6 = 3.20/0.62 ≈ 5.161 (saturated).  t5 ≈ 0.330 → mult5 ≈ 0.703;
+    #     mult6 = m_floor = 0.10 exactly.
+    cse = torch.tensor([0.60, 0.55, 0.70, 0.58, 0.62, 1.28, 3.20])
+    w5, d5 = v5_cse_reject_weights(cse, ds, tau_ratio=1.85, k_cap=2,
+                                   m_floor=0.10, r_hard=2.5)
+    _, d4 = v4_cse_reject_weights(cse, ds, tau_ratio=1.85, k_cap=2,
+                                  reject_mult=0.10)
+    assert d5["flagged"].tolist() == d4["flagged"].tolist() == \
+        [False] * 5 + [True, True], "V5 flag set must equal V4's"
+    m5, m6 = float(d5["multiplier"][5]), float(d5["multiplier"][6])
+    assert 0.69 < m5 < 0.72, f"ramp-zone mult expected ≈0.703, got {m5}"
+    assert abs(m6 - 0.10) < 1e-6, f"saturated mult expected 0.10, got {m6}"
+    assert m5 > m6, "higher ratio must never get a milder multiplier"
+    assert abs(float(w5.sum()) - 1.0) < 1e-6
+    # Unflagged clients keep exact n_k proportions among themselves.
+    ratio_b = w5[:5] / ds[:5]
+    assert torch.allclose(ratio_b, ratio_b[0].expand(5), rtol=1e-5)
+    # (b) clean round: zero flags -> weights exactly the n_k prior (identical
+    #     guarantee to V4's no-scapegoat property).
+    cse0 = torch.tensor([0.60, 0.55, 0.98, 0.58, 0.62, 0.70, 0.66])
+    w0, d0 = v5_cse_reject_weights(cse0, ds, tau_ratio=1.85, k_cap=2,
+                                   m_floor=0.10, r_hard=2.5)
+    assert not bool(d0["flagged"].any()), d0["flagged"]
+    assert torch.allclose(w0, ds / ds.sum(), atol=1e-6)
+    # (c) invalid geometry: r_hard <= tau must raise (ramp divides by the
+    #     difference), never silently degenerate.
+    try:
+        v5_cse_reject_weights(cse, ds, tau_ratio=1.85, k_cap=2,
+                              m_floor=0.10, r_hard=1.85)
+        raise AssertionError("expected ValueError for r_hard <= tau_ratio")
+    except ValueError:
+        pass
+    print("PASS  v5 rule: V4 flags, graded ramp, clean = n_k prior")
+
+
+def test_v5_saturation_equals_v4():
+    """When every flagged client sits at ratio >= r_hard, V5 must reproduce
+    V4 with reject_mult = m_floor (the ramp term is an exact 0.0)."""
+    ds = torch.tensor([309., 1500., 2100., 900., 1200., 1800., 1191.])
+    # V4 test's attack round: r5 ≈ 3.065, r6 ≈ 2.823 — both >= r_hard=2.5.
+    cse = torch.tensor([0.60, 0.55, 0.70, 0.58, 0.62, 1.90, 1.75])
+    w5, d5 = v5_cse_reject_weights(cse, ds, tau_ratio=1.85, k_cap=2,
+                                   m_floor=0.10, r_hard=2.5)
+    w4, d4 = v4_cse_reject_weights(cse, ds, tau_ratio=1.85, k_cap=2,
+                                   reject_mult=0.10)
+    assert d5["flagged"].tolist() == d4["flagged"].tolist()
+    assert torch.allclose(w5, w4, atol=1e-9, rtol=0.0), (w5, w4)
+    assert torch.allclose(d5["multiplier"], d4["multiplier"], atol=1e-9)
+    print("PASS  v5 saturation: bit-equal to V4 at reject_mult = m_floor")
+
+
+def test_v5_false_positive_containment():
+    """The design motivation: a borderline flag (ratio just past tau — the
+    shape a benign false positive would take) keeps most of its weight under
+    V5, versus losing 90% under V4."""
+    ds = torch.tensor([1000.] * 7)
+    # Only c6 clears tau: median = 0.60, r6 = 1.20/0.60 = 2.0 (borderline).
+    cse = torch.tensor([0.60, 0.60, 0.60, 0.60, 0.60, 0.60, 1.20])
+    w5, d5 = v5_cse_reject_weights(cse, ds, tau_ratio=1.85, k_cap=2,
+                                   m_floor=0.10, r_hard=2.5)
+    w4, _ = v4_cse_reject_weights(cse, ds, tau_ratio=1.85, k_cap=2,
+                                  reject_mult=0.10)
+    assert d5["flagged"].tolist() == [False] * 6 + [True]
+    m6 = float(d5["multiplier"][6])
+    # t = (2.0-1.85)/0.65 ≈ 0.231 -> mult ≈ 0.792.
+    assert 0.75 < m6 < 0.82, f"borderline mult expected ≈0.79, got {m6}"
+    # Weight retained by the borderline client: ~5x more than under V4.
+    assert float(w5[6]) > 4.0 * float(w4[6]), (float(w5[6]), float(w4[6]))
+    print("PASS  v5 FP containment: borderline flag keeps most of its weight")
+
+
 # --------------------------------------------------------------------------- #
 # 5) runtime: suspicion EMA + checkpoint roundtrip                            #
 # --------------------------------------------------------------------------- #
@@ -513,6 +591,65 @@ def test_runtime_v4_cse_reject():
     print("PASS  runtime v4_cse_reject: flags attackers, loud on missing CSE")
 
 
+def test_runtime_v5_cse_reject():
+    """End-to-end runtime in V5 mode: graded rejection driven by the CSE
+    ratio, V5 diagnostics emitted (and V4's scalar mult NOT emitted),
+    missing local_cse loud, and the V5-specific config guards enforced at
+    construction."""
+    torch.manual_seed(0)
+    rt = _runtime({"trust_mode": "v5_cse_reject", "num_byzantine": 2,
+                   "graph_min_distinct": 4})
+    ids, ds = list(range(7)), [100.0] * 7
+    rows = make_geometry(5, 2, dim=256, seed=1)
+    # median = 0.61: r5 = 1.60/0.61 ≈ 2.62 (saturated -> 0.10),
+    # r6 = 1.50/0.61 ≈ 2.46 (ramp zone -> ≈ 0.157).
+    cse = [0.60, 0.62, 0.58, 0.61, 0.59, 1.60, 1.50]
+    _, stats = rt.aggregate([rows[i] for i in range(7)], ids, ds,
+                            round_num=0, local_cse=cse)
+    assert stats["trust_mode_used"] == "v5_cse_reject"
+    assert stats["v4_flagged"] == [0, 0, 0, 0, 0, 1, 1], stats["v4_flagged"]
+    mults = stats["v4_multiplier"]
+    assert abs(mults[5] - 0.10) < 1e-6, mults
+    assert 0.13 < mults[6] < 0.19, mults
+    alpha = np.asarray(stats["alpha"])
+    assert 0.0 < alpha[5:].sum() < 0.06, alpha
+    # V5 diagnostics present; V4's scalar mult absent (it does not apply).
+    for key in ("v5_m_floor", "v5_r_hard", "v5_ramp_t",
+                "v4_cse", "v4_ratio", "v4_median_cse"):
+        assert key in stats, f"missing diagnostic {key}"
+    assert "v4_reject_mult" not in stats
+    assert len(stats["v5_ramp_t"]) == 7
+    # Missing local_cse must raise, not silently degrade.
+    try:
+        rt.aggregate([rows[i] for i in range(7)], ids, ds, round_num=1)
+        raise AssertionError("expected ValueError when local_cse is missing")
+    except ValueError:
+        pass
+    # Config guards at construction: hard zeroing and degenerate ramp.
+    try:
+        _runtime({"trust_mode": "v5_cse_reject", "num_byzantine": 2,
+                  "v5_m_floor": 0.0})
+        raise AssertionError("expected ValueError for v5_m_floor = 0")
+    except ValueError:
+        pass
+    # ...and the same invalid V5 knobs must be INERT under V4 mode (a V4 run
+    # with stale v5_* keys in defense_config must not crash).
+    _runtime({"trust_mode": "v4_cse_reject", "num_byzantine": 2,
+              "v5_m_floor": 0.0, "v5_r_hard": 1.0})
+    try:
+        _runtime({"trust_mode": "v5_cse_reject", "num_byzantine": 2,
+                  "v5_r_hard": 1.85})
+        raise AssertionError("expected ValueError for v5_r_hard <= tau")
+    except ValueError:
+        pass
+    try:
+        _runtime({"trust_mode": "v5_cse_reject", "num_byzantine": 4})
+        raise AssertionError("expected ValueError for num_byzantine >= N/2")
+    except ValueError:
+        pass
+    print("PASS  runtime v5_cse_reject: graded flags, V5 diagnostics, guards")
+
+
 def test_runtime_attackers_lose_weight_over_rounds():
     """End-to-end runtime with the production signal stack (semantic ON):
     after the EMA warms up, attackers hold negligible aggregation mass."""
@@ -547,7 +684,11 @@ if __name__ == "__main__":
     test_sus_override_drives_gate()
     test_trust_weights_default_path_unchanged()
     test_v4_cse_reject_rule()
+    test_v5_cse_reject_rule()
+    test_v5_saturation_equals_v4()
+    test_v5_false_positive_containment()
     test_runtime_ema_and_state_roundtrip()
     test_runtime_v4_cse_reject()
+    test_runtime_v5_cse_reject()
     test_runtime_attackers_lose_weight_over_rounds()
     print("\nAll trust-robustness tests passed.")

@@ -91,10 +91,11 @@ class Server:
         self._probe_batches: Optional[List[Dict[str, torch.Tensor]]] = None
         # Whether the active defense actually consumes probe distributions.
         # HMP-GAE will use them when defense_config.semantic_weight > 0.
-        # NOTE (V4): trust_mode='v4_cse_reject' does NOT depend on this probe —
-        # its rejection signal is the full-test local CSE (_needs_local_cse
-        # below), so a semantic_weight=0 ablation cannot silently disable the
-        # V4 signal; it only drops the sem_div/probe_cse diagnostics.
+        # NOTE (V4/V5): the CSE-reject trust modes ('v4_cse_reject',
+        # 'v5_cse_reject') do NOT depend on this probe — their rejection
+        # signal is the full-test local CSE (_needs_local_cse below), so a
+        # semantic_weight=0 ablation cannot silently disable that signal; it
+        # only drops the sem_div/probe_cse diagnostics.
         sem_w = float((self.defense_config or {}).get('semantic_weight', 0.0))
         self._needs_probe = (
             self.defense_method in ('hmp_gae', 'hmpgae', 'hmp-gae')
@@ -112,7 +113,7 @@ class Server:
         ).lower()
         self._needs_local_cse = (
             self.defense_method in ('hmp_gae', 'hmpgae', 'hmp-gae')
-            and trust_mode_cfg == 'v4_cse_reject'
+            and trust_mode_cfg in ('v4_cse_reject', 'v5_cse_reject')
         )
 
         # Track historical data
@@ -429,22 +430,30 @@ class Server:
             )
             print(f"  🚪 gate:         {gate_summary}")
 
-        # V4 rejection-rule diagnostics (trust_mode='v4_cse_reject' only):
-        # per-client CSE/median ratio and which clients were flagged this round.
+        # V4/V5 rejection-rule diagnostics (trust_mode 'v4_cse_reject' or
+        # 'v5_cse_reject'): per-client CSE/median ratio and which clients were
+        # flagged this round. V5 has no scalar mult — show floor + r_hard.
         v4_ratio_list = defense_stats.get('v4_ratio')
         v4_flagged_list = defense_stats.get('v4_flagged')
         if isinstance(v4_ratio_list, list) and len(v4_ratio_list) == len(client_ids):
             ratio_summary = ", ".join(
                 f"c{cid}={v:.3f}" for cid, v in zip(client_ids, v4_ratio_list)
             )
-            print(f"  🧪 v4 cse/med:   {ratio_summary}")
+            print(f"  🧪 cse/med:      {ratio_summary}")
         if isinstance(v4_flagged_list, list) and len(v4_flagged_list) == len(client_ids):
             flagged_ids = [cid for cid, f in zip(client_ids, v4_flagged_list) if f]
+            if 'v5_m_floor' in defense_stats:
+                mult_desc = (
+                    f"ramp floor={defense_stats.get('v5_m_floor')}, "
+                    f"r_hard={defense_stats.get('v5_r_hard')}"
+                )
+            else:
+                mult_desc = f"mult={defense_stats.get('v4_reject_mult')}"
             print(
-                f"  ⛔ v4 flagged:   {flagged_ids if flagged_ids else 'none'} "
+                f"  ⛔ flagged:      {flagged_ids if flagged_ids else 'none'} "
                 f"(tau={defense_stats.get('v4_tau_ratio')}, "
                 f"k_cap={defense_stats.get('v4_k_cap')}, "
-                f"mult={defense_stats.get('v4_reject_mult')})"
+                f"{mult_desc})"
             )
 
         # Compute similarity and distance metrics for visualization (unchanged).
@@ -488,6 +497,7 @@ class Server:
                   'probe_cse',
                   'v4_cse', 'v4_ratio', 'v4_flagged', 'v4_multiplier',
                   'v4_median_cse', 'v4_tau_ratio', 'v4_k_cap', 'v4_reject_mult',
+                  'v5_m_floor', 'v5_r_hard', 'v5_ramp_t',
                   'L_rec', 'L_smooth', 'L_hist',
                   'fallback_reason', 'defense_time_ms'):
             if k in defense_stats:
@@ -945,28 +955,28 @@ class Server:
             probe_tensor = torch.stack(probe_rows, dim=0)  # (N, K, C)
 
         # Optional Phase 3.6: pre-aggregation per-client local metrics for the
-        # V4 CSE trust rule (trust_mode='v4_cse_reject'). Client models are
-        # untouched by aggregation, so these values are identical to the
-        # legacy post-aggregation evaluation — computed once here and reused
-        # for the round log below (no duplicate eval cost).
+        # CSE-reject trust rules (trust_mode 'v4_cse_reject' / 'v5_cse_reject').
+        # Client models are untouched by aggregation, so these values are
+        # identical to the legacy post-aggregation evaluation — computed once
+        # here and reused for the round log below (no duplicate eval cost).
         local_accs_this_round: Dict[int, float] = {}
         local_cse_this_round: Dict[int, float] = {}
         local_cse_vector: Optional[List[float]] = None
         if self._needs_local_cse:
             if any(getattr(c, 'crafts_update', False) for c in self.clients):
                 raise RuntimeError(
-                    "trust_mode='v4_cse_reject' is not supported with update-"
-                    "forging attackers (crafts_update, e.g. AugMP): local CSE "
-                    "evaluates client.model, which such attackers leave "
-                    "looking benign (the poison lives only in the crafted "
-                    "update)."
+                    "CSE-reject trust modes (v4_cse_reject / v5_cse_reject) "
+                    "are not supported with update-forging attackers "
+                    "(crafts_update, e.g. AugMP): local CSE evaluates "
+                    "client.model, which such attackers leave looking benign "
+                    "(the poison lives only in the crafted update)."
                 )
             local_accs_this_round, local_cse_this_round = self._collect_local_metrics()
             missing = [cid for cid in sorted_client_ids
                        if cid not in local_cse_this_round]
             if missing:
                 raise RuntimeError(
-                    "trust_mode='v4_cse_reject': local CSE evaluation failed "
+                    "CSE-reject trust mode: local CSE evaluation failed "
                     f"for clients {missing}; cannot aggregate without it."
                 )
             local_cse_vector = [float(local_cse_this_round[cid])
