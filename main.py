@@ -1217,41 +1217,41 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: HMP-GAE V4 defended arm, AG NEWS cell (seed=42069)
-        # === — HMP-GAE V4 (trust_mode='v4_cse_reject') vs Hallucination on
-        # === AG News (non-IID 0.5, 4 classes), Qwen2.5-0.5B backbone,
-        # === 5 benign + 2 attackers (N=7) ===
-        # Fills the HMP-GAE (proposed) column of the AG News seed=42069 row.
-        # Exactly ONE axis moves vs each companion cell:
-        #   vs agnews-foolsgold-qwen seed=42069 arm : defense foolsgold ->
-        #     hmp_gae(V4)
-        #   vs agnews-fltrust-qwen  seed=42069 arm : defense fltrust ->
-        #     hmp_gae(V4)
-        # (completes the defense column set {fltrust, foolsgold, hmpgae-v4}
-        # on AG News at this seed.)
+        # === CURRENT RUN: HMP-GAE V4 SINGLE-ATTACKER arm — HMP-GAE V4
+        # === (trust_mode='v4_cse_reject') vs Hallucination on Yahoo Answers
+        # === (non-IID 0.5, 10 classes), Llama-3.2-1B backbone,
+        # === 6 benign + 1 attacker (N=7), seed=42 ===
+        # Companion to the ARCHIVED run
+        #   20260723-yahoo-(non-iid0.5)-foolsgold-汉霖-6-1attacker
+        # (config.json verified 2026-08-05: seed=42, N=7, num_attackers=1,
+        # yahoo_answers, Llama-3.2-1B, foolsgold, canonical skeleton).
+        # Exactly ONE axis moves vs that run: defense foolsgold -> hmp_gae(V4).
+        # PURPOSE: FoolsGold's signal is cross-attacker similarity, which is
+        # structurally blind with a single attacker; HMP-GAE V4's CSE-ratio
+        # rule is per-client ABSOLUTE (no attacker-pair needed), so this pair
+        # tests exactly that contrast.
+        # V4 rank cap: num_byzantine kept at 2 (NOT lowered to 1) — the
+        # defense keeps the same assumed byzantine bound as every other V4
+        # arm (soundness needs #attackers <= k_cap < N/2: 1 <= 2 < 3.5 OK);
+        # the ratio floor r>1.85 is what protects the second-ranked benign
+        # from a spurious flag (0 FP over the 51-run replay).
         # The full defense_config block below is LIVE: per-round semantic
-        # probe forwards run (semantic_weight=1.0, stratified probe — AG News
-        # gives 25 samples/class, V4's easy regime), and the V4 rule
-        # evaluates per-client full-test local CSE BEFORE aggregation every
-        # round.  V4 rank cap reuses num_byzantine=2 (< N/2, OK for N=7).
-        # v4_tau_ratio=1.85 is PRE-REGISTERED (Qwen-validated) — do not
-        # re-tune after results.
-        # What the seed changes across seed arms of the SAME dataset:
-        # Dirichlet partition, model/LoRA init, training shuffles, per-round
-        # flip randomization.  The 10K train pool and the test set are
-        # HARDCODED rng(42) in data_loader.py — identical eval data across
-        # all seed arms of a given dataset.
-        # Held fixed (canonical skeleton): 50 rounds, LoRA r=8, batch 32,
-        # lr 5e-5, max_length=128, 10K subset, Dirichlet(0.5), DEFAULT attack
-        # strength flip_ratio_range=[0.3,0.8], per-round randomized flip path.
-        # NOTE: Qwen/Qwen2.5-0.5B is NOT gated — no HF login required; fits a
-        # T4 15GB (A100 not needed for this arm).
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v4-hallu(localround=1,seed=42069,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
-        'seed': 42069,  # Random seed — held fixed; defense is the only moving axis vs the agnews fltrust/foolsgold seed=42069 arms
+        # probe forwards (semantic_weight=1.0, stratified — 10/class on
+        # Yahoo) and pre-aggregation per-client full-test local CSE.
+        # v4_tau_ratio=1.85 is PRE-REGISTERED — do not re-tune after results.
+        # Held fixed vs the archived companion (verified against its
+        # config.json): 50 rounds, seed=42, LoRA r=8, batch 32, lr 5e-5,
+        # max_length=128, 10K subset, Dirichlet(0.5), DEFAULT attack strength
+        # flip_ratio_range=[0.3,0.8], per-round randomized flip path.
+        # NOTE: meta-llama/Llama-3.2-1B is GATED — accept the license on HF
+        # and provide HF_TOKEN (Colab Step 2 logs in automatically). Needs
+        # A100 (fp32 ~5GB/copy; does NOT fit a T4 15GB).
+        'experiment_name': 'yahoo-(non-iid0.5)-hmpgae-v4-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8,atk1)-llama3.2-1b',
+        'seed': 42,  # Random seed — matches the archived foolsgold 6b+1a companion (defense is the only moving axis)
 
         # ========== Federated Learning Setup ==========
-        'num_clients': 7,    # Total clients: 5 benign + 2 attackers (canonical arm)
-        'num_attackers': 2,  # 2 attackers (C5, C6 — the last clients), per-round randomized label-flip
+        'num_clients': 7,    # Total clients: 6 benign, 1 attacker (single-attacker arm, N=7)
+        'num_attackers': 1,  # 1 attacker (C6, the last client), per-round randomized label-flip
         'num_rounds': 50,    # 50 × 1 local epoch = the paper regime (~3-4 h on T4).
                              # Also gives the suspicion EMA (β=0.6, ~2-3 round lag)
                              # a long steady state; 10-round runs are smoke tests.
@@ -1271,9 +1271,9 @@ def main(config_overrides: Optional[Dict] = None):
         # ========== Dataset Configuration ==========
         # Choose dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers' — set num_labels and max_length accordingly
         # Dataset 1: AG News
-        'dataset': 'ag_news',  # news classification (4 classes)
-        'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
-        'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
+        # 'dataset': 'ag_news',  # news classification (4 classes)
+        # 'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
+        # 'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
                                # (128 also matches ALL prior cross-dataset runs' truncation envelope)
         # -------------------------------------------
         # Dataset 2: IMDB
@@ -1287,9 +1287,9 @@ def main(config_overrides: Optional[Dict] = None):
         # 'max_length': 512,
         # -------------------------------------------
         # Dataset 4: Yahoo Answers (10 classes, 1.4M train / 60K test)
-        # 'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
-        # 'num_labels': 10,       # Yahoo Answers: 10 classes
-        # 'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
+        'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
+        'num_labels': 10,       # Yahoo Answers: 10 classes
+        'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
                                 # (same truncation / wall-clock / memory envelope; README's
                                 # 256 recommendation is a separate ablation, not part of the
                                 # cross-dataset comparison).
@@ -1326,11 +1326,11 @@ def main(config_overrides: Optional[Dict] = None):
         # 'model_name': 'gpt2',                      # GPT-2 124M — stable decoder baseline
         # 'model_name': 'EleutherAI/pythia-160m',    # Pythia-160M (may need grad_clip_norm=0.5)
         # 'model_name': 'facebook/opt-125m',         # OPT-125M (Meta)
-        'model_name': 'Qwen/Qwen2.5-0.5B',         # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning.
+        # 'model_name': 'Qwen/Qwen2.5-0.5B',       # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning.
                                                    # NOT gated; fits a T4 15GB comfortably.  Backbone of the
                                                    # AG News results-table rows and the archived Qwen Yahoo
                                                    # non-IID V3 baseline (the Qwen V4 confirmatory arm).
-        # 'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
+        'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
                                                   # GATED repo: accept the Llama 3.2 license on HF and provide
                                                   # HF_TOKEN (Colab Step 2 logs in automatically).
                                                   # LoRA targets auto-resolve via the "llama" branch in models.py
@@ -1380,12 +1380,12 @@ def main(config_overrides: Optional[Dict] = None):
         # ======================================================================
         'hallu_flip_ratio': 0.5,                   # used only when hallu_flip_ratio_range is None
         'hallu_flip_mode': 'random',               # 'pairwise' | 'targeted' | 'random'
-        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2},
+        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4, 6: 7, 7: 6, 8: 9, 9: 8},
                                                    # only consumed in flip_mode='pairwise' (inert in
                                                    # the active 'random' mode). Adjacent-pair bijection
                                                    # sized for the ACTIVE dataset's num_labels
-                                                   # (4 = AG News); expand to {0:1,1:0,...,8:9,9:8}
-                                                   # for Yahoo Answers (10 classes).
+                                                   # (10 = Yahoo Answers); shrink to {0:1,1:0,2:3,3:2}
+                                                   # for AG News (4 classes).
         'hallu_target_class': None,                # only for flip_mode='targeted'
         'hallu_attack_start_round': 0,
         'hallu_per_round_reseed': True,            # re-sample flipped-label set each round
