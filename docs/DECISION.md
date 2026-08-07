@@ -36,6 +36,10 @@ all 5 clean baselines. **Do not route the V4 signal through `_zscore`.**
 
 ### Rejected: hard zeroing (`v4_reject_mult = 0.0`)
 
+> **Scope narrowed 2026-08-07** — see "V4-remove ablation arm" below: 0.0 is
+> now legal as an explicit, pre-registered ablation arm on Qwen AG News. As a
+> *default*, and on Yahoo, it remains rejected exactly as stated here.
+
 Hard discard is FoolsGold's mechanism; FoolsGold on Qwen Yahoo non-IID has the
 archive's worst PPL (1549.30) and worst per-class spread. Since lowering PPL is
 half the goal, rejection is soft (0.10). `0.10` itself was not separately
@@ -228,6 +232,55 @@ Both were measured on the archive before V6 was designed, and both fail:
   acknowledged and **not** addressed here — it is a separate change, gated on
   first archiving `probe_cse` to check whether the 100-sample probe entropy
   discriminates as well as the 1500-sample full-test CSE.
+
+## V4-remove ablation arm: `v4_reject_mult = 0.0` legalized (2026-08-07)
+
+**Adopted (user decision, paper-story motivation):** exactly `0.0` is now a
+legal value for `v4_reject_mult` under `trust_mode='v4_cse_reject'` — a
+flagged client is excluded from that round's aggregate outright
+("detect-then-remove"). This narrows, but does not overturn, the V4 entry's
+"Rejected: hard zeroing": 0.0 as a **default** stays rejected, the runtime
+default stays 0.10, and the guard still refuses negatives. The authorized
+sweep set is now {0.10, 0.05, 0.02, 0.0}.
+
+- **Motivation is narrative, not metrics.** "Detected attackers are removed"
+  is a cleaner paper story than "detected attackers keep a 0.10 multiplier".
+  The arm exists to test whether that story is free — NOT because a
+  measurable CSE gain is expected.
+- **Pre-registered expectation (written before the run):** V4 leaves
+  attackers ~2.4% of aggregate weight in the Qwen AG cell, and ~half the
+  mean-CSE mass accrues in R1–R10 before detection fires (R1–R2 alone ~17%,
+  untouched by any multiplier). Extrapolating the measured V6 dose-response
+  (−0.41pp attacker share → −0.0008 mean CSE), full removal moves mean/final
+  CSE by at most ~0.005 — inside the seed-noise band (median |Δmean CSE|
+  13.1% over the 6 archived seed pairs). A within-noise delta in EITHER
+  direction is a tie. Success for the story = no metric regresses beyond
+  seed noise; the insight either way is what the residual 2% of attacker
+  mass is actually worth.
+- **Noise-band discipline for PPL (V6 Run-1 lesson):** same-cell seed-pair
+  PPL deltas measure +6%/+38%/+65%, so only a PPL / ppl_class_std regression
+  beyond that band counts as harm. The V6 criterion of +2% was calibrated on
+  the V5-vs-V4 delta (+0.3%) — two nearly-identical trajectories, not two
+  independent draws — and is retired as miscalibrated.
+- **Scope: Qwen AG News non-IID only.** Extending remove to Yahoo requires a
+  new entry first: the 2026-07-29 coverage mechanism (10-class
+  Dirichlet-0.5; m=0.10 already pushed Qwen-Yahoo PPL past the attack floor)
+  predicts hard removal makes Yahoo PPL strictly worse.
+- **Removal is per-round.** Flags are re-evaluated every round; an unflagged
+  round re-admits the client. Sticky flags / permanent blacklisting remain
+  deferred (V5 entry) — with archived flag stability (97/100
+  attacker-rounds, 0 benign) per-round removal approximates permanent
+  exclusion without new cross-round state or checkpoint changes.
+- **Unchanged:** `v5_m_floor` and `v6_geo_floor` keep their open lower
+  bounds (no 0.0) — under the V5 ramp a floor of 0 zeroes only saturated
+  (r ≥ r_hard) clients, a different mechanism that gets its own decision if
+  ever wanted. `tau=1.85` pre-registration, rank-cap semantics, the
+  no-`_zscore` rule, and AugMP incompatibility all carry over.
+- **Companion & controlled delta:** archived Qwen AG non-IID V4 run
+  20260729 (seed 42); the ONLY moving axis is `v4_reject_mult` 0.10 → 0.0.
+- Tested: `test_v4_hard_removal_arm` (flagged mass exactly 0, survivors
+  renormalise to the n_k prior, clean rounds bit-identical to soft V4,
+  guard accepts 0.0 / refuses negatives).
 
 ## C1 z-score hygiene (2026-07-28)
 

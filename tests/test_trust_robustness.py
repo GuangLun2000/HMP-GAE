@@ -434,6 +434,48 @@ def test_v4_cse_reject_rule():
     print("PASS  v4 rule: flags need rank AND ratio, soft mass, clean = n_k prior")
 
 
+def test_v4_hard_removal_arm():
+    """The 2026-08-07 pre-registered ablation arm (docs/DECISION.md
+    "V4-remove"): reject_mult=0.0 excludes flagged clients from the round's
+    aggregate outright. Flagged weights must be exactly 0, survivors must
+    renormalise to their n_k prior, clean rounds are untouched, and the
+    runtime guard accepts 0.0 but still refuses negatives (a negative
+    multiplier would sign-flip a flagged update — an attack, not a penalty)."""
+    ds = torch.tensor([309., 1500., 2100., 900., 1200., 1800., 1191.])
+    # (a) attack round: both attackers flagged -> exactly zero mass; the
+    #     benign remainder is the n_k prior renormalised over survivors.
+    cse = torch.tensor([0.60, 0.55, 0.70, 0.58, 0.62, 1.90, 1.75])
+    w, diag = v4_cse_reject_weights(cse, ds, tau_ratio=1.85, k_cap=2,
+                                    reject_mult=0.0)
+    assert diag["flagged"].tolist() == [False] * 5 + [True, True]
+    assert float(w[5:].abs().sum()) == 0.0, "flagged mass must be exactly 0"
+    assert abs(float(w.sum()) - 1.0) < 1e-6
+    assert torch.allclose(w[:5], ds[:5] / ds[:5].sum(), atol=1e-6), \
+        "survivors must renormalise to their n_k prior"
+    # (b) clean round: no flags -> exact n_k prior, bit-identical to soft V4
+    #     (the arm changes nothing until a flag actually fires).
+    cse0 = torch.tensor([0.60, 0.55, 0.98, 0.58, 0.62, 0.70, 0.66])
+    w0, d0 = v4_cse_reject_weights(cse0, ds, tau_ratio=1.85, k_cap=2,
+                                   reject_mult=0.0)
+    assert not bool(d0["flagged"].any()), d0["flagged"]
+    assert torch.allclose(w0, ds / ds.sum(), atol=1e-6)
+    # (c) the normalisation denominator stays positive by construction: the
+    #     rank cap (num_byzantine < N/2, runtime-validated) plus keep_min
+    #     bound the flag count below N, and unflagged clients keep m=1.
+    assert float(w[:5].sum()) > 0.99
+    # (d) runtime guard: 0.0 constructs since 2026-08-07; negatives refuse.
+    rt = _runtime({"trust_mode": "v4_cse_reject", "num_byzantine": 2,
+                   "v4_reject_mult": 0.0, "graph_min_distinct": 4})
+    assert rt.v4_reject_mult == 0.0
+    try:
+        _runtime({"trust_mode": "v4_cse_reject", "num_byzantine": 2,
+                  "v4_reject_mult": -0.1})
+        raise AssertionError("expected ValueError for negative reject_mult")
+    except ValueError:
+        pass
+    print("PASS  v4 hard-removal arm: flagged mass exactly 0, survivors = n_k prior")
+
+
 def test_v5_cse_reject_rule():
     """The V5 graded rule in isolation: flag set identical to V4, multiplier
     is a monotone ramp in the ratio (mild just past tau, m_floor at r_hard),
@@ -939,6 +981,7 @@ if __name__ == "__main__":
     test_sus_override_drives_gate()
     test_trust_weights_default_path_unchanged()
     test_v4_cse_reject_rule()
+    test_v4_hard_removal_arm()
     test_v5_cse_reject_rule()
     test_v5_saturation_equals_v4()
     test_v5_false_positive_containment()

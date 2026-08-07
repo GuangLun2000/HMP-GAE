@@ -180,10 +180,14 @@ class HMPGAERuntime:
         #   k_cap         : REUSES defense_config.num_byzantine — no new
         #                   hyperparameter. Rule is sound only for
         #                   #attackers <= k_cap < N/2 (validated below).
-        #   v4_reject_mult: soft rejection multiplier, 0.10 — NOT 0.0 (hard
-        #                   zeroing is FoolsGold's mechanism, the archive's
-        #                   worst PPL); first knob to sweep if a confirmatory
-        #                   run shows residual attacker mass.
+        #   v4_reject_mult: rejection multiplier, default 0.10 (soft). 0.0 =
+        #                   HARD REMOVAL — a flagged client contributes nothing
+        #                   to that round's aggregate. Legal since 2026-08-07 as
+        #                   an explicit pre-registered ablation arm (docs/
+        #                   DECISION.md "V4-remove"); as a DEFAULT it stays
+        #                   rejected (FoolsGold's mechanism, the archive's
+        #                   worst Qwen-Yahoo PPL). Sweep set {0.10, 0.05,
+        #                   0.02, 0.0}.
         self.v4_tau_ratio = float(self.cfg.get("v4_tau_ratio", 1.85))
         self.v4_reject_mult = float(self.cfg.get("v4_reject_mult", 0.10))
         self.v4_k_cap = int(self.cfg.get("num_byzantine", 2))
@@ -228,10 +232,18 @@ class HMPGAERuntime:
                     f"v4_tau_ratio must be > 1.0, got {self.v4_tau_ratio}"
                 )
         if self.trust_mode == "v4_cse_reject":
-            if not (0.0 < self.v4_reject_mult < 1.0):
+            # Exactly 0.0 (hard removal) became legal on 2026-08-07 as a
+            # pre-registered ablation arm — the detect-then-remove paper
+            # story (docs/DECISION.md "V4-remove"). The bound is now closed
+            # at 0: negatives would flip a flagged client's update sign,
+            # which is an attack, not a penalty. v5_m_floor / v6_geo_floor
+            # below keep their OPEN lower bounds — widening those is a
+            # separate decision this entry deliberately does not make.
+            if not (0.0 <= self.v4_reject_mult < 1.0):
                 raise ValueError(
-                    "v4_reject_mult must be in (0, 1) — 0.0 is FoolsGold-style "
-                    f"hard zeroing (rejected); got {self.v4_reject_mult}"
+                    "v4_reject_mult must be in [0, 1) — 0.0 = hard removal "
+                    "(pre-registered ablation arm, DECISION 2026-08-07); "
+                    f"got {self.v4_reject_mult}"
                 )
         if self.trust_mode in ("v5_cse_reject", "v6_cse_reject_geo"):
             # V6 reuses V5's Stage-2 ramp verbatim, so it inherits both guards.

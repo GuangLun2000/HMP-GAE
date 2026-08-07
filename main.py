@@ -1224,54 +1224,53 @@ def main():
     # A/B arm — edit it here, run, and edit it back.
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: V6 FIRST TEST — HMP-GAE V6
-        # === (trust_mode='v6_cse_reject_geo') vs Hallucination on AG News
-        # === (non-IID 0.5, 4 classes), Qwen2.5-0.5B backbone,
+        # === CURRENT RUN: V4-REMOVE ABLATION — HMP-GAE V4
+        # === (trust_mode='v4_cse_reject', v4_reject_mult=0.0) vs Hallucination
+        # === on AG News (non-IID 0.5, 4 classes), Qwen2.5-0.5B backbone,
         # === 5 benign + 2 attackers (N=7), seed=42 ===
-        # Companion to the ARCHIVED V5 run 20260805-...-v5-... (Qwen AG
-        # non-IID, seed 42 — take the exact folder name from the archive's
-        # docs/LEADERBOARD.md and verify its config.json before comparing)
-        # and, through it, to the V4 run 20260729-...-qwen-zihao(v4).
-        # Exactly ONE axis moves vs the V5 companion: trust_mode v5 -> v6
-        # (plus the new v6_geo_floor knob, which is inert under v5).
-        # WHAT V6 CHANGES — V4/V5 compute the hypergraph/VGAE channels and then
-        # multiply them by zero: alpha = normalize(m_i * n_i) depends only on
-        # (partition, seed), which is why the archived trust separation is
-        # bit-identical across BACKBONES (Qwen AG V4 = Llama AG V4 = Qwen AG
-        # V5 = 16.1289). V6 folds the geometry gate back into alpha as a
-        # CONSERVATIVE CONJUNCTION on flagged clients only:
-        #     m_i = m_cse_i * (v6_geo_floor + (1-v6_geo_floor)*gate_i)
-        # Since that factor is in [geo_floor, 1], m_i <= m_cse_i ALWAYS: the
-        # geometry can only deepen a CSE-driven penalty, never soften one, so
-        # CSE cannot regress by construction. Motivation is paper consistency
-        # (Eq. 21 / Algorithm 1 line 16-17 claim f_trust produces alpha) with
-        # a provably bounded risk, NOT an expected accuracy win.
-        # Estimated from the archived gate values, this should cut flagged
-        # attacker weight by ~12% (Qwen AG) to ~36% (Llama AG) vs V5.
-        # RUN ORDER — Run 0 FIRST as a wiring check: set 'v6_geo_floor': 1.0
-        # and confirm trust_weights.csv is BIT-IDENTICAL to the V5 companion
-        # (at 1.0 the geometry term is an exact 1.0). If it differs, the
-        # plumbing is wrong — stop and fix, do not proceed. Then this config
-        # (geo_floor=0.5) as Run 1.
-        # ⚠ GIVE RUN 0 ITS OWN 'experiment_name' (e.g. ...-v6-geofloor1.0-...).
+        # Companion to the ARCHIVED V4 run 20260729-...-qwen-zihao(v4) (Qwen
+        # AG non-IID, seed 42). Exactly ONE axis moves vs that companion:
+        # v4_reject_mult 0.10 -> 0.0. Do NOT touch anything else — the
+        # v5_*/v6_* keys below are inert under v4 mode and must stay at their
+        # documented values so the comparison remains controlled.
+        # WHAT THIS ARM ASKS — the detect-then-remove paper story: a client
+        # flagged by the CSE rule (top-num_byzantine by ratio AND r > 1.85)
+        # is EXCLUDED from that round's aggregate outright instead of keeping
+        # a 0.10 multiplier. Removal is PER-ROUND — flags are re-evaluated
+        # every round and an unflagged round re-admits the client. Sticky /
+        # permanent blacklisting stays deferred (docs/DECISION.md); with the
+        # archived flag stability (97/100 attacker-rounds flagged, 0 benign)
+        # per-round removal is a near-permanent exclusion in practice anyway.
+        # PRE-REGISTERED EXPECTATION (2026-08-07, written BEFORE the run):
+        # V4 already leaves attackers only ~2.4% of aggregate weight, and
+        # ~half the mean-CSE mass accrues in R1-R10 before detection fires
+        # (R1-R2 carry ~17% alone and are untouched by ANY multiplier).
+        # Extrapolating the measured V6 dose-response, removing the residual
+        # mass can improve mean/final CSE by AT MOST ~0.005 — INSIDE the
+        # seed-noise band (median |Δmean CSE| 13.1% over the 6 archived seed
+        # pairs). So: a within-noise CSE delta must be reported as a TIE, not
+        # a win. PPL / ppl_class_std judged by the same discipline — observed
+        # same-cell seed-pair PPL deltas are +6%/+38%/+65%, so only a
+        # regression beyond that band is evidence of harm; the V6 run's +6.5%
+        # "regression" sat at the bottom of the band and taught us the old +2%
+        # criterion was miscalibrated. SUCCESS for the paper story = no metric
+        # regresses beyond seed noise: then remove (m=0) and soft (m=0.10)
+        # are interchangeable and the cleaner story costs nothing.
+        # ⚠ DO NOT run Yahoo with v4_reject_mult=0.0 without a new DECISION
+        # entry: the 2026-07-29 coverage mechanism (10-class Dirichlet-0.5;
+        # down-weighting 2/7 clients already pushed PPL past the attack
+        # floor at m=0.10) predicts hard removal makes Yahoo PPL strictly
+        # worse. This arm is Qwen AG News ONLY until that entry exists.
+        # ⚠ THIS RUN HAS ITS OWN 'experiment_name' ('-v4remove-' below).
         # fed_resume's fingerprint covers experiment_name / N / rounds /
         # attackers / model / defense_method / lora / seed / dataset — it does
-        # NOT look inside defense_config. Run 0 and Run 1 differ ONLY in
-        # v6_geo_floor, so under a shared name a leftover Run-0 checkpoint
-        # would resume into Run 1 with no mismatch warning at all.
-        # SUCCESS = no regression on ALL FOUR of CSE + PPL + ppl_class_std +
-        # accuracy (accuracy is a floor check only — on this benchmark it sits
-        # inside seed noise, median |Δmean acc| 0.0207 over 6 archived seed
-        # pairs, and must NOT be used to rank defenses).
-        # ALSO REPORT: the per-round v6_geo_mult distribution. If it is ≈1.0
-        # in every round, the geometry never acted and V6 is V5 renamed —
-        # that is a negative result to report honestly, NOT a reason to lower
-        # v6_geo_floor after the fact.
-        # v4_tau_ratio=1.85, v5_r_hard=2.5 and v6_geo_floor=0.5 are ALL
-        # PRE-REGISTERED — do not re-tune after seeing results.
+        # NOT look inside defense_config, so under a reused name a leftover
+        # V4/V5/V6 checkpoint would resume into this arm with no mismatch
+        # warning at all.
+        # v4_tau_ratio=1.85 stays PRE-REGISTERED — do not re-tune it here.
         # NOTE: Qwen/Qwen2.5-0.5B is NOT gated — no HF login required; fits a
         # T4 15GB (A100 not needed for this arm).
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v6-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v4remove-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
         'seed': 42,  # Random seed — matches the archived V4/V5 companions (trust_mode is the only moving axis)
 
         # ========== Federated Learning Setup ==========
@@ -1615,11 +1614,13 @@ def main():
             #       n_k/Σn — the "no scapegoat" property V3 could not hold.
             #       Same local-CSE requirement / eval timing / AugMP
             #       incompatibility as V4.
-            # CURRENT RUN: 'v6_cse_reject_geo' — the ONE aggregation-behavior
-            # knob changed vs the archived Qwen AG News V5 companion (20260805).
-            # Set to 'v5_cse_reject' / 'v4_cse_reject' to reproduce those
-            # companions, or to 'soft_reject_fedavg' for V3.
-            'trust_mode': 'v6_cse_reject_geo',
+            # CURRENT RUN: 'v4_cse_reject' with v4_reject_mult=0.0 below — the
+            # V4-REMOVE ablation. The ONE aggregation-behavior axis moved vs
+            # the archived Qwen AG News V4 companion (20260729) is that
+            # multiplier, 0.10 -> 0.0. Restore 0.10 to reproduce the
+            # companion; 'v5_cse_reject' / 'v6_cse_reject_geo' reproduce the
+            # later arms, 'soft_reject_fedavg' is V3.
+            'trust_mode': 'v4_cse_reject',
             # --- V4 CSE rejection knobs (INERT unless trust_mode='v4_cse_reject') ---
             # v4_tau_ratio: pre-registered 1.85 (zero-FP plateau [1.785, 1.90]
             #   over 51 archived runs / 17,850 client-round decisions,
@@ -1627,14 +1628,18 @@ def main():
             #   seeing a confirmatory run. Headroom is thin (max clean-run
             #   ratio observed 1.7833) and Qwen-only — a Llama no-attack
             #   baseline (validation plan Run 0) is the missing check.
-            # v4_reject_mult: SOFT rejection multiplier — 0.10, not 0.0 (hard
-            #   zeroing is FoolsGold's mechanism: worst archive PPL 1549 on
-            #   Qwen Yahoo). Not separately validated — the first knob to
-            #   sweep if a confirmatory run shows residual attacker mass.
+            # v4_reject_mult: rejection multiplier. THIS RUN: 0.0 — HARD
+            #   REMOVAL (pre-registered ablation arm, docs/DECISION.md
+            #   "V4-remove", 2026-08-07): a flagged client is excluded from
+            #   that round's aggregate outright. The default and the archived
+            #   companion's value is 0.10 (soft); 0.0 as a DEFAULT stays
+            #   rejected (FoolsGold's mechanism: worst archive PPL 1549 on
+            #   Qwen Yahoo). RESTORE 0.10 after this arm. Sweep set
+            #   {0.10, 0.05, 0.02, 0.0}.
             # The rank cap REUSES 'num_byzantine' above (no new key); keep_min
             #   below also applies.
             'v4_tau_ratio': 1.85,
-            'v4_reject_mult': 0.10,
+            'v4_reject_mult': 0.0,
             # --- V5 graded-rejection knobs (INERT unless trust_mode='v5_cse_reject') ---
             # V5 keeps V4's flag rule (top-num_byzantine AND ratio > v4_tau_ratio,
             # byte-identical) and grades only the penalty of flagged clients:

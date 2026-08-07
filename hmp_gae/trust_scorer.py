@@ -460,8 +460,15 @@ def v4_cse_reject_weights(
         do NOT route it through _zscore: pool-relative scoring has no absolute
         floor and scapegoats the most heterogeneous benign client in a clean
         federation (fails test_no_attack_no_scapegoat).
-      * reject_mult is SOFT (0.10), not 0.0 — hard zeroing is FoolsGold's
-        mechanism and carries the archive's worst PPL for Qwen Yahoo.
+      * reject_mult DEFAULTS soft (0.10). Exactly 0.0 — hard removal: a
+        flagged client is excluded from the round's aggregate outright — is
+        legal since 2026-08-07 as a pre-registered ablation arm for the
+        detect-then-remove paper story (docs/DECISION.md "V4-remove"). As a
+        default it stays rejected: hard zeroing is FoolsGold's mechanism and
+        carries the archive's worst PPL for Qwen Yahoo. Removal is per-round
+        (flags re-evaluated each round, no sticky state), and the rank cap
+        (< N/2) plus keep_min guarantee the unflagged remainder always
+        carries positive mass, so w still sums to 1.
       * tau_ratio=1.85 is pre-registered (zero-FP plateau [1.785, 1.90]); do
         not re-tune it after seeing a confirmatory run.
       * k_cap reuses defense_config.num_byzantine; the rule is sound only for
