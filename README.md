@@ -81,7 +81,7 @@ python main.py
 
 ### Google Colab Execution (or other Cloud AI platforms)
 
-**Recommended: run the notebook.** Open [`HMP_GAE_Colab.ipynb`](HMP_GAE_Colab.ipynb), enable **T4 GPU**, then **Run all**. It runs **`main.main(...)`** only (same `config` as [`main.py`](main.py), plus optional **`COLAB_CONFIG_OVERRIDES`**) and prints the full `*_results.json` / PPL / per-round tables inline. The last cell calls **`google.colab.runtime.unassign()`** to release the GPU. Wall-clock time follows `main.py` (e.g. Qwen2.5 + 10 rounds is long).
+**Recommended: run the notebook.** Open [`HMP_GAE_Colab.ipynb`](HMP_GAE_Colab.ipynb), enable **T4 GPU**, then **Run all**. It runs **`main.main()`** only — with **no overrides of any kind**: [`main.py`](main.py)'s `config` dict is the single source of truth, so what the notebook runs is exactly what that file says. It then prints the full `*_results.json` / PPL / per-round tables inline. The last cell calls **`google.colab.runtime.unassign()`** to release the GPU. Wall-clock time follows `main.py` (e.g. Qwen2.5 + 10 rounds is long).
 
 **Alternative: pure shell (same entry as local).**
 

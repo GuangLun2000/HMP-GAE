@@ -7,7 +7,7 @@ code. Encodes the anti-drift rule established 2026-07-08:
 
   * NO `main.py:<line>` / `main.py#L<line>` refs in the agent docs — main.py
     churns constantly, so line numbers rot. Refer to it by symbol instead
-    (`main()` / `run_suite()` / config-key name).
+    (`main()` / config-key name).
   * Every relative markdown link target must exist on disk.
   * Every config key the docs treat as authoritative must exist in main.py.
   * Every code symbol the docs name (in STABLE files) must exist there.
@@ -42,7 +42,7 @@ CONFIG_KEYS = [
 
 # Symbols the docs name, keyed by the file that must define them (def/class).
 SYMBOLS = {
-    "main.py": ["main", "run_suite"],
+    "main.py": ["main"],
     "client.py": ["BenignClient", "local_train"],
     "server.py": ["Server", "run_round"],
     "defense/__init__.py": ["HMPGAEDefense", "FedAvgDefense", "build_defense"],

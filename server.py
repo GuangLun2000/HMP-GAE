@@ -469,16 +469,21 @@ class Server:
                 f"k_cap={defense_stats.get('v4_k_cap')}, "
                 f"{mult_desc})"
             )
-        # V6 only: the geometric factor actually applied to the flagged
-        # clients this round. geo_mult ≈ 1.0 across all rounds means the
-        # hypergraph never acted and V6 reduced to V5 — a result to report,
-        # not to tune away by lowering v6_geo_floor.
+        # V6 only: the geometry factor. It is APPLIED only to flagged clients
+        # (marked '*'); for everyone else the applied multiplier is a hard 1.0
+        # and the number below is counterfactual — what the geometry WOULD have
+        # said. Judge "did the hypergraph act" from the starred values only:
+        # if those sit at ≈1.0 every round, V6 reduced to V5, which is a result
+        # to report, not to tune away by lowering v6_geo_floor.
         v6_geo_mult_list = defense_stats.get('v6_geo_mult')
         if isinstance(v6_geo_mult_list, list) and len(v6_geo_mult_list) == len(client_ids):
+            flags = defense_stats.get('v4_flagged') or []
             geo_summary = ", ".join(
-                f"c{cid}={v:.3f}" for cid, v in zip(client_ids, v6_geo_mult_list)
+                f"c{cid}{'*' if i < len(flags) and flags[i] else ''}={v:.3f}"
+                for i, (cid, v) in enumerate(zip(client_ids, v6_geo_mult_list))
             )
-            print(f"  📐 geo_mult:     {geo_summary}")
+            print(f"  📐 geo_mult:     {geo_summary}   (* = applied; "
+                  f"unstarred are counterfactual)")
 
         # Compute similarity and distance metrics for visualization (unchanged).
         mode = getattr(self, 'similarity_mode', 'local_vs_global')

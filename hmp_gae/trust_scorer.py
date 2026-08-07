@@ -716,10 +716,17 @@ def v6_cse_reject_geo_weights(
     Returns:
         (weights, diag) where weights is (N,) summing to 1 and diag carries
         V5's five keys ('ratio', 'flagged', 'multiplier', 'ramp_t', 'median')
-        plus 'geo_gate' (N,), 'geo_mult' (N,) and 'm_cse' (N,) — the last two
-        exist so a run can be audited for how much the geometry actually
-        contributed (geo_mult ≈ 1.0 every round ⇒ V6 is V5 under a new name,
-        which must be reported as such and NOT tuned away).
+        plus 'geo_gate', 'geo_mult' and 'm_cse' (all (N,)).
+
+        READING THE DIAGNOSTICS — 'multiplier' is the only APPLIED quantity;
+        'geo_mult' and 'm_cse' are reported for every client but take effect
+        ONLY where flagged[i] is True (elsewhere multiplier is a hard 1.0, and
+        their values there are counterfactual — what the geometry/ramp WOULD
+        have said). So the headline "did the geometry act" statistic is
+        geo_mult restricted to the flagged set; a mean over all N mixes in
+        benign clients that were never multiplied by anything and understates
+        the effect. If flagged-set geo_mult ≈ 1.0 in every round, V6 is V5
+        under a new name — report that, do NOT lower geo_floor to make it move.
     """
     if not (float(r_hard) > float(tau_ratio)):
         raise ValueError(

@@ -754,9 +754,12 @@ class HMPGAERuntime:
                 stats["v5_ramp_t"] = v4_diag["ramp_t"].detach().cpu().tolist()
             else:
                 # V6: V5's ramp channels (the Stage-2 knobs are literally the
-                # v5_* ones) plus the geometry read-out. v6_geo_mult ≈ 1.0 in
-                # every round is the falsification signal for V6 — report it,
-                # do not tune v6_geo_floor to make it move.
+                # v5_* ones) plus the geometry read-out. v6_geo_mult and
+                # v6_m_cse are emitted for all N but only ACT where
+                # v4_flagged is 1 — v4_multiplier is the applied value. So the
+                # falsification statistic for V6 is v6_geo_mult restricted to
+                # the flagged set: ≈1.0 there in every round means the geometry
+                # never acted. Report that; do not tune v6_geo_floor to move it.
                 stats["v5_m_floor"] = float(self.v5_m_floor)
                 stats["v5_r_hard"] = float(self.v5_r_hard)
                 stats["v5_ramp_t"] = v4_diag["ramp_t"].detach().cpu().tolist()

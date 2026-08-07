@@ -1214,7 +1214,14 @@ def analyze_results(metrics):
         print(f"Best Clean Accuracy: {max(clean):.4f}")
         print(f"Accuracy Change: {clean[-1] - clean[0]:+.4f}")
 
-def main(config_overrides: Optional[Dict] = None):
+def main():
+    # The dict below is the SINGLE authoritative config source. There is no
+    # override path — not a `config_overrides` argument, not a notebook-side
+    # `COLAB_CONFIG_OVERRIDES`, not a `run_suite()` sweep helper (all removed
+    # 2026-08-07). A second place to set a knob means a run's real config can
+    # differ from what this file says, and the archived `config.json` is the
+    # only record of which one won. To change ANY parameter — including for an
+    # A/B arm — edit it here, run, and edit it back.
     config = {
         # ========== Experiment Configuration ==========
         # === CURRENT RUN: V6 FIRST TEST — HMP-GAE V6
@@ -1803,19 +1810,6 @@ def main(config_overrides: Optional[Dict] = None):
         ],
 
     }
-    if config_overrides:
-        overrides = dict(config_overrides)
-        # Merge defense_config ONE level deep: an override like
-        # {'defense_config': {'trust_mode': 'v4_cse_reject'}} adjusts single
-        # knobs without silently dropping every other defense key (a plain
-        # dict.update would replace the whole sub-dict, and the runtime's
-        # code-level defaults differ from this dict's tuned values).
-        dc_override = overrides.pop('defense_config', None)
-        if dc_override:
-            merged_dc = dict(config.get('defense_config') or {})
-            merged_dc.update(dc_override)
-            config['defense_config'] = merged_dc
-        config.update(overrides)
 
     # Run experiment (attack if num_attackers > 0 AND attack_method != 'NoAttack',
     # otherwise baseline). 'NoAttack' overrides num_attackers (see setup_experiment).
@@ -1838,78 +1832,6 @@ def main(config_overrides: Optional[Dict] = None):
     
     results, metrics = run_experiment(config)
     analyze_results(metrics)
-        
-
-def run_suite(
-    suite: List[Dict],
-    base_overrides: Optional[Dict] = None,
-) -> None:
-    """
-    Run a list of experiments sequentially, each as a separate main() call.
-
-    Args:
-        suite:          List of per-experiment override dicts.  Each dict is
-                        merged on top of base_overrides (and on top of main()'s
-                        default config via the existing config_overrides path).
-                        An empty dict {} means "use base_overrides as-is".
-        base_overrides: Shared overrides applied to every experiment before the
-                        per-experiment dict.  Useful for Colab-wide settings
-                        (e.g. dataset_size_limit) that every run should share.
-
-    Example (Colab notebook):
-        run_suite(
-            suite=[
-                # No-attack ceiling: 7 benign clients, defense is a no-op (use fedavg).
-                # This is the "perfect-world" upper bound HMP-GAE is compared against.
-                {'experiment_name': 'noattack_n7_r50_qwen',
-                 'num_attackers': 0, 'attack_method': 'NoAttack',
-                 'defense_method': 'fedavg'},
-                # Under attack: FedAvg (no defense) -- shows attack damage.
-                {'experiment_name': 'fedavg_hallu_n7_r50_qwen',
-                 'defense_method': 'fedavg'},
-                # Under attack: HMP-GAE (full, with semantic signal).
-                {'experiment_name': 'hmpgae_hallu_n7_r50_qwen',
-                 'defense_method': 'hmp_gae'},
-            ],
-            base_overrides=COLAB_CONFIG_OVERRIDES,  # shared knobs, e.g. num_rounds=5 for a quick test
-        )
-    """
-    n = len(suite)
-    print(f"\n{'=' * 60}")
-    print(f"EXPERIMENT SUITE: {n} run(s) queued")
-    print(f"{'=' * 60}\n")
-
-    for idx, exp_overrides in enumerate(suite):
-        combined: Dict = {}
-        if base_overrides:
-            combined.update(base_overrides)
-        combined.update(exp_overrides)
-
-        exp_name = combined.get('experiment_name', f'run_{idx + 1}')
-        print(f"\n{'=' * 60}")
-        print(f"RUN {idx + 1}/{n}: {exp_name}")
-        print(f"{'=' * 60}")
-
-        try:
-            main(config_overrides=combined if combined else None)
-            print(f"\nRUN {idx + 1}/{n} DONE: {exp_name}")
-        except KeyboardInterrupt:
-            print(f"\nSuite interrupted after run {idx + 1}/{n}.")
-            raise
-        except Exception as e:
-            import traceback
-            print(f"\nRUN {idx + 1}/{n} FAILED: {exp_name}")
-            print(f"  Error: {type(e).__name__}: {e}")
-            traceback.print_exc()
-            print(f"  Continuing to next run...\n")
-        finally:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    print(f"\n{'=' * 60}")
-    print(f"SUITE COMPLETE: {n} run(s) finished")
-    print(f"{'=' * 60}\n")
 
 
 if __name__ == "__main__":

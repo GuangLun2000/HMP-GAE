@@ -20,7 +20,7 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 - 出 bug 优先靠静态分析 / trace 推理，不要要求 "先跑一下看看"
 - macOS 上 `torch.cuda.is_available()` 永远 False——涉及 device 的代码要兼容 CPU 路径
 - 用户自己 commit；改完代码不要主动 git add/commit
-- **唯一 Colab notebook 是 [HMP_GAE_Colab.ipynb](HMP_GAE_Colab.ipynb)**。不要复制/新建 `*_Colab*.ipynb` 变体——Colab 同时只能跑一个，维护多份只会漂移；跑不同配置走 `COLAB_CONFIG_OVERRIDES` 或修改 main.py 的 config
+- **唯一 Colab notebook 是 [HMP_GAE_Colab.ipynb](HMP_GAE_Colab.ipynb)**。不要复制/新建 `*_Colab*.ipynb` 变体——Colab 同时只能跑一个，维护多份只会漂移。notebook 只调用裸的 `main()`，**不做任何 config 覆写**；跑不同配置一律改 main.py 的 config
 
 ## Verify 一个改动（不训练）
 
@@ -34,11 +34,11 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 
 ## Canonical config: [main.py](main.py) 的 `main()` config dict
 
-`main()` 里的 `config` dict 是**唯一**权威 config 源。**不标行号**——main.py 频繁改动，任何行号都会失效；一律用符号定位（`main()` / `run_suite()` / config key 名）。任何参数调整都在这里改：
+`main()` 里的 `config` dict 是**唯一**权威 config 源，且自 2026-08-07 起是**唯一入口**——`main()` 不再接受 `config_overrides`，`run_suite()` 与 `COLAB_CONFIG_OVERRIDES` 已删除。**不标行号**——main.py 频繁改动，任何行号都会失效；一律用符号定位（`main()` / config key 名）。任何参数调整都在这里改：
 
 - 改默认行为 → 改 `main()` 的 `config`
-- 对照实验 → 在 Colab Step 3 用 `COLAB_CONFIG_OVERRIDES` 临时覆盖（跑完即恢复），或调用 `run_suite()`
-- 不要在 notebook cell 里硬编码超参覆盖（除非临时尝试，跑完即撤）
+- 对照实验 / A-B 臂 → 同样改 `main()` 的 `config`，跑完改回来；每条臂**必须换 `experiment_name`**（[fed_resume.py](fed_resume.py) 的 fingerprint 不看 `defense_config`，同名会让上一臂的 checkpoint 被静默续跑）
+- notebook 里**不要**加任何覆写机制——多一个设值的地方，就多一次"归档 config.json 与实际跑的不一致"的机会
 
 **不变的实验骨架**（很少动，可依赖）：N=7（5 benign + 2 attackers），50 轮，LoRA(r=8)，per-round 随机化 label-flip（`hallu_flip_ratio_range`），`attack_method='Hallucination'` + `defense_method='hmp_gae'` 三信号防御。
 
