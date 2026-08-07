@@ -1217,39 +1217,55 @@ def analyze_results(metrics):
 def main(config_overrides: Optional[Dict] = None):
     config = {
         # ========== Experiment Configuration ==========
-        # === CURRENT RUN: V5 FIRST TEST / REGRESSION GUARD — HMP-GAE V5
-        # === (trust_mode='v5_cse_reject') vs Hallucination on AG News
+        # === CURRENT RUN: V6 FIRST TEST — HMP-GAE V6
+        # === (trust_mode='v6_cse_reject_geo') vs Hallucination on AG News
         # === (non-IID 0.5, 4 classes), Qwen2.5-0.5B backbone,
         # === 5 benign + 2 attackers (N=7), seed=42 ===
-        # Companion to the ARCHIVED run
-        #   20260729-agnews-(non-iid0.5)-hmpgae-v4(...)-qwen-zihao(v4)
-        # (config.json verified 2026-08-06: seed=42, N=7, 2 attackers,
-        # ag_news/4/128, Qwen2.5-0.5B, hmp_gae, v4_cse_reject, tau=1.85,
-        # mult=0.10, num_byzantine=2, semantic_weight=1, graph_min_distinct=4,
-        # knn_k=2, probe=100 — every one of those matched below).
-        # Exactly ONE axis moves vs that run: trust_mode v4 -> v5.
-        # Reference numbers of that V4 companion: acc 0.9120, final CSE
-        # 0.0395, PPL 69.49 (clean ceiling: acc 0.9033, CSE 0.0409, PPL 71.40).
-        # PURPOSE — this is a REGRESSION GUARD, not a benefit demo. On Qwen
-        # AG the archived attacker CSE ratios are enormous (steady-state
-        # median ~11.9, min ~4.09), far above v5_r_hard=2.5, so the V5 ramp
-        # SATURATES to v5_m_floor and V5 is expected to reproduce V4 almost
-        # exactly. That is the point: prove V5 does not damage the block
-        # where V4 already beats the clean ceiling, before spending a run on
-        # Llama Yahoo (where V4 leaves the one real PPL gap).
-        # V5 differences here should appear ONLY in (a) cold-start rounds
-        # where an attacker's ratio is still between tau and r_hard, and
-        # (b) any round where a benign is flagged — Qwen AG's benign max
-        # ratio reaches 2.73, above tau, shielded only by the rank cap, and
-        # that is exactly the false-positive case V5's ramp is designed to
-        # make cheap.  SUCCESS = no regression on ALL FOUR of CSE + PPL +
-        # ppl_class_std + accuracy (never rank by one scalar).
-        # v4_tau_ratio=1.85 and v5_r_hard=2.5 are BOTH PRE-REGISTERED — do
-        # not re-tune after seeing results.
+        # Companion to the ARCHIVED V5 run 20260805-...-v5-... (Qwen AG
+        # non-IID, seed 42 — take the exact folder name from the archive's
+        # docs/LEADERBOARD.md and verify its config.json before comparing)
+        # and, through it, to the V4 run 20260729-...-qwen-zihao(v4).
+        # Exactly ONE axis moves vs the V5 companion: trust_mode v5 -> v6
+        # (plus the new v6_geo_floor knob, which is inert under v5).
+        # WHAT V6 CHANGES — V4/V5 compute the hypergraph/VGAE channels and then
+        # multiply them by zero: alpha = normalize(m_i * n_i) depends only on
+        # (partition, seed), which is why the archived trust separation is
+        # bit-identical across BACKBONES (Qwen AG V4 = Llama AG V4 = Qwen AG
+        # V5 = 16.1289). V6 folds the geometry gate back into alpha as a
+        # CONSERVATIVE CONJUNCTION on flagged clients only:
+        #     m_i = m_cse_i * (v6_geo_floor + (1-v6_geo_floor)*gate_i)
+        # Since that factor is in [geo_floor, 1], m_i <= m_cse_i ALWAYS: the
+        # geometry can only deepen a CSE-driven penalty, never soften one, so
+        # CSE cannot regress by construction. Motivation is paper consistency
+        # (Eq. 21 / Algorithm 1 line 16-17 claim f_trust produces alpha) with
+        # a provably bounded risk, NOT an expected accuracy win.
+        # Estimated from the archived gate values, this should cut flagged
+        # attacker weight by ~12% (Qwen AG) to ~36% (Llama AG) vs V5.
+        # RUN ORDER — Run 0 FIRST as a wiring check: set 'v6_geo_floor': 1.0
+        # and confirm trust_weights.csv is BIT-IDENTICAL to the V5 companion
+        # (at 1.0 the geometry term is an exact 1.0). If it differs, the
+        # plumbing is wrong — stop and fix, do not proceed. Then this config
+        # (geo_floor=0.5) as Run 1.
+        # ⚠ GIVE RUN 0 ITS OWN 'experiment_name' (e.g. ...-v6-geofloor1.0-...).
+        # fed_resume's fingerprint covers experiment_name / N / rounds /
+        # attackers / model / defense_method / lora / seed / dataset — it does
+        # NOT look inside defense_config. Run 0 and Run 1 differ ONLY in
+        # v6_geo_floor, so under a shared name a leftover Run-0 checkpoint
+        # would resume into Run 1 with no mismatch warning at all.
+        # SUCCESS = no regression on ALL FOUR of CSE + PPL + ppl_class_std +
+        # accuracy (accuracy is a floor check only — on this benchmark it sits
+        # inside seed noise, median |Δmean acc| 0.0207 over 6 archived seed
+        # pairs, and must NOT be used to rank defenses).
+        # ALSO REPORT: the per-round v6_geo_mult distribution. If it is ≈1.0
+        # in every round, the geometry never acted and V6 is V5 renamed —
+        # that is a negative result to report honestly, NOT a reason to lower
+        # v6_geo_floor after the fact.
+        # v4_tau_ratio=1.85, v5_r_hard=2.5 and v6_geo_floor=0.5 are ALL
+        # PRE-REGISTERED — do not re-tune after seeing results.
         # NOTE: Qwen/Qwen2.5-0.5B is NOT gated — no HF login required; fits a
         # T4 15GB (A100 not needed for this arm).
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v5-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
-        'seed': 42,  # Random seed — matches the archived V4 companion (trust_mode is the only moving axis)
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v6-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
+        'seed': 42,  # Random seed — matches the archived V4/V5 companions (trust_mode is the only moving axis)
 
         # ========== Federated Learning Setup ==========
         'num_clients': 7,    # Total clients: 5 benign + 2 attackers (canonical arm)
@@ -1577,11 +1593,26 @@ def main(config_overrides: Optional[Dict] = None):
             #       evidence, e.g. a borderline false positive), v5_m_floor
             #       at ratio >= v5_r_hard (clear evidence). Same local-CSE
             #       requirement / eval timing / AugMP incompatibility as V4.
-            # CURRENT RUN: 'v5_cse_reject' — the ONE aggregation-behavior knob
-            # changed vs the archived Qwen AG News V4 companion (20260729).
-            # Set to 'v4_cse_reject' to reproduce that companion, or to
-            # 'soft_reject_fedavg' for V3.
-            'trust_mode': 'v5_cse_reject',
+            #   'v6_cse_reject_geo' (V6, 2026-08-07): V5's flag decision AND
+            #       V5's CSE ramp, both byte-identical, times a ONE-SIDED
+            #       read-out of the HMP-GAE geometry gate on flagged clients
+            #       (trust_scorer.v6_cse_reject_geo_weights):
+            #         m = m_cse × (v6_geo_floor + (1-v6_geo_floor) × gate)
+            #       with gate = sigmoid(-soft_reject_k × (sus - threshold)),
+            #       the same gate V3's 'soft_reject_fedavg' uses. The factor
+            #       lies in [v6_geo_floor, 1], so V6's weight for a flagged
+            #       client is ALWAYS <= V5's — the geometry may tighten a
+            #       penalty, never loosen one, and CSE cannot regress by
+            #       construction. Unflagged clients keep exactly 1.0 (not the
+            #       gate), so a clean federation still aggregates at exactly
+            #       n_k/Σn — the "no scapegoat" property V3 could not hold.
+            #       Same local-CSE requirement / eval timing / AugMP
+            #       incompatibility as V4.
+            # CURRENT RUN: 'v6_cse_reject_geo' — the ONE aggregation-behavior
+            # knob changed vs the archived Qwen AG News V5 companion (20260805).
+            # Set to 'v5_cse_reject' / 'v4_cse_reject' to reproduce those
+            # companions, or to 'soft_reject_fedavg' for V3.
+            'trust_mode': 'v6_cse_reject_geo',
             # --- V4 CSE rejection knobs (INERT unless trust_mode='v4_cse_reject') ---
             # v4_tau_ratio: pre-registered 1.85 (zero-FP plateau [1.785, 1.90]
             #   over 51 archived runs / 17,850 client-round decisions,
@@ -1617,6 +1648,26 @@ def main(config_overrides: Optional[Dict] = None):
             #   the rank cap). Do NOT re-tune after a confirmatory run.
             'v5_m_floor': 0.10,
             'v5_r_hard': 2.5,
+            # --- V6 geometry-conjunction knob (INERT unless trust_mode='v6_cse_reject_geo') ---
+            # V6 keeps V5's flag rule AND V5's ramp (it reuses v5_m_floor /
+            # v5_r_hard above verbatim) and multiplies the flagged-client
+            # multiplier by a one-sided geometry factor:
+            #   geo  = v6_geo_floor + (1 - v6_geo_floor) * gate
+            #   mult = m_cse * geo          (flagged only; unflagged stay 1.0)
+            # v6_geo_floor: PRE-REGISTERED 0.5 (2026-08-07, before any V6 run).
+            #   Range is (0, 1]; 1.0 is legal and disables the geometry term,
+            #   reproducing V5 element-for-element — that is Run 0, the wiring
+            #   regression guard, and it must be run BEFORE this value.
+            #   0.5 says: a client the geometry considers maximally suspicious
+            #   keeps HALF the weight V5 would have left it; a client the
+            #   geometry considers benign keeps all of it. The floor is 0.5
+            #   rather than something aggressive because offline replay of the
+            #   archived runs shows the gate averages 0.766 on CONFIRMED
+            #   attackers in the Qwen AG cell — the geometry is unreliable
+            #   enough that it gets to tighten the penalty, never to set it.
+            #   Do NOT re-tune after seeing results; if v6_geo_mult logs at
+            #   ≈1.0 every round, report "geometry did not act".
+            'v6_geo_floor': 0.5,
             # --- Robust suspicion scale (2026-07-04) ---
             # zscore_mode 'mad': median/MAD z-scores.  mean/std gets polluted
             #   as the attacker fraction grows (attackers drag the mean toward
@@ -1663,14 +1714,22 @@ def main(config_overrides: Optional[Dict] = None):
             # (multiples of 1/6); its MAD was exactly 0 in 33-44 of 50 Yahoo
             # rounds, silently falling back to std. Do NOT re-tune knn_k
             # instead. 0 = off (legacy). Diagnostics-only under
-            # trust_mode='v4_cse_reject' (geometry no longer drives rejection).
+            # trust_mode='v4_cse_reject' / 'v5_cse_reject' (geometry does not
+            # drive rejection there) — but LIVE again under
+            # 'v6_cse_reject_geo', which reads the gate built from these
+            # channels. Same for the three gate knobs immediately below.
             'graph_min_distinct': 4,
             'gate_rezscore': False,
             'sus_ema_beta': 0.6,
             'reject_z_threshold': 2.5,   # sigmoid midpoint, in per-signal robust-z
                                          # units (suspicion = -s / ||w||₂); use 0.75
                                          # when gate_rezscore=True — the two keys
-                                         # must be changed together
+                                         # must be changed together.
+                                         # Under V6 this (with soft_reject_k) sets
+                                         # the geometry gate V6 multiplies in, so
+                                         # it is no longer inert: keep it at the
+                                         # V3-calibrated 2.5 so V6's gate is the
+                                         # SAME object the archived replay measured.
             'soft_reject_k': 2.0,        # sigmoid steepness: 2=recommended, 3=near-binary
             'keep_min': 1,
             # --- Cold start ---

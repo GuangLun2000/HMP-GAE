@@ -209,12 +209,15 @@ class HMPGAEDefense(Defense):
             stats["fallback_reason"] = f"N={len(updates)} <= 2"
             return agg, stats
 
-        # V4/V5 (trust_mode 'v4_cse_reject' / 'v5_cse_reject') hard-require
-        # the per-client CSE vector. Validate BEFORE the runtime try/except
-        # below: a missing vector is a server-plumbing bug and must crash the
-        # run loudly, not silently degrade to FedAvg for 50 rounds.
+        # V4/V5/V6 (trust_mode 'v4_cse_reject' / 'v5_cse_reject' /
+        # 'v6_cse_reject_geo') hard-require the per-client CSE vector.
+        # Validate BEFORE the runtime try/except below: a missing vector is a
+        # server-plumbing bug and must crash the run loudly, not silently
+        # degrade to FedAvg for 50 rounds.
         _tm = str(self.cfg.get("trust_mode", "")).lower()
-        if _tm in ("v4_cse_reject", "v5_cse_reject") and local_cse is None:
+        if _tm in (
+            "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo"
+        ) and local_cse is None:
             raise RuntimeError(
                 f"HMPGAEDefense: trust_mode='{_tm}' but no local_cse "
                 "vector was provided — the server must evaluate per-client "

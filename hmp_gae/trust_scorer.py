@@ -44,6 +44,26 @@
 # containment (archived benign max ratios reach 1.89-2.73 in the AG cells —
 # only the rank cap keeps them unflagged; a borderline mis-flag under V4
 # costs 90% of that client's weight, under V5 nearly nothing).
+#
+# V6 (2026-08-07): trust_mode='v6_cse_reject_geo' puts the HYPERGRAPH GEOMETRY
+# back into alpha, as a CONSERVATIVE CONJUNCTION on top of V5's CSE ramp
+# (v6_cse_reject_geo_weights). V4/V5 compute the four geometry channels and
+# then multiply them by zero: alpha = normalize(m_i * n_i) is a deterministic
+# function of (data partition, seed) alone — the archived trust separation is
+# bit-identical ACROSS BACKBONES (Qwen AG V4 = Llama AG V4 = Qwen AG V5 =
+# 16.1289), which is the empirical proof that no model-dependent signal
+# reaches alpha. V6 folds the geometry gate g_i in one direction only:
+#
+#     m_i = m_cse_i * (geo_floor + (1 - geo_floor) * g_i)   if flagged
+#     m_i = 1.0                                              otherwise
+#
+# Because (geo_floor + (1-geo_floor)*g) lies in [geo_floor, 1], we always have
+# m_i <= m_cse_i: geometry can only DEEPEN a CSE-driven penalty, never soften
+# one. That one-sidedness is not stylistic — offline replay of the archived
+# runs shows the geometry gate averages 0.766 ("77% benign") on CONFIRMED
+# attackers in the Qwen AG cell, so any symmetric fusion would hand attackers
+# weight back and undo V4/V5's CSE gains. geo_floor = 1.0 reproduces
+# v5_cse_reject_weights element-for-element (the regression guard).
 
 from __future__ import annotations
 
@@ -615,6 +635,173 @@ def v5_cse_reject_weights(
         "multiplier": mult,
         "ramp_t": ramp_t,
         "median": float(med),
+    }
+    return w, diag
+
+
+def v6_cse_reject_geo_weights(
+    local_cse: torch.Tensor,
+    data_sizes: torch.Tensor,
+    gate: torch.Tensor,
+    tau_ratio: float = 1.85,
+    k_cap: int = 2,
+    m_floor: float = 0.10,
+    r_hard: float = 2.5,
+    geo_floor: float = 0.5,
+    keep_min: int = 1,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    V6 geometry-conjunction rule (2026-08-07): V5's CSE ramp, then a ONE-SIDED
+    multiplicative read-out of the HMP-GAE trust gate on the flagged clients.
+
+        # Stage 1 — candidate set. Byte-identical to V4/V5; carries the
+        #           zero-false-positive replay record.
+        r_i     = local_cse_i / max(median(local_cse), eps)
+        flagged = { top-k_cap clients by r }  INTERSECT  { r > tau_ratio }
+        # Stage 2 — CSE evidence strength. Identical to V5's ramp.
+        t_i     = clamp((r_i - tau_ratio) / (r_hard - tau_ratio), 0, 1)
+        m_cse_i = m_floor + (1 - m_floor) * (1 - t_i)
+        # Stage 3 — geometry consistency (the V6 delta).
+        geo_i   = geo_floor + (1 - geo_floor) * gate_i
+        m_i     = m_cse_i * geo_i    if flagged else 1.0
+        w       = normalize(m_i * n_i)
+
+    Why this shape (each property is asserted by tests/test_trust_robustness):
+
+      * MONOTONE SAFETY — `geo_i` lives in [geo_floor, 1], so `m_i <= m_cse_i`
+        pointwise: V6 can only take MORE weight away from a flagged client
+        than V5 does, never give any back. This is what bounds the CSE risk of
+        re-admitting the geometry a priori. Offline replay of the archived
+        runs measured the gate at a mean of 0.766 on CONFIRMED attackers in the
+        Qwen AG cell (it "votes benign" there), so a two-sided fusion would
+        actively undo V4/V5's detection in exactly the cell where they beat
+        the clean ceiling.
+      * PERFECT DEGENERACY — at `geo_floor = 1.0` the geometry term is an
+        exact 1.0 (the `(1 - geo_floor)` factor is a float-exact 0.0), so the
+        output equals `v5_cse_reject_weights` element-for-element. Run 0 of
+        the V6 experiment plan is exactly this: reproduce the archived V5 run
+        bit-for-bit, or the wiring is wrong.
+      * CLEAN-FEDERATION IDENTITY — unflagged clients get `m_i = 1.0`, NOT
+        `gate_i`. A federation with no flags therefore aggregates at exactly
+        `n_i / sum(n)` (invariant 9, test_no_attack_no_scapegoat). This is the
+        property V3's always-on sigmoid gate could not hold: its gate never
+        equals 1, so it taxed the most heterogeneous benign client even with
+        no attacker present.
+
+    The geometry enters ONLY through `gate` — computed by the runtime with
+    `gate_diagnostics` on the EMA-smoothed suspicion score, i.e. the exact
+    same expression V3's `soft_reject_fedavg` gates on:
+    `sigmoid(-soft_reject_k * (sus - reject_z_threshold))`, high = benign.
+
+    Args:
+        local_cse:  (N,) per-client full-test CSE (absolute scale, NOT
+                    z-scored — same contract as V4/V5).
+        data_sizes: (N,) raw data-size prior n_i (unchanged, uncapped).
+        gate:       (N,) geometry gate in [0, 1]; sanitized (NaN -> 1.0 =
+                    abstain = V5) and clamped defensively rather than
+                    validated, since it arrives from a sigmoid whose output
+                    can sit a float epsilon outside the interval. Only its
+                    LENGTH is a hard error — that would be a plumbing bug.
+        tau_ratio:  flag threshold on r (pre-registered 1.85; NOT re-tuned).
+        k_cap:      rank cap, reuses defense_config.num_byzantine (< N/2).
+        m_floor:    CSE-ramp multiplier floor in (0, 1) (v5_m_floor).
+        r_hard:     ratio at which the CSE ramp saturates (v5_r_hard); must be
+                    > tau_ratio.
+        geo_floor:  strongest geometric discount, in (0, 1]. 1.0 = V5 exactly;
+                    0.5 = pre-registered default (a fully-suspicious client
+                    keeps half of the weight V5 would have left it).
+        keep_min:   defensive floor on unflagged clients (as in V4/V5).
+
+    Returns:
+        (weights, diag) where weights is (N,) summing to 1 and diag carries
+        V5's five keys ('ratio', 'flagged', 'multiplier', 'ramp_t', 'median')
+        plus 'geo_gate' (N,), 'geo_mult' (N,) and 'm_cse' (N,) — the last two
+        exist so a run can be audited for how much the geometry actually
+        contributed (geo_mult ≈ 1.0 every round ⇒ V6 is V5 under a new name,
+        which must be reported as such and NOT tuned away).
+    """
+    if not (float(r_hard) > float(tau_ratio)):
+        raise ValueError(
+            f"v6_cse_reject_geo_weights requires r_hard > tau_ratio; got "
+            f"r_hard={r_hard} tau_ratio={tau_ratio}"
+        )
+    if not (0.0 < float(geo_floor) <= 1.0):
+        raise ValueError(
+            "v6_cse_reject_geo_weights requires 0 < geo_floor <= 1 (1.0 is "
+            f"the V5-equivalence point and must stay legal); got {geo_floor}"
+        )
+    x = local_cse.detach().to(dtype=torch.float32)
+    N = int(x.numel())
+    if N == 0:
+        raise ValueError("v6_cse_reject_geo_weights received an empty local_cse")
+    ds = data_sizes.detach().to(device=x.device, dtype=torch.float32)
+    if int(ds.numel()) != N:
+        raise ValueError(
+            f"data_sizes length {int(ds.numel())} != local_cse length {N}"
+        )
+    g = gate.detach().to(device=x.device, dtype=torch.float32)
+    if int(g.numel()) != N:
+        raise ValueError(
+            f"gate length {int(g.numel())} != local_cse length {N}"
+        )
+
+    # --- Stage 1: flag decision — byte-identical to v4/v5 ---------------- #
+    med = x.median()
+    ratio = x / med.clamp(min=eps)
+
+    order = torch.argsort(ratio, descending=True)
+    max_flags = min(max(0, int(k_cap)), max(0, N - max(1, int(keep_min))))
+    flagged = torch.zeros(N, dtype=torch.bool, device=x.device)
+    for j in order[:max_flags].tolist():
+        if float(ratio[j]) > float(tau_ratio):
+            flagged[j] = True
+
+    # --- Stage 2: CSE evidence ramp — identical to v5 -------------------- #
+    ramp_t = torch.clamp(
+        (ratio - float(tau_ratio)) / (float(r_hard) - float(tau_ratio)),
+        min=0.0, max=1.0,
+    )
+    graded = float(m_floor) + (1.0 - float(m_floor)) * (1.0 - ramp_t)
+    m_cse = torch.where(flagged, graded, torch.ones_like(x))
+
+    # --- Stage 3: V6 delta — one-sided geometric tightening -------------- #
+    # Sanitize, then clamp (not raise): `gate` is a sigmoid output, so values
+    # land in [0, 1] up to float error, and a hard bound here is what makes
+    # m_i <= m_cse_i a guarantee rather than an assumption about the caller.
+    # NaN maps to 1.0 = "the geometry abstains" = exactly V5 for that client:
+    # a numerically broken channel must degrade to the validated rule, not
+    # invent a penalty (nan -> 0.0) and not poison the aggregate (nan weights
+    # would survive the total > 0 check below and silently corrupt the round).
+    # A raise would be worse still — HMPGAEDefense.aggregate would catch it and
+    # drop the whole round to plain FedAvg, losing the CSE rejection too.
+    # The event stays auditable: stats['gate'] logs the raw gate while
+    # stats['v6_geo_gate'] logs this sanitized one, so they disagree iff this
+    # fired. +-inf need no special case; clamp maps them to 1.0 / 0.0, which
+    # are their correct limits.
+    g = torch.nan_to_num(g, nan=1.0)
+    g = torch.clamp(g, min=0.0, max=1.0)
+    geo_mult = float(geo_floor) + (1.0 - float(geo_floor)) * g
+    # Unflagged clients take 1.0, NOT geo_mult — see the clean-federation
+    # identity in the docstring.
+    mult = torch.where(flagged, m_cse * geo_mult, torch.ones_like(x))
+
+    w = mult * ds
+    total = w.sum()
+    if float(total) <= 0.0:
+        w = mult.clone()
+        total = w.sum().clamp(min=1.0)
+    w = w / total
+
+    diag: Dict[str, Any] = {
+        "ratio": ratio,
+        "flagged": flagged,
+        "multiplier": mult,
+        "ramp_t": ramp_t,
+        "median": float(med),
+        "geo_gate": g,
+        "geo_mult": geo_mult,
+        "m_cse": m_cse,
     }
     return w, diag
 

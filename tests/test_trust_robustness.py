@@ -5,6 +5,9 @@
 #   - gate_rezscore=False + weight-norm scaling (no "scapegoat tax" on
 #     all-benign rounds; threshold in per-signal robust-z units)
 #   - suspicion EMA state + checkpoint roundtrip
+#   - the CSE-reject rules V4 / V5 / V6, including V6's three structural
+#     guarantees (geo_floor=1.0 == V5 element-for-element, m_v6 <= m_v5 for
+#     every gate, and no-flags == the exact n_k prior)
 #   - bit-for-bit backward compatibility of all legacy code paths
 #
 # Pure tensors, no FL training, no GPU, no dataset — runs in ~1s:
@@ -31,6 +34,7 @@ from hmp_gae.trust_scorer import (
     reject_soft_weighted,
     v4_cse_reject_weights,
     v5_cse_reject_weights,
+    v6_cse_reject_geo_weights,
 )
 from hmp_gae.hypergraph import knn_hypergraph
 from hmp_gae.runtime import HMPGAERuntime
@@ -508,6 +512,162 @@ def test_v5_false_positive_containment():
 
 
 # --------------------------------------------------------------------------- #
+# 4c) V6 geometry conjunction (V5's ramp, tightened by the hypergraph gate)    #
+# --------------------------------------------------------------------------- #
+
+# Shared fixtures for the V6 block: a 7-client federation whose last two
+# clients carry elevated CSE, and a gate vector that DISAGREES with the CSE
+# evidence on one attacker (0.9 = "geometry says benign"). The disagreement is
+# the point — the archived replay measured a mean gate of 0.766 on confirmed
+# attackers in the Qwen AG cell, so V6 must behave correctly precisely when
+# the geometry is wrong.
+_V6_DS = torch.tensor([309., 1500., 2100., 900., 1200., 1800., 1191.])
+_V6_CSE = torch.tensor([0.60, 0.55, 0.70, 0.58, 0.62, 1.28, 3.20])
+_V6_GATE = torch.tensor([0.95, 0.90, 0.85, 0.92, 0.88, 0.20, 0.90])
+
+
+def test_v6_geo_floor_one_equals_v5():
+    """THE regression guard: at geo_floor = 1.0 the geometry term is an exact
+    1.0, so V6 must reproduce v5_cse_reject_weights element-for-element
+    (atol=0, rtol=0) — for the flagged AND the unflagged clients, and for any
+    gate vector at all. Run 0 of the experiment plan is this test at FL scale."""
+    for gate in (_V6_GATE, torch.zeros(7), torch.ones(7), torch.full((7,), 0.5)):
+        w6, d6 = v6_cse_reject_geo_weights(
+            _V6_CSE, _V6_DS, gate=gate, tau_ratio=1.85, k_cap=2,
+            m_floor=0.10, r_hard=2.5, geo_floor=1.0,
+        )
+        w5, d5 = v5_cse_reject_weights(
+            _V6_CSE, _V6_DS, tau_ratio=1.85, k_cap=2,
+            m_floor=0.10, r_hard=2.5,
+        )
+        assert d6["flagged"].tolist() == d5["flagged"].tolist()
+        assert torch.equal(w6, w5), (w6, w5)
+        assert torch.equal(d6["multiplier"], d5["multiplier"])
+        assert torch.equal(d6["ramp_t"], d5["ramp_t"])
+        assert d6["median"] == d5["median"]
+        # ...and the geometry factor is a literal 1.0 everywhere.
+        assert torch.equal(d6["geo_mult"], torch.ones(7))
+    print("PASS  v6 degeneracy: geo_floor=1.0 is bit-equal to V5 for any gate")
+
+
+def test_v6_monotone_safety():
+    """Monotone safety: for ANY gate in [0,1] and ANY geo_floor in (0,1], a
+    flagged client's V6 multiplier (and weight share among the flagged) is
+    <= V5's. Geometry may only deepen a CSE-driven penalty, never soften one
+    — the property that bounds V6's CSE risk a priori."""
+    _, d5 = v5_cse_reject_weights(_V6_CSE, _V6_DS, tau_ratio=1.85, k_cap=2,
+                                  m_floor=0.10, r_hard=2.5)
+    m5, flagged = d5["multiplier"], d5["flagged"]
+    assert bool(flagged.any()), "fixture must produce flags"
+    rng = np.random.default_rng(0)
+    for geo_floor in (1.0, 0.75, 0.5, 0.25, 0.05):
+        for _ in range(20):
+            gate = torch.tensor(rng.random(7), dtype=torch.float32)
+            _, d6 = v6_cse_reject_geo_weights(
+                _V6_CSE, _V6_DS, gate=gate, tau_ratio=1.85, k_cap=2,
+                m_floor=0.10, r_hard=2.5, geo_floor=geo_floor,
+            )
+            m6 = d6["multiplier"]
+            # Compare the MULTIPLIERS, not the normalised weights: shrinking
+            # the flagged mass raises every unflagged weight, so a weight-space
+            # comparison would confound the two effects.
+            assert torch.all(m6 <= m5 + 1e-7), (geo_floor, gate, m6, m5)
+            assert torch.all(m6[flagged] >= float(geo_floor) * m5[flagged] - 1e-7)
+            # Flag set is untouched by the geometry (Stage 1 is V4's, verbatim).
+            assert d6["flagged"].tolist() == flagged.tolist()
+    # Out-of-range / non-finite gates are sanitized, never trusted: none of
+    # these may push the multiplier above V5's or leave a NaN in the weights.
+    for bad_gate in (torch.full((7,), 5.0), torch.full((7,), -3.0),
+                     torch.full((7,), float("inf")),
+                     torch.full((7,), float("-inf")),
+                     torch.full((7,), float("nan"))):
+        w_b, d_b = v6_cse_reject_geo_weights(
+            _V6_CSE, _V6_DS, gate=bad_gate, tau_ratio=1.85, k_cap=2,
+            m_floor=0.10, r_hard=2.5, geo_floor=0.5,
+        )
+        assert torch.all(d_b["multiplier"] <= m5 + 1e-7), bad_gate
+        assert torch.isfinite(w_b).all(), (bad_gate, w_b)
+    # A NaN gate specifically means "the geometry abstains" -> exactly V5, so
+    # a numerically broken channel degrades to the validated rule instead of
+    # inventing a penalty or poisoning the aggregate.
+    _, d_nan = v6_cse_reject_geo_weights(
+        _V6_CSE, _V6_DS, gate=torch.full((7,), float("nan")), tau_ratio=1.85,
+        k_cap=2, m_floor=0.10, r_hard=2.5, geo_floor=0.5,
+    )
+    assert torch.equal(d_nan["multiplier"], m5), d_nan["multiplier"]
+    print("PASS  v6 monotone safety: m_v6 <= m_v5 for every gate and floor")
+
+
+def test_v6_clean_federation_identity():
+    """Invariant 9 under V6: with no flags, weights are EXACTLY the n_k prior.
+    Unflagged clients take m = 1.0, not the gate — so unlike V3's always-on
+    sigmoid, a clean federation pays no scapegoat tax even when the geometry
+    dislikes somebody (gate 0.05 on c2 below)."""
+    cse0 = torch.tensor([0.60, 0.55, 0.98, 0.58, 0.62, 0.70, 0.66])
+    gate0 = torch.tensor([0.9, 0.9, 0.05, 0.9, 0.9, 0.9, 0.9])
+    w0, d0 = v6_cse_reject_geo_weights(
+        cse0, _V6_DS, gate=gate0, tau_ratio=1.85, k_cap=2,
+        m_floor=0.10, r_hard=2.5, geo_floor=0.5,
+    )
+    assert not bool(d0["flagged"].any()), d0["flagged"]
+    assert torch.allclose(w0, _V6_DS / _V6_DS.sum(), atol=1e-6)
+    assert torch.equal(d0["multiplier"], torch.ones(7))
+    print("PASS  v6 clean federation: no flags -> exactly the n_k prior")
+
+
+def test_v6_monotone_in_ratio_and_gate():
+    """Ordering sanity in both arguments: (a) with the gate held equal, a
+    higher CSE ratio never earns a milder multiplier; (b) with the ratio held
+    equal, a more suspicious gate (lower value) never earns a milder one."""
+    # (a) equal gates, c6 at a far higher ratio than c5.
+    _, da = v6_cse_reject_geo_weights(
+        _V6_CSE, _V6_DS, gate=torch.full((7,), 0.7), tau_ratio=1.85, k_cap=2,
+        m_floor=0.10, r_hard=2.5, geo_floor=0.5,
+    )
+    assert da["flagged"].tolist() == [False] * 5 + [True, True]
+    assert float(da["multiplier"][5]) > float(da["multiplier"][6])
+    # m_cse is the V5 value; multiplier is m_cse scaled by a constant 0.85
+    # (= 0.5 + 0.5*0.7) on the flagged clients.
+    for i in (5, 6):
+        assert abs(float(da["multiplier"][i])
+                   - 0.85 * float(da["m_cse"][i])) < 1e-6
+    # (b) equal ratios (same cse vector), gate varied on one flagged client.
+    prev = None
+    for g in (1.0, 0.75, 0.5, 0.25, 0.0):
+        gate = torch.full((7,), 0.9)
+        gate[6] = g
+        _, db = v6_cse_reject_geo_weights(
+            _V6_CSE, _V6_DS, gate=gate, tau_ratio=1.85, k_cap=2,
+            m_floor=0.10, r_hard=2.5, geo_floor=0.5,
+        )
+        m = float(db["multiplier"][6])
+        if prev is not None:
+            assert m <= prev + 1e-9, f"gate {g} gave a milder multiplier"
+        prev = m
+    # Bottom of the range is exactly geo_floor x the V5 multiplier.
+    assert abs(prev - 0.5 * float(da["m_cse"][6])) < 1e-6
+    # Invalid geometry / floor must raise, never silently degenerate.
+    for bad in dict(geo_floor=0.0), dict(geo_floor=1.5), dict(r_hard=1.85):
+        kwargs = dict(tau_ratio=1.85, k_cap=2, m_floor=0.10, r_hard=2.5,
+                      geo_floor=0.5)
+        kwargs.update(bad)
+        try:
+            v6_cse_reject_geo_weights(_V6_CSE, _V6_DS, gate=_V6_GATE, **kwargs)
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+    # A mis-sized gate is a plumbing bug: loud, not broadcast.
+    try:
+        v6_cse_reject_geo_weights(_V6_CSE, _V6_DS, gate=torch.ones(3),
+                                  tau_ratio=1.85, k_cap=2, m_floor=0.10,
+                                  r_hard=2.5, geo_floor=0.5)
+        raise AssertionError("expected ValueError for a length-3 gate")
+    except ValueError:
+        pass
+    print("PASS  v6 monotonicity in both ratio and gate, guards raise")
+
+
+# --------------------------------------------------------------------------- #
 # 5) runtime: suspicion EMA + checkpoint roundtrip                            #
 # --------------------------------------------------------------------------- #
 
@@ -650,6 +810,101 @@ def test_runtime_v5_cse_reject():
     print("PASS  runtime v5_cse_reject: graded flags, V5 diagnostics, guards")
 
 
+def test_runtime_v6_cse_reject_geo():
+    """End-to-end runtime in V6 mode. Checks the three things only the wiring
+    can get wrong: (1) the gate V6 multiplies in is the SAME vector the run
+    logs as 'gate' (not sus_raw, not a freshly recomputed one); (2) against a
+    V5 runtime in identical state on identical inputs, V6's multipliers are
+    pointwise <= V5's, and exactly equal at v6_geo_floor = 1.0; (3) the V6
+    diagnostics reach stats and are not mislabelled as V4's."""
+    ids, ds = list(range(7)), [100.0] * 7
+    cse = [0.60, 0.62, 0.58, 0.61, 0.59, 1.60, 1.50]
+
+    def _run(cfg_extra):
+        # Re-seed before EVERY construction so the two runtimes start from
+        # bit-identical modules / random projection; the round is then a
+        # deterministic function of the inputs (no dropout, Adam is exact).
+        torch.manual_seed(0)
+        rt = _runtime(dict({"num_byzantine": 2, "graph_min_distinct": 4},
+                           **cfg_extra))
+        rows_local = make_geometry(5, 2, dim=256, seed=1)
+        _, st = rt.aggregate([rows_local[i] for i in range(7)], ids, ds,
+                             round_num=0, local_cse=cse)
+        return rt, st
+
+    _, s6 = _run({"trust_mode": "v6_cse_reject_geo", "v6_geo_floor": 0.5})
+    _, s5 = _run({"trust_mode": "v5_cse_reject"})
+    _, s6_one = _run({"trust_mode": "v6_cse_reject_geo", "v6_geo_floor": 1.0})
+
+    assert s6["trust_mode_used"] == "v6_cse_reject_geo"
+    assert s6["v4_flagged"] == [0, 0, 0, 0, 0, 1, 1], s6["v4_flagged"]
+    assert s6["v4_flagged"] == s5["v4_flagged"], "V6 must not move the flag set"
+
+    # (1) the geometry input is the logged gate, on the EMA-smoothed suspicion.
+    gate = np.asarray(s6["gate"])
+    assert np.allclose(s6["v6_geo_gate"], gate, atol=1e-6), (s6["v6_geo_gate"], gate)
+    assert np.allclose(s6["v6_geo_mult"], 0.5 + 0.5 * gate, atol=1e-6)
+    assert np.allclose(s6["v6_m_cse"], s5["v4_multiplier"], atol=1e-6), (
+        "V6's Stage-2 value must be V5's multiplier exactly"
+    )
+
+    # (2) monotone safety end-to-end, and exact V5 degeneracy at floor 1.0.
+    m6, m5 = np.asarray(s6["v4_multiplier"]), np.asarray(s5["v4_multiplier"])
+    assert np.all(m6 <= m5 + 1e-7), (m6, m5)
+    flagged = np.asarray(s6["v4_flagged"], dtype=bool)
+    assert np.all(m6[~flagged] == 1.0), "unflagged clients must keep m = 1.0"
+    assert np.all(m6[flagged] < m5[flagged]), (
+        "the fixture's gate is < 1 on the flagged clients, so V6 must be "
+        "strictly tighter there"
+    )
+    assert np.allclose(s6_one["alpha"], s5["alpha"], atol=0.0, rtol=0.0), (
+        "v6_geo_floor=1.0 must reproduce V5 exactly"
+    )
+    assert np.allclose(s6_one["v4_multiplier"], m5, atol=0.0, rtol=0.0)
+    # Attackers lose (weakly) more mass than under V5, benigns gain.
+    assert np.asarray(s6["alpha"])[5:].sum() < np.asarray(s5["alpha"])[5:].sum()
+
+    # (3) diagnostics present and correctly labelled.
+    for key in ("v6_geo_floor", "v6_geo_gate", "v6_geo_mult", "v6_m_cse",
+                "v5_m_floor", "v5_r_hard", "v5_ramp_t",
+                "v4_cse", "v4_ratio", "v4_median_cse"):
+        assert key in s6, f"missing diagnostic {key}"
+    assert "v4_reject_mult" not in s6, "V6 must not advertise V4's scalar mult"
+    assert s6["v6_geo_floor"] == 0.5
+    assert "v6_geo_floor" not in s5, "V5 rounds must not carry V6 diagnostics"
+
+    # Missing local_cse must raise, not silently degrade.
+    torch.manual_seed(0)
+    rt = _runtime({"trust_mode": "v6_cse_reject_geo", "num_byzantine": 2})
+    rows = make_geometry(5, 2, dim=256, seed=1)
+    try:
+        rt.aggregate([rows[i] for i in range(7)], ids, ds, round_num=0)
+        raise AssertionError("expected ValueError when local_cse is missing")
+    except ValueError:
+        pass
+
+    # Config guards, all at CONSTRUCTION (a raise from aggregate() would be
+    # swallowed by HMPGAEDefense's FedAvg fallback and run 50 silent rounds).
+    _runtime({"trust_mode": "v6_cse_reject_geo", "num_byzantine": 2,
+              "v6_geo_floor": 1.0})               # the V5-equivalence point is legal
+    for bad in ({"v6_geo_floor": 0.0}, {"v6_geo_floor": 1.5},
+                {"v6_geo_floor": -0.5}, {"v5_m_floor": 0.0},
+                {"v5_r_hard": 1.85}, {"num_byzantine": 4}):
+        cfg = dict({"trust_mode": "v6_cse_reject_geo", "num_byzantine": 2}, **bad)
+        try:
+            _runtime(cfg)
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+    # ...and an out-of-range v6_geo_floor must stay INERT under V4/V5 (a
+    # stale key in defense_config must not crash an older arm).
+    _runtime({"trust_mode": "v4_cse_reject", "num_byzantine": 2,
+              "v6_geo_floor": 0.0})
+    _runtime({"trust_mode": "v5_cse_reject", "num_byzantine": 2,
+              "v6_geo_floor": 0.0})
+    print("PASS  runtime v6_cse_reject_geo: gate wired in, <= V5, guards")
+
+
 def test_runtime_attackers_lose_weight_over_rounds():
     """End-to-end runtime with the production signal stack (semantic ON):
     after the EMA warms up, attackers hold negligible aggregation mass."""
@@ -687,8 +942,13 @@ if __name__ == "__main__":
     test_v5_cse_reject_rule()
     test_v5_saturation_equals_v4()
     test_v5_false_positive_containment()
+    test_v6_geo_floor_one_equals_v5()
+    test_v6_monotone_safety()
+    test_v6_clean_federation_identity()
+    test_v6_monotone_in_ratio_and_gate()
     test_runtime_ema_and_state_roundtrip()
     test_runtime_v4_cse_reject()
     test_runtime_v5_cse_reject()
+    test_runtime_v6_cse_reject_geo()
     test_runtime_attackers_lose_weight_over_rounds()
     print("\nAll trust-robustness tests passed.")

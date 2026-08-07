@@ -40,6 +40,7 @@ from .trust_scorer import (
     gate_diagnostics,
     v4_cse_reject_weights,
     v5_cse_reject_weights,
+    v6_cse_reject_geo_weights,
 )
 
 
@@ -151,6 +152,13 @@ class HMPGAERuntime:
         #     ratio (trust_scorer.v5_cse_reject_weights): mild just past tau,
         #     v5_m_floor at ratio >= v5_r_hard. Same local-CSE requirement and
         #     server eval timing as V4.
+        #   'v6_cse_reject_geo' (V6, 2026-08-07): V5's ramp times a ONE-SIDED
+        #     read-out of the geometry gate on flagged clients only
+        #     (trust_scorer.v6_cse_reject_geo_weights). Restores the hypergraph
+        #     signal to alpha — V4/V5 compute it and multiply it by zero —
+        #     without letting it soften any CSE-driven penalty. v6_geo_floor=1.0
+        #     reproduces V5 exactly. Same local-CSE requirement / eval timing /
+        #     AugMP incompatibility as V4.
         self.trust_mode = str(
             self.cfg.get("trust_mode", "soft_reject_fedavg")
         ).strip().lower()
@@ -159,7 +167,7 @@ class HMPGAERuntime:
         # different aggregation rule for 50 rounds. Fail loudly instead.
         _known_modes = {
             "soft_reject_fedavg", "reject_then_fedavg", "softmax",
-            "v4_cse_reject", "v5_cse_reject",
+            "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo",
         }
         if self.trust_mode not in _known_modes:
             raise ValueError(
@@ -191,7 +199,20 @@ class HMPGAERuntime:
         #               borderline flags near tau stay mild.
         self.v5_m_floor = float(self.cfg.get("v5_m_floor", 0.10))
         self.v5_r_hard = float(self.cfg.get("v5_r_hard", 2.5))
-        if self.trust_mode in ("v4_cse_reject", "v5_cse_reject"):
+        # --- V6 knob (inert unless trust_mode == 'v6_cse_reject_geo') ---
+        #   v6_geo_floor: the strongest geometric discount a flagged client can
+        #               receive on top of V5's CSE ramp, i.e. the flagged
+        #               multiplier is m_cse * (geo_floor + (1-geo_floor)*gate).
+        #               1.0 = geometry disabled = V5 element-for-element (the
+        #               Run-0 regression guard); 0.5 = PRE-REGISTERED default
+        #               (2026-08-07). Never re-tune after seeing a run: if the
+        #               logged geo_mult sits at ~1.0 all round, the honest
+        #               report is "geometry did not act", not a lower floor.
+        #               V6 reuses v5_m_floor / v5_r_hard for Stage 2 unchanged.
+        self.v6_geo_floor = float(self.cfg.get("v6_geo_floor", 0.5))
+        if self.trust_mode in (
+            "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo"
+        ):
             # The pool median must be benign-controlled: majority-poisoned
             # federations invert the rule. Raise (not assert) so a bad config
             # fails loudly at construction — _lazy_init runs OUTSIDE the
@@ -212,7 +233,8 @@ class HMPGAERuntime:
                     "v4_reject_mult must be in (0, 1) — 0.0 is FoolsGold-style "
                     f"hard zeroing (rejected); got {self.v4_reject_mult}"
                 )
-        if self.trust_mode == "v5_cse_reject":
+        if self.trust_mode in ("v5_cse_reject", "v6_cse_reject_geo"):
+            # V6 reuses V5's Stage-2 ramp verbatim, so it inherits both guards.
             if not (0.0 < self.v5_m_floor < 1.0):
                 raise ValueError(
                     "v5_m_floor must be in (0, 1) — 0.0 is FoolsGold-style "
@@ -223,6 +245,19 @@ class HMPGAERuntime:
                     "v5_r_hard must be > v4_tau_ratio (the ramp divides by "
                     f"their difference); got v5_r_hard={self.v5_r_hard}, "
                     f"v4_tau_ratio={self.v4_tau_ratio}"
+                )
+        if self.trust_mode == "v6_cse_reject_geo":
+            # Upper bound is CLOSED: geo_floor == 1.0 is the V5-equivalence
+            # point and must stay legal (it is the Run-0 regression guard).
+            # Validated here, in __init__, and NOT inside aggregate(): a
+            # ValueError raised from aggregate() is swallowed by
+            # HMPGAEDefense.aggregate's FedAvg safety net, which would turn a
+            # config typo into 50 silent rounds of plain FedAvg.
+            if not (0.0 < self.v6_geo_floor <= 1.0):
+                raise ValueError(
+                    "v6_geo_floor must be in (0, 1] — 1.0 disables the "
+                    "geometry term (= V5 exactly), 0.0 would let the gate "
+                    f"zero a client outright (rejected); got {self.v6_geo_floor}"
                 )
         # reject_z_threshold: midpoint of the sigmoid gate for soft_reject_fedavg,
         # or the hard cutoff for reject_then_fedavg.  Same scale (gr_z units)
@@ -496,6 +531,19 @@ class HMPGAERuntime:
         )
         sus_used = self._smooth_suspicion(client_ids, sus_raw)
 
+        # Geometry gate, from the same gate_diagnostics() that
+        # reject_soft_weighted uses (same sus_override), so the logged
+        # sus_z/gate match the production aggregation exactly. sus_z is the
+        # gating value (EMA-smoothed when sus_ema_beta > 0); sus_raw in stats
+        # keeps this round's unsmoothed one. Computed HERE rather than after
+        # aggregation because trust_mode='v6_cse_reject_geo' consumes `gate`
+        # as an input; it is a pure function of `trust`/`sus_used`, so hoisting
+        # it changes nothing for the other modes.
+        diag_sus_z, diag_gate = gate_diagnostics(
+            trust, self.reject_z_threshold, self.soft_reject_k, self.gate_signal,
+            sus_override=sus_used,
+        )
+
         # ---- 3c) Map trust signals to aggregation weights ---- #
         ds_tensor = torch.tensor(
             data_sizes, dtype=torch.float32, device=self.device
@@ -518,8 +566,10 @@ class HMPGAERuntime:
         if use_cold_start_fallback:
             used_alpha = alpha_cold
             used_mode = "cold_start_fedavg"
-        elif self.trust_mode in ("v4_cse_reject", "v5_cse_reject"):
-            # V4/V5: rejection driven by the absolute per-client full-test CSE.
+        elif self.trust_mode in (
+            "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo"
+        ):
+            # V4/V5/V6: rejection driven by the absolute per-client full-test CSE.
             # local_cse is required — do NOT silently fall back (the defense
             # facade also validates this BEFORE its FedAvg-fallback net).
             # Deliberately routed AROUND _zscore: pool-relative scoring has no
@@ -547,7 +597,7 @@ class HMPGAERuntime:
                     reject_mult=self.v4_reject_mult,
                     keep_min=self.keep_min,
                 )
-            else:
+            elif self.trust_mode == "v5_cse_reject":
                 # V5: same flag decision, graded multiplier (linear ramp in
                 # the CSE ratio between tau and v5_r_hard).
                 used_alpha, v4_diag = v5_cse_reject_weights(
@@ -557,6 +607,23 @@ class HMPGAERuntime:
                     k_cap=self.v4_k_cap,
                     m_floor=self.v5_m_floor,
                     r_hard=self.v5_r_hard,
+                    keep_min=self.keep_min,
+                )
+            else:
+                # V6: V5's ramp, tightened (never loosened) on flagged clients
+                # by the geometry gate. `diag_gate` is the SAME tensor the
+                # soft_reject_fedavg path gates on — sigmoid(-k*(sus - thr))
+                # over the EMA-smoothed suspicion, not the raw one — so V6's
+                # geometry read-out is V3's, only conjunctive.
+                used_alpha, v4_diag = v6_cse_reject_geo_weights(
+                    local_cse=v4_cse_t,
+                    data_sizes=ds_tensor,
+                    gate=diag_gate,
+                    tau_ratio=self.v4_tau_ratio,
+                    k_cap=self.v4_k_cap,
+                    m_floor=self.v5_m_floor,
+                    r_hard=self.v5_r_hard,
+                    geo_floor=self.v6_geo_floor,
                     keep_min=self.keep_min,
                 )
             used_mode = self.trust_mode
@@ -595,14 +662,8 @@ class HMPGAERuntime:
         aggregated = weighted_aggregate(updates_stack, used_alpha)
 
         # ---- 4b) gate diagnostics (sus_z + gate, pre keep_min fallback) ---- #
-        # Computed via the same gate_diagnostics() that reject_soft_weighted uses
-        # (same sus_override), so the logged sus_z/gate match the production
-        # aggregation exactly. sus_z is the gating value (EMA-smoothed when
-        # sus_ema_beta > 0); sus_raw in stats keeps this round's unsmoothed one.
-        diag_sus_z, diag_gate = gate_diagnostics(
-            trust, self.reject_z_threshold, self.soft_reject_k, self.gate_signal,
-            sus_override=sus_used,
-        )
+        # (diag_sus_z / diag_gate were computed in 3b — V6 needs the gate as an
+        # aggregation input, not just as a log line.)
 
         # ---- 5) update EMA history ---- #
         self._update_history(client_ids, Z)
@@ -669,10 +730,12 @@ class HMPGAERuntime:
             "graph_min_distinct": int(self.graph_min_distinct),
             "defense_time_ms": float(elapsed_ms),
         }
-        # V4/V5 per-round diagnostics (trust_mode 'v4_cse_reject' or
-        # 'v5_cse_reject'). The "v4_" prefix names the shared CSE-reject
-        # diagnostic channel family — V5 reuses it so the archive-side CSV
-        # tooling works unchanged; V5-only extras carry a "v5_" prefix.
+        # V4/V5/V6 per-round diagnostics (trust_mode 'v4_cse_reject',
+        # 'v5_cse_reject' or 'v6_cse_reject_geo'). The "v4_" prefix names the
+        # shared CSE-reject diagnostic channel family — V5/V6 reuse it so the
+        # archive-side CSV tooling works unchanged; version-only extras carry
+        # a "v5_" / "v6_" prefix. NOTE: this must stay a THREE-way branch —
+        # an `if v4 / else` would silently label V6's rows as V5's.
         if v4_diag is not None and v4_cse_t is not None:
             stats["v4_cse"] = v4_cse_t.detach().cpu().tolist()
             stats["v4_ratio"] = v4_diag["ratio"].detach().cpu().tolist()
@@ -685,10 +748,22 @@ class HMPGAERuntime:
             stats["v4_k_cap"] = int(self.v4_k_cap)
             if self.trust_mode == "v4_cse_reject":
                 stats["v4_reject_mult"] = float(self.v4_reject_mult)
-            else:
+            elif self.trust_mode == "v5_cse_reject":
                 stats["v5_m_floor"] = float(self.v5_m_floor)
                 stats["v5_r_hard"] = float(self.v5_r_hard)
                 stats["v5_ramp_t"] = v4_diag["ramp_t"].detach().cpu().tolist()
+            else:
+                # V6: V5's ramp channels (the Stage-2 knobs are literally the
+                # v5_* ones) plus the geometry read-out. v6_geo_mult ≈ 1.0 in
+                # every round is the falsification signal for V6 — report it,
+                # do not tune v6_geo_floor to make it move.
+                stats["v5_m_floor"] = float(self.v5_m_floor)
+                stats["v5_r_hard"] = float(self.v5_r_hard)
+                stats["v5_ramp_t"] = v4_diag["ramp_t"].detach().cpu().tolist()
+                stats["v6_geo_floor"] = float(self.v6_geo_floor)
+                stats["v6_geo_gate"] = v4_diag["geo_gate"].detach().cpu().tolist()
+                stats["v6_geo_mult"] = v4_diag["geo_mult"].detach().cpu().tolist()
+                stats["v6_m_cse"] = v4_diag["m_cse"].detach().cpu().tolist()
         # Probe-entropy diagnostic (V4 brief, decision (d)): the mean
         # per-sample entropy on the K-sample probe is the "free" pre-agg
         # statistic under option (ii). Logged whenever the probe exists so a
@@ -718,11 +793,14 @@ class HMPGAERuntime:
     # the Adam optimizer, and the EMA latent cache z_hist.  The fixed random
     # projection and all hyperparameters are reconstructed deterministically
     # from config + random_proj_seed at __init__, so they are not stored.
-    # The V4/V5 rules ('v4_cse_reject' / 'v5_cse_reject') are deliberately
-    # STATELESS across rounds (per-round median ratio; V5's ramp is a pure
-    # per-round function of that ratio), so they add nothing here; if either
-    # ever grows cross-round state (e.g. sticky flags), serialize it
-    # alongside sus_ema or resumed runs will silently restart it.
+    # The V4/V5/V6 rules ('v4_cse_reject' / 'v5_cse_reject' /
+    # 'v6_cse_reject_geo') are deliberately STATELESS across rounds (per-round
+    # median ratio; V5's ramp and V6's geometry factor are pure per-round
+    # functions of that ratio and of the gate — whose own cross-round state,
+    # the suspicion EMA, is already serialized below as `sus_ema`). They add
+    # nothing here; if any of them ever grows cross-round state (e.g. sticky
+    # flags), serialize it alongside sus_ema or resumed runs will silently
+    # restart it.
 
     def state_dict(self) -> Dict[str, Any]:
         # Deep-copy the module/optimizer payloads: torch's .state_dict()

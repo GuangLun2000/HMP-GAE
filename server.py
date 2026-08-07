@@ -91,11 +91,14 @@ class Server:
         self._probe_batches: Optional[List[Dict[str, torch.Tensor]]] = None
         # Whether the active defense actually consumes probe distributions.
         # HMP-GAE will use them when defense_config.semantic_weight > 0.
-        # NOTE (V4/V5): the CSE-reject trust modes ('v4_cse_reject',
-        # 'v5_cse_reject') do NOT depend on this probe — their rejection
-        # signal is the full-test local CSE (_needs_local_cse below), so a
-        # semantic_weight=0 ablation cannot silently disable that signal; it
-        # only drops the sem_div/probe_cse diagnostics.
+        # NOTE (V4/V5/V6): the CSE-reject trust modes ('v4_cse_reject',
+        # 'v5_cse_reject', 'v6_cse_reject_geo') do NOT depend on this probe —
+        # their rejection signal is the full-test local CSE (_needs_local_cse
+        # below), so a semantic_weight=0 ablation cannot silently disable that
+        # signal; it only drops the sem_div/probe_cse diagnostics. It DOES
+        # change V6's geometry factor, though: with semantic_weight=0 the
+        # sem_div channel drops out of `s` and hence out of the gate, so a V6
+        # ablation on that axis moves v6_geo_mult as well as the diagnostics.
         sem_w = float((self.defense_config or {}).get('semantic_weight', 0.0))
         self._needs_probe = (
             self.defense_method in ('hmp_gae', 'hmpgae', 'hmp-gae')
@@ -113,7 +116,9 @@ class Server:
         ).lower()
         self._needs_local_cse = (
             self.defense_method in ('hmp_gae', 'hmpgae', 'hmp-gae')
-            and trust_mode_cfg in ('v4_cse_reject', 'v5_cse_reject')
+            and trust_mode_cfg in (
+                'v4_cse_reject', 'v5_cse_reject', 'v6_cse_reject_geo'
+            )
         )
 
         # Track historical data
@@ -430,9 +435,12 @@ class Server:
             )
             print(f"  🚪 gate:         {gate_summary}")
 
-        # V4/V5 rejection-rule diagnostics (trust_mode 'v4_cse_reject' or
-        # 'v5_cse_reject'): per-client CSE/median ratio and which clients were
-        # flagged this round. V5 has no scalar mult — show floor + r_hard.
+        # V4/V5/V6 rejection-rule diagnostics (trust_mode 'v4_cse_reject',
+        # 'v5_cse_reject' or 'v6_cse_reject_geo'): per-client CSE/median ratio
+        # and which clients were flagged this round. V5/V6 have no scalar
+        # mult — show floor + r_hard (V6 additionally shows its geometry
+        # factor). Test V6 FIRST: it emits the v5_* ramp keys too, so a
+        # 'v5_m_floor' in stats test alone would mislabel a V6 round as V5.
         v4_ratio_list = defense_stats.get('v4_ratio')
         v4_flagged_list = defense_stats.get('v4_flagged')
         if isinstance(v4_ratio_list, list) and len(v4_ratio_list) == len(client_ids):
@@ -442,7 +450,13 @@ class Server:
             print(f"  🧪 cse/med:      {ratio_summary}")
         if isinstance(v4_flagged_list, list) and len(v4_flagged_list) == len(client_ids):
             flagged_ids = [cid for cid, f in zip(client_ids, v4_flagged_list) if f]
-            if 'v5_m_floor' in defense_stats:
+            if 'v6_geo_floor' in defense_stats:
+                mult_desc = (
+                    f"ramp floor={defense_stats.get('v5_m_floor')}, "
+                    f"r_hard={defense_stats.get('v5_r_hard')}, "
+                    f"geo_floor={defense_stats.get('v6_geo_floor')}"
+                )
+            elif 'v5_m_floor' in defense_stats:
                 mult_desc = (
                     f"ramp floor={defense_stats.get('v5_m_floor')}, "
                     f"r_hard={defense_stats.get('v5_r_hard')}"
@@ -455,6 +469,16 @@ class Server:
                 f"k_cap={defense_stats.get('v4_k_cap')}, "
                 f"{mult_desc})"
             )
+        # V6 only: the geometric factor actually applied to the flagged
+        # clients this round. geo_mult ≈ 1.0 across all rounds means the
+        # hypergraph never acted and V6 reduced to V5 — a result to report,
+        # not to tune away by lowering v6_geo_floor.
+        v6_geo_mult_list = defense_stats.get('v6_geo_mult')
+        if isinstance(v6_geo_mult_list, list) and len(v6_geo_mult_list) == len(client_ids):
+            geo_summary = ", ".join(
+                f"c{cid}={v:.3f}" for cid, v in zip(client_ids, v6_geo_mult_list)
+            )
+            print(f"  📐 geo_mult:     {geo_summary}")
 
         # Compute similarity and distance metrics for visualization (unchanged).
         mode = getattr(self, 'similarity_mode', 'local_vs_global')
@@ -498,6 +522,7 @@ class Server:
                   'v4_cse', 'v4_ratio', 'v4_flagged', 'v4_multiplier',
                   'v4_median_cse', 'v4_tau_ratio', 'v4_k_cap', 'v4_reject_mult',
                   'v5_m_floor', 'v5_r_hard', 'v5_ramp_t',
+                  'v6_geo_floor', 'v6_geo_gate', 'v6_geo_mult', 'v6_m_cse',
                   'L_rec', 'L_smooth', 'L_hist',
                   'fallback_reason', 'defense_time_ms'):
             if k in defense_stats:
@@ -955,7 +980,8 @@ class Server:
             probe_tensor = torch.stack(probe_rows, dim=0)  # (N, K, C)
 
         # Optional Phase 3.6: pre-aggregation per-client local metrics for the
-        # CSE-reject trust rules (trust_mode 'v4_cse_reject' / 'v5_cse_reject').
+        # CSE-reject trust rules (trust_mode 'v4_cse_reject' / 'v5_cse_reject'
+        # / 'v6_cse_reject_geo').
         # Client models are untouched by aggregation, so these values are
         # identical to the legacy post-aggregation evaluation — computed once
         # here and reused for the round log below (no duplicate eval cost).
@@ -965,7 +991,8 @@ class Server:
         if self._needs_local_cse:
             if any(getattr(c, 'crafts_update', False) for c in self.clients):
                 raise RuntimeError(
-                    "CSE-reject trust modes (v4_cse_reject / v5_cse_reject) "
+                    "CSE-reject trust modes (v4_cse_reject / v5_cse_reject / "
+                    "v6_cse_reject_geo) "
                     "are not supported with update-forging attackers "
                     "(crafts_update, e.g. AugMP): local CSE evaluates "
                     "client.model, which such attackers leave looking benign "
@@ -1004,7 +1031,7 @@ class Server:
             or ((round_num + 1) % n_eval == 0)
         )
         if self._needs_local_cse:
-            # V4 path: local metrics were already evaluated pre-aggregation
+            # V4/V5/V6 path: local metrics were already evaluated pre-aggregation
             # this round (every round — the trust rule needs them even when
             # eval_local_every_n_rounds would skip); reuse those values here.
             pass

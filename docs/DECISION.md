@@ -122,6 +122,113 @@ replay-calibratable parameters and exact V4 saturation equivalence.
   validation of a `tau_hold`), no cold-start holdback (new prereg + clean
   ceiling reruns). Both remain future work.
 
+## V6 geometry conjunction (2026-08-07)
+
+**Adopted:** `trust_mode='v6_cse_reject_geo'` — V5's flag decision **and** V5's
+CSE ramp, both byte-identical (V6 reuses `v5_m_floor` / `v5_r_hard` directly),
+times a **one-sided** read-out of the HMP-GAE geometry gate, applied to flagged
+clients only. Implemented in
+`hmp_gae/trust_scorer.py::v6_cse_reject_geo_weights`:
+
+```text
+geo_i = v6_geo_floor + (1 - v6_geo_floor) * gate_i     # gate = V3's sigmoid gate
+m_i   = m_cse_i * geo_i     if flagged      else 1.0
+```
+
+**Problem it fixes:** the paper (Eq. 21, Algorithm 1 lines 16–17) claims
+`alpha = softmax(f_trust(z))`, but V4/V5 execute `alpha = normalize(m_i · n_i)`
+with `m_i` from local CSE alone — the hypergraph/VGAE channels are computed,
+logged, and multiplied by zero. The archive proves it: trust separation is
+bit-identical across BACKBONES (Qwen AG V4 = Llama AG V4 = Qwen AG V5 =
+16.1289; Qwen Yahoo V4 = Llama Yahoo V4 = 8.9906), i.e. `alpha` is a
+deterministic function of (partition, seed) with no model-dependent — and
+therefore no geometric — content.
+
+- **The conjunction is one-sided on purpose.** `geo_i ∈ [v6_geo_floor, 1]`, so
+  `m_i ≤ m_cse_i` pointwise and V6's weight for a flagged client is always
+  ≤ V5's: CSE cannot regress by construction. This is not stylistic. Offline
+  replay of the archived CSVs (per-round flag sets recomputed under the V4/V5
+  rule, benign false positives = 0 in all 5 replayed runs, then read the
+  same round's discarded `sigmoid_gate`) measures the geometry at a mean of
+  **0.766 on confirmed attackers in Qwen AG non-IID V4** (0.649 under V5,
+  0.606 Llama Yahoo V4, 0.286 Llama AG V4) — i.e. in the very cell where V4/V5
+  beat the clean ceiling, the geometry votes "give this attacker 77% weight".
+  Any two-sided fusion hands that weight back.
+- `v6_geo_floor = 0.5` is **pre-registered** (2026-08-07, before any V6 run).
+  Estimated effect on flagged-attacker weight vs V5, from the archived gate
+  means at steady-state `m_cse ≈ m_floor`: −12% (Qwen AG), −20% (Llama Yahoo),
+  −36% (Llama AG). Do **not** re-tune after seeing a run. If the logged
+  `v6_geo_mult` sits at ≈1.0 every round, the honest report is "the geometry
+  did not act, V6 = V5 renamed" — that is a publishable negative result, not a
+  reason to lower the floor.
+- `v6_geo_floor = 1.0` is **legal and is the regression guard**: the
+  `(1 - geo_floor)` factor is a float-exact 0.0, so V6 reproduces
+  `v5_cse_reject_weights` element-for-element (tested:
+  `test_v6_geo_floor_one_equals_v5`). Run 0 of the experiment plan is this at
+  FL scale — `trust_weights.csv` must match the archived V5 companion bit for
+  bit before Run 1 (floor 0.5) is worth spending.
+- **Unflagged clients keep `m_i = 1.0`, not `gate_i`.** A federation with no
+  flags therefore aggregates at exactly `n_k/Σn` (invariant 9,
+  `test_no_attack_no_scapegoat`). V3's always-on gate could not hold this: its
+  sigmoid never equals 1, so it taxed the most heterogeneous benign client
+  even with no attacker present.
+- **Side effect to keep in mind:** `graph_min_distinct`, `reject_z_threshold`,
+  `soft_reject_k` and `semantic_weight` are diagnostics-only under V4/V5 but
+  become live α-affecting knobs under V6. Keep `reject_z_threshold = 2.5` /
+  `soft_reject_k = 2.0` so V6's gate is the same object the replay measured.
+- A NaN gate maps to 1.0 ("the geometry abstains") = exactly V5 for that
+  client. Raising instead would be worse: `HMPGAEDefense.aggregate` catches it
+  and drops the whole round to plain FedAvg, losing the CSE rejection too.
+
+### Rejected: reverting to V3, or feeding CSE into V3's gate
+
+Both were measured on the archive before V6 was designed, and both fail:
+
+- **V3 is not "the accurate one".** Over 69 archived runs / 6 cells, plain
+  FedAvg-under-attack ranks **1st** by mean accuracy in Qwen AG non-IID and
+  Llama Yahoo non-IID, and the no-attack clean ceiling ranks *below* an
+  attacked undefended run in two cells. V3 never places 1st in any of its 4
+  cells. Median seed-to-seed |Δmean acc| over the archive's 6 reproduction
+  pairs is 0.0207, and 42 of 49 adjacent rank gaps (86%) are smaller than that
+  — **accuracy cannot order defenses on this benchmark** and is a floor check
+  only (extends the 2026-07-29 "The Attack Has No Accuracy Cost" entry from 2
+  cells to 4). Meanwhile V3 costs +37.8%/+73.0%/+10.9%/+63.3% mean CSE vs V4,
+  and its trust separation is **< 1 in both Yahoo cells** (0.958 / 0.994) —
+  attackers outweighing the benign mean for 40 consecutive rounds, i.e. the
+  defense pointing backwards.
+- **CSE as a fifth V3 channel tops out.** Injecting `z_cse = log(r)/log(tau)`
+  into the trust logit and sweeping `cse_weight` peaks at ≈2.0 and then
+  *declines* (Qwen AG separation 1.16 → 2.04 → 1.07 at weights 0/2/8). The
+  cause is structural, not a tuning miss: `weight_norm = sqrt(Σ w_k²)` grows
+  with the new channel and `sus = -s/weight_norm` divides the added signal
+  back out, while `reject_z_threshold` is denominated in per-signal robust-z
+  units that a single dominant channel can barely exceed. Optimally tuned,
+  V3's gate reaches ~2.0x separation where V4/V5 reach 16.13x. **The
+  bottleneck is V3's gate/normalisation architecture, not the signal set** —
+  do not retry `graph_weight` / `semantic_weight` / `hist_weight_beta` /
+  `cse_weight` tuning to rescue it (and see the standing rejections of
+  `semantic_weight=2.0` and `hist_weight_beta` tuning).
+
+### What V6 deliberately does NOT do
+
+- No change to `v4_tau_ratio` (1.85), `v5_r_hard` (2.5), or the never-zero
+  `m_floor` rule — all pre-registered, all inherited unchanged.
+- No coverage-aware reweighting. The one genuinely unsolved failure is Yahoo
+  **PPL** (Qwen Yahoo V4: CSE 0.6378 beats the 0.6551 ceiling, but PPL 1209.10
+  is worse than both the attack floor 1092.07 and the ceiling 1109.56; Llama
+  Yahoo V4: 620.23 vs ceiling 431.07). Under 10-class Dirichlet-0.5, damping
+  2 of 7 clients to 0.1× costs **label coverage**, not hallucination — no
+  trust architecture fixes it, and V6 (which only ever tightens) will make it
+  marginally worse. Needs its own decision entry; still deferred, as in V5.
+- No sticky flags / hysteresis and no cold-start holdback (deferred in V5, and
+  both would add cross-round state that `HMPGAERuntime.state_dict` would have
+  to serialize).
+- The **test-set leakage** issue (`evaluate_local_metrics` iterates
+  `self.test_loader`, the same set the reported global CSE comes from) is
+  acknowledged and **not** addressed here — it is a separate change, gated on
+  first archiving `probe_cse` to check whether the 100-sample probe entropy
+  discriminates as well as the 1500-sample full-test CSE.
+
 ## C1 z-score hygiene (2026-07-28)
 
 - `_zscore` MAD degeneracy guard is **relative** (`scale < 1e-3·max|x|`), with
