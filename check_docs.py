@@ -51,7 +51,7 @@ SYMBOLS = {
     "hmp_gae/trust_scorer.py": [
         "compute_trust_weights", "_zscore", "_semantic_divergence_signal",
         "reject_soft_weighted", "gate_diagnostics", "weighted_aggregate", "_suspicion_signal",
-        "v4_cse_reject_weights",
+        "v4_cse_reject_weights", "v5_cse_reject_weights", "v6_cse_reject_geo_weights",
     ],
     "hmp_gae/hypergraph.py": ["knn_hypergraph"],
     "hmp_gae/node_features.py": ["compute_node_features"],
