@@ -10,6 +10,10 @@
 ├── .gitignore
 ├── LICENSE
 ├── README.md                          # This documentation
+├── AGENTS.md / CLAUDE.md              # Agent working conventions (CLAUDE.md imports AGENTS.md)
+├── MATH_LOGIC.md                      # Algorithm symbols and derivations
+├── docs/DECISION.md                   # Settled design decisions + pre-registered constants
+├── check_docs.py                      # Doc↔code consistency guard (run after editing any .md)
 ├── requirements.txt                   # Python dependencies
 ├── main.py                            # Entry: configure and run federated learning
 ├── client.py                          # Client base + BenignClient (FedProx local training)
@@ -17,6 +21,8 @@
 ├── models.py                          # NewsClassifierModel (SeqCLS + optional LoRA)
 ├── data_loader.py                     # DataManager / datasets (AG News, Yahoo Answers, IMDB, DBpedia)
 ├── fed_checkpoint.py                  # Save global model + metadata after FL
+├── fed_resume.py                      # Per-round checkpoint + fingerprint resume (Colab resilience)
+├── replay_v7_calibration.py           # V7 pre-run replay calibration over archived runs (stdlib)
 ├── decoder_adapters.py                # SeqCLS backbone → CausalLM transfer adapters
 ├── run_downstream_generation.py       # CLI: checkpoint + probes → JSONL (Task 2)
 ├── visualization.py                   # Experiment figures / plots
@@ -27,8 +33,9 @@
 │   ├── gaussian.py                    # Gaussian (USENIX Security ’20)
 │   └── alie.py                        # ALIE (NeurIPS ’19)
 ├── defense/                           # Server-side defense wiring
-│   ├── __init__.py                    # FedAvg / HMP-GAE + build_defense (was root defense.py)
-│   └── baselines/                     # Placeholder for future defense baselines
+│   ├── __init__.py                    # build_defense: fedavg / hmp_gae / krum / multi_krum
+│   │                                  #   / coord_median / fltrust / foolsgold
+│   └── baselines/                     # (reserved)
 │       └── __init__.py
 ├── evaluation_hallucination.py        # V2 M7: end-of-FL PPL (backbone transfer to CausalLM)
 ├── hmp_gae/                           # HMP-GAE defense sub-package (this paper)
@@ -42,6 +49,8 @@
 ├── data/                              # Local CSV caches (AG News + Yahoo Answers)
 │   ├── ag_news/                       # train.csv, test.csv (label,title,text — no header)
 │   └── yahoo_answers/                 # train.csv, test.csv (label,text — no header; 1-based labels)
+├── tests/
+│   └── test_trust_robustness.py       # Trust-scoring CPU regression (V3–V7, legacy bit-for-bit)
 └── HMP_GAE_Colab.ipynb                # Colab: main experiment + full inline results; then disconnect GPU
 ```
 
@@ -52,13 +61,13 @@
 ## Supported Models
 
 - Encoder-only (BERT-style): `distilbert-base-uncased`, `bert-base-uncased`, `roberta-base`, `microsoft/deberta-v3-base`
-- Decoder-only (GPT-style): `gpt2`, `EleutherAI/pythia-160m`, `EleutherAI/pythia-1b`, `facebook/opt-125m`, `Qwen/Qwen2.5-0.5B`
+- Decoder-only (GPT-style): `gpt2`, `EleutherAI/pythia-160m`, `EleutherAI/pythia-1b`, `facebook/opt-125m`, `Qwen/Qwen2.5-0.5B`, `meta-llama/Llama-3.2-1B` (gated: accept the HF license and provide `HF_TOKEN`; fp32 needs an A100)
 - Configure in `main.py` via `model_name`.
 
 ## Supported Datasets
 
 - **AG News**: `dataset='ag_news'`, `num_labels=4`, `max_length=128` (default). CSVs: `data/ag_news/train.csv`, `data/ag_news/test.csv`.
-- **Yahoo Answers** (yassiracharki/Yahoo_Answers_10_categories_for_NLP): `dataset='yahoo_answers'`, `num_labels=10`, `max_length=256` (10 topic classes, 1.4M train / 60K test). CSVs: `data/yahoo_answers/train.csv`, `data/yahoo_answers/test.csv`.
+- **Yahoo Answers** (yassiracharki/Yahoo_Answers_10_categories_for_NLP): `dataset='yahoo_answers'`, `num_labels=10`, `max_length=256` standalone — the cross-dataset comparison arms keep 128 (see `main.py`). 10 topic classes, 1.4M train / 60K test. CSVs: `data/yahoo_answers/train.csv`, `data/yahoo_answers/test.csv`.
 - **IMDB** (stanfordnlp/imdb): `dataset='imdb'`, `num_labels=2`, `max_length=512` (or 256 for lower memory)
 - **DBpedia 14** (fancyzhx/dbpedia_14): `dataset='dbpedia'`, `num_labels=14`, `max_length=512` (14 topic classes, 560K train / 70K test)
 - Configure in `main.py` via `dataset`, `num_labels`, and `max_length`.
@@ -81,7 +90,7 @@ python main.py
 
 ### Google Colab Execution (or other Cloud AI platforms)
 
-**Recommended: run the notebook.** Open [`HMP_GAE_Colab.ipynb`](HMP_GAE_Colab.ipynb), enable **T4 GPU**, then **Run all**. It runs **`main.main()`** only — with **no overrides of any kind**: [`main.py`](main.py)'s `config` dict is the single source of truth, so what the notebook runs is exactly what that file says. It then prints the full `*_results.json` / PPL / per-round tables inline. The last cell calls **`google.colab.runtime.unassign()`** to release the GPU. Wall-clock time follows `main.py` (e.g. Qwen2.5 + 10 rounds is long).
+**Recommended: run the notebook.** Open [`HMP_GAE_Colab.ipynb`](HMP_GAE_Colab.ipynb), enable **T4 GPU**, then **Run all**. It runs **`main.main()`** only — with **no overrides of any kind**: [`main.py`](main.py)'s `config` dict is the single source of truth, so what the notebook runs is exactly what that file says. It then prints the full `*_results.json` / PPL / per-round tables inline. The last cell calls **`google.colab.runtime.unassign()`** to release the GPU. Wall-clock time follows `main.py` (the canonical 50-round Qwen2.5 arm is ~3–4 h on a T4).
 
 **Alternative: pure shell (same entry as local).**
 
@@ -129,38 +138,24 @@ V1 ships the paper's core immunization pipeline end-to-end:
 
 ### Configure via `main.py::main()`
 
-```python
-# Attack
-'attack_method': 'Hallucination',
-'hallu_flip_ratio': 1.0,               # 0..1, fraction of samples flipped
-'hallu_flip_mode': 'pairwise',         # 'pairwise' | 'targeted' | 'random'
-'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2},   # AG News: World<->Sports, Business<->Sci/Tech
+All knobs live in the single authoritative `config` dict in `main.py::main()` — there is
+no CLI / notebook override path. This README deliberately does **not** restate live
+values (they change per experiment arm; read the dict). The knob groups:
 
-# Defense
-'defense_method': 'hmp_gae',           # or 'fedavg' for the baseline
-'defense_config': {
-    'knn_k': 3, 'hidden_dim': 64, 'latent_dim': 32, 'num_hmp_layers': 2,
-    'train_steps_per_round': 5, 'train_lr': 1e-3,
-    'lambda_H': 1.0, 'lambda_A': 1.0, 'lambda_hist': 0.5,
-    'graph_weight': 1.0, 'residual_weight_alpha': 0.3, 'hist_weight_beta': 0.0,
-    'semantic_weight': 1.0,
-    # --- Robust trust scoring (2026-07; legacy values in comments) ---
-    'zscore_mode': 'mad',                # 'std' = legacy mean/std z-scores
-    'zscore_clip': 10.0,                 # cap |z| per signal
-    'gate_rezscore': False,              # True = legacy double z-score gate
-    'sus_ema_beta': 0.6,                 # 0.0 = no cross-round suspicion EMA
-    'semantic_reference': 'median',      # 'pairwise' = legacy peer-consensus KL
-    'semantic_confidence_weight': False, # ablation knob
-    'semantic_probe_stratified': True,   # False = head-of-test_loader probes
-    'trust_mode': 'soft_reject_fedavg',
-    'reject_z_threshold': 2.5,           # per-signal robust-z units; use 0.75
-                                         # with gate_rezscore=True (legacy)
-    'soft_reject_k': 2.0,
-    'softmax_tau': 0.1, 'hist_ema_beta': 0.9,
-    'cold_start_fallback': False,
-    'device': 'cpu', 'random_proj_seed': 42,
-},
-```
+- **Attack** — `attack_method`: `'NoAttack' | 'Hallucination' | 'SignFlipping' |
+  'Gaussian' | 'ALIE'`, plus the `hallu_*` knobs (flip mode / ratio / per-round
+  randomization).
+- **Defense** — `defense_method`: `'fedavg' | 'hmp_gae' | 'krum' | 'multi_krum' |
+  'coord_median' | 'fltrust' | 'foolsgold'`. The `defense_config` block holds the
+  hypergraph geometry (`knn_k`, encoder dims, loss weights), trust-signal fusion
+  (`graph_weight` / `residual_weight_alpha` / `semantic_weight` / `hist_weight_beta`),
+  and the robust suspicion scale (`zscore_mode`, `sus_ema_beta`, `reject_z_threshold`,
+  `graph_min_distinct`, …).
+- **`trust_mode`** — the trust→weight mapping: V3 `'soft_reject_fedavg'` (sigmoid gate +
+  FedAvg) and the CSE-reject family `'v4_cse_reject'` / `'v5_cse_reject'` /
+  `'v6_cse_reject_geo'` / `'v7_cse_reject_corrob'` (V7 may not run before
+  `replay_v7_calibration.py` passes). Pre-registered constants and design rationale:
+  [docs/DECISION.md](docs/DECISION.md).
 
 **Robust trust scoring (2026-07).** Four config-gated fixes targeting the two
 failure modes that cost clean accuracy: (1) `semantic_reference='median'`
@@ -174,15 +169,16 @@ scale so an all-benign round always down-weighted its most extreme client
 (the "scapegoat tax"); the suspicion score is instead `-s / ‖w‖₂`, putting
 `reject_z_threshold` in per-signal robust-z units; (4) `sus_ema_beta=0.6`
 smooths suspicion across rounds, so one-off benign extremes recover while
-persistent attackers stay gated. Setting the six legacy values noted above
-reproduces pre-2026-07 runs bit-for-bit. Detection quality (attacker/benign
+persistent attackers stay gated. Setting the seven legacy values listed in
+`main.py`'s robust-suspicion comment reproduces pre-2026-07 runs bit-for-bit.
+Detection quality (attacker/benign
 gate means + suspicion AUROC) is written to `detection_summary` in the
 results JSON. Sanity tests: `python tests/test_trust_robustness.py` (CPU,
 ~1s, no dataset).
 
 ### Representative results (example regime)
 
-Runs below use **`python main.py`** with comparable settings (e.g. N=10 clients, 2 attackers, short rounds, AG News subset, DistilBERT + LoRA); tune `config` in [`main.py`](main.py) to reproduce.
+Historical V1 snapshot (2026-06: N=10 clients, 2 attackers, short rounds, AG News subset, DistilBERT + LoRA, V3-era trust scoring). The current canonical arm is N=7 / 50 rounds / Qwen2.5-0.5B — see `config` in [`main.py`](main.py); archived results live outside this repo.
 
 | Setting | Final Clean Acc (3-seed mean ± std) |
 |---|---|
@@ -217,9 +213,9 @@ Output files per run (the `results/` folder is gitignored; paths below are produ
 
 ### V1 / V2 limitations and roadmap
 
-- V1 still omits comparison baselines (Krum / Median / FLTrust / FLDetector / Safe-FedLLM). Planned for the next V2 milestone.
+- Baseline defenses (Krum / Multi-Krum / Coord-Median / FLTrust / FoolsGold) are implemented in `defense/` and selectable via `defense_method`; FLDetector / Safe-FedLLM remain future work.
 - PPL currently evaluates a decoder-only backbone; when `model_name` is encoder-only, PPL is skipped with a reason string in the JSON.
 - Single modality (text) -- the paper's multimodal formulation is simulated via LoRA-only updates; true multimodal encoders are later work.
-- Tuning presets above are calibrated for the N=10 / 2-attackers / AG News regime. For `num_clients <= 2` the defense auto-falls back to FedAvg (the hard threshold in `defense/__init__.py::HMPGAEDefense.aggregate`; hypergraph signals are simply weak at small N); for very heterogeneous (`dirichlet_alpha << 0.3`) data, `reject_z_threshold` may need to be raised.
+- The canonical regime is N=7 (5 benign + 2 attackers). For `num_clients <= 2` the defense auto-falls back to FedAvg (the hard threshold in `defense/__init__.py::HMPGAEDefense.aggregate`; hypergraph signals are simply weak at small N); for very heterogeneous (`dirichlet_alpha << 0.3`) data, `reject_z_threshold` may need to be raised.
 
 <br>

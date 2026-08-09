@@ -1125,7 +1125,8 @@ def main():
         'alie_attack_start_round': None,
 
         # ========== Defense ==========
-        # 'fedavg' | 'hmp_gae' (this paper) | 'foolsgold' | 'fltrust'
+        # 'fedavg' | 'hmp_gae' (this paper) | 'krum' | 'multi_krum' | 'coord_median'
+        # | 'fltrust' | 'foolsgold'
         'defense_method': 'hmp_gae',
         'defense_config': {
             # Baseline-defense knobs — inert under hmp_gae, EXCEPT num_byzantine:
