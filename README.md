@@ -33,10 +33,8 @@
 │   ├── gaussian.py                    # Gaussian (USENIX Security ’20)
 │   └── alie.py                        # ALIE (NeurIPS ’19)
 ├── defense/                           # Server-side defense wiring
-│   ├── __init__.py                    # build_defense: fedavg / hmp_gae / krum / multi_krum
-│   │                                  #   / coord_median / fltrust / foolsgold
-│   └── baselines/                     # (reserved)
-│       └── __init__.py
+│   └── __init__.py                    # build_defense: fedavg / hmp_gae / krum / multi_krum
+│                                      #   / coord_median / fltrust / foolsgold
 ├── evaluation_hallucination.py        # V2 M7: end-of-FL PPL (backbone transfer to CausalLM)
 ├── hmp_gae/                           # HMP-GAE defense sub-package (this paper)
 │   ├── node_features.py               #   eta_i = f_enc(Delta_i, stats, history)
