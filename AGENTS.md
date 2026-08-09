@@ -42,7 +42,7 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 
 **不变的实验骨架**（很少动，可依赖）：N=7（5 benign + 2 attackers），50 轮，LoRA(r=8)，per-round 随机化 label-flip（`hallu_flip_ratio_range`），`attack_method='Hallucination'` + `defense_method='hmp_gae'` 三信号防御。
 
-> **易变 knob（dataset / model_name / flip ratio 等）一律以 `config` dict 现值为准，本文件不复述具体值**——写死的数值随时会过时；需要当前值时读 `config`，不要引用本文件。（撰写本节时现值，仅供参考：Yahoo Answers non-IID(0.5) + Llama-3.2-1B。）
+> **易变 knob（dataset / model_name / flip ratio 等）一律以 `config` dict 现值为准，本文件不复述具体值**——写死的数值随时会过时；需要当前值时读 `config`，不要引用本文件。（撰写本节时现值 2026-08-09，仅供参考：AG News non-IID(0.5) + Qwen2.5-0.5B，V4-remove ablation 臂。）
 
 ## 模块速查（哪里改什么）
 
@@ -73,7 +73,7 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 - **Attacker 的数据语义因 attack 类型而异**：
   - `Hallucination`：**使用**自己的本地数据但训练时翻转 label（dataset-USED with flips）
   - `sign_flipping` / `gaussian` / `alie`：**dataset-free**，不读自己的数据，只伪造 update
-  - main.py 分区打印处那条 `"attackers do NOT perform local training and do NOT use these local data"` 注释**只对后三种成立**——读到这条不要"修正"代码
+  - main.py 分区后的 `[Note]` 打印自 2026-08-09 起按 `attack_method` 区分表述（Hallucination 明确打印"使用本地数据+翻转 label"）；此前归档日志里的旧版 "attackers do NOT perform local training" 表述只对后三种成立，读旧日志时注意
 - **N ≤ 2 时 HMP-GAE 自动 fallback 到 FedAvg**（[defense/\_\_init\_\_.py](defense/__init__.py) 的 `HMPGAEDefense.aggregate`，原因写入 `fallback_reason`）：这是代码里**唯一**的硬阈值——早期文档/README 写 N≤4 不准确（小 N 下超图信号确实偏弱，但真正触发回退是 N≤2）；动这里要同步更新 README limitations
 - **`defense_config.device: 'cpu'` 故意的**：HMP-GAE 子模型很小（N=7），CPU 比反复 GPU↔CPU 搬数据快
 - **`semantic_weight > 0` 会触发 server 每轮 per-client probe forward**：从 test_loader 头部确定性取 `semantic_probe_size` 条样本；`semantic_weight=0` 时整条 probe path 跳过

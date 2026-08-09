@@ -1,5 +1,5 @@
-# main.py
-# This script sets up and runs a federated learning experiment with a progressive GRMP attack.
+# main.py — FL experiment entry point: label-flip Hallucination attack vs HMP-GAE defense.
+# The config dict in main() is the single source of truth (conventions: AGENTS.md).
 
 import sys
 import subprocess
@@ -41,9 +41,7 @@ def _preflight_hf_auth(model_name):
     except ImportError:
         return
 
-    # Colab fallback: if Step 2 wasn't run (or the runtime restarted and wiped
-    # the login), pull HF_TOKEN from Colab Secrets here so this cell is
-    # self-sufficient. Records the failure reason for the error message below.
+    # Colab fallback: pull HF_TOKEN from Colab Secrets if notebook Step 2 didn't run.
     colab_secret_err = None
     if get_token() is None:
         try:
@@ -80,9 +78,7 @@ def _preflight_hf_auth(model_name):
         return
 
 
-# Initialize experiment components
 def setup_experiment(config):
-    # Set random seeds for reproducibility
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
     if torch.cuda.is_available():
@@ -90,7 +86,6 @@ def setup_experiment(config):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-    # Create results directory
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
 
@@ -98,8 +93,6 @@ def setup_experiment(config):
     print(f"Setting up Experiment: {config['experiment_name']}")
     print("=" * 50)
 
-    # 1. Initialize Data Manager
-    # dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers' — select dataset; num_labels and max_length must match (see config below)
     _preflight_hf_auth(config.get('model_name', 'distilbert-base-uncased'))
     data_manager = DataManager(
         num_clients=config['num_clients'],
@@ -113,8 +106,7 @@ def setup_experiment(config):
         dataset=config.get('dataset', 'ag_news')
     )
 
-    # 2. Partition data among clients
-    # Supports both IID and Non-IID distributions based on config
+    # Partition data among clients (IID or Dirichlet non-IID).
     data_distribution = config.get('data_distribution', 'non-iid').lower()
     indices = np.arange(len(data_manager.train_texts))
     labels = np.array(data_manager.train_labels)
@@ -123,35 +115,27 @@ def setup_experiment(config):
     num_attackers = config.get('num_attackers', 0)
     num_benign = num_clients - num_attackers
     
-    # Fixed shuffle for consistent partitioning across runs
     rng = np.random.default_rng(config['seed'])
     
     client_indices = {i: [] for i in range(num_clients)}
     
     if data_distribution == 'iid':
-        # ========== IID Distribution: Uniform Random Partition ==========
-        # Each client gets approximately equal number of samples with similar label distribution
         print("\nPartitioning data (IID distribution)...")
         
-        # Shuffle all indices
         all_indices = indices.copy()
         rng.shuffle(all_indices)
         
-        # Calculate samples per client (approximately equal)
         total_samples = len(all_indices)
         base_samples = total_samples // num_clients
         remainder = total_samples % num_clients
         
-        # Assign samples to each client
         start_idx = 0
         for client_id in range(num_clients):
-            # First 'remainder' clients get one extra sample
             extra = 1 if client_id < remainder else 0
             end_idx = start_idx + base_samples + extra
             client_indices[client_id] = all_indices[start_idx:end_idx].tolist()
             start_idx = end_idx
         
-        # Print distribution statistics
         print(f"  IID distribution (uniform random partition)")
         for client_id in range(num_clients):
             client_labels = [labels[idx] for idx in client_indices[client_id]]
@@ -165,50 +149,35 @@ def setup_experiment(config):
                 client_type = "BENIGN" if client_id < num_benign else "ATTACKER"
                 print(f"    Client {client_id} ({client_type}): 0 samples WARNING: No data assigned!")
 
-        if num_benign < num_clients:
-            print("\n  [Note] Attackers are assigned only data *quantities* (sizes) for the experimental setup. "
-                  "In reality, attackers do NOT perform local training and do NOT use these local data "
-                  "(dataset-free). They also do NOT access other local agents' data.")
-    
     else:
-        # ========== Non-IID Distribution: Dirichlet-based Partition ==========
-        # Per paper: "heterogeneous IoA system" with heterogeneous data distributions
         print("\nPartitioning data (Non-IID distribution)...")
         
-        # Use Dirichlet distribution to create heterogeneous data
-        # Each client gets data with different label distributions
         dirichlet_alpha = config['dirichlet_alpha']
         
-        # Partition data by label first
         label_indices = {label: [] for label in range(num_labels)}
         for idx, label in enumerate(labels):
             label_indices[label].append(idx)
         
-        # Assign samples to clients using Dirichlet distribution for non-IID
         for label in range(num_labels):
             label_list = np.array(label_indices[label])
             rng.shuffle(label_list)
             
-            # Generate proportions for each client using Dirichlet distribution
-            # Lower dirichlet_alpha creates more heterogeneous (non-IID) distribution
+            # Lower alpha = more heterogeneous.
             proportions = rng.dirichlet([dirichlet_alpha] * num_clients)
             proportions = np.cumsum(proportions)
             proportions[-1] = 1.0  # Ensure last is exactly 1.0
             
-            # Assign samples based on proportions
             start_idx = 0
             for client_id in range(num_clients):
                 end_idx = int(len(label_list) * proportions[client_id])
                 client_indices[client_id].extend(label_list[start_idx:end_idx].tolist())
                 start_idx = end_idx
         
-        # Shuffle within each client to mix labels (but distribution remains non-IID)
         for client_id in range(num_clients):
             client_list = np.array(client_indices[client_id])
             rng.shuffle(client_list)
             client_indices[client_id] = client_list.tolist()
         
-        # Print distribution statistics
         print(f"  Non-IID distribution (Dirichlet alpha={dirichlet_alpha})")
         for client_id in range(num_clients):
             client_labels = [labels[idx] for idx in client_indices[client_id]]
@@ -222,16 +191,19 @@ def setup_experiment(config):
                 client_type = "BENIGN" if client_id < num_benign else "ATTACKER"
                 print(f"    Client {client_id} ({client_type}): 0 samples WARNING: No data assigned!")
 
-        # Clarification: attackers are dataset-free
-        if num_benign < num_clients:
-            print("\n  [Note] Attackers are assigned only data *quantities* (sizes) following the non-IID distribution, "
-                  "for experimental setup. In reality, attackers do NOT perform local training and do NOT use "
-                  "these local data (dataset-free). They also do NOT access other local agents' data.")
+    # Attacker data semantics depend on attack_method (see AGENTS.md): Hallucination
+    # attackers train on their assigned local data with flipped labels; the classical
+    # baselines forge updates and use assigned data mainly as claimed size.
+    if num_benign < num_clients:
+        _am = config.get('attack_method', 'Hallucination')
+        if _am == 'Hallucination':
+            print("\n  [Note] Hallucination attackers USE their assigned local data and flip labels during training.")
+        elif _am != 'NoAttack':
+            print("\n  [Note] Assigned attacker data mainly defines the claimed update weight; "
+                  "actual usage depends on the attack implementation (see attack/).")
 
-    # 3. Get global test loader
     test_loader = data_manager.get_test_loader()
 
-    # 4. Initialize Global Model
     use_lora = config.get('use_lora', False)
     model_name = config.get('model_name', 'distilbert-base-uncased')
     if use_lora:
@@ -253,7 +225,6 @@ def setup_experiment(config):
             use_lora=False
         )
 
-    # 5. Initialize Server
     server = Server(
         global_model=global_model,
         test_loader=test_loader,
@@ -270,23 +241,18 @@ def setup_experiment(config):
         eval_local_every_n_rounds=int(config.get('eval_local_every_n_rounds', 1)),
     )
 
-    # 6. Create Clients
     print("\nCreating federated learning clients...")
-    num_attackers = config.get('num_attackers', 0)  # Allow 0 attackers for baseline experiment
+    num_attackers = config.get('num_attackers', 0)
     attack_method = config.get('attack_method', 'Hallucination')
 
-    # AugMP constraint bounds live on the server (server Phase 0.5 forwards them to
-    # each attacker via set_constraint_params). None = auto-derive from benign-update
-    # statistics inside the attacker (recommended). Set only for AugMP so no other
-    # run's server state changes.
+    # AugMP constraint bounds ride on the server (Phase 0.5 → set_constraint_params);
+    # None = auto-derive from benign-update statistics.
     if attack_method == 'AugMP':
         server.dist_bound = config.get('dist_bound', None)
         server.sim_bound_low = config.get('sim_bound_low', None)
         server.sim_bound_up = config.get('sim_bound_up', None)
 
-    # 'NoAttack' is a first-class no-op: it forces every client to be benign even
-    # when num_attackers>0, so the (num_attackers=2, attack_method='NoAttack')
-    # combo from notebook overrides doesn't fall through the attacker dispatch.
+    # 'NoAttack' forces every client benign even when num_attackers>0.
     if attack_method == 'NoAttack' and num_attackers > 0:
         print(f"  [config] attack_method='NoAttack' overrides num_attackers={num_attackers}: "
               f"all {config['num_clients']} clients will be benign.")
@@ -294,16 +260,12 @@ def setup_experiment(config):
     else:
         effective_num_attackers = num_attackers
 
+    # The last 'effective_num_attackers' client ids are the attackers.
     for client_id in range(config['num_clients']):
-        # Determine if benign or attacker
-        # Logic: Last 'effective_num_attackers' clients are attackers
-        # If effective_num_attackers=0, all clients are benign (baseline experiment)
         if client_id < (config['num_clients'] - effective_num_attackers):
-            # --- Benign Client ---
             client_texts = [data_manager.train_texts[i] for i in client_indices[client_id]]
             client_labels = [data_manager.train_labels[i] for i in client_indices[client_id]]
             
-            # Create static dataloader for benign client
             dataset = NewsDataset(client_texts, client_labels, data_manager.tokenizer, 
                                   max_length=config.get('max_length', 128))
             client_loader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True)
@@ -321,20 +283,14 @@ def setup_experiment(config):
                 grad_clip_norm=config['grad_clip_norm']
             )
         else:
-            # --- Attacker Client ---
-            # attack_method is resolved once before the loop above.
-            # Use the actual assigned data size as claimed size (realistic scenario:
-            # attackers do not exaggerate their contribution weight).
+            # Claimed size = actual assigned size (attackers don't exaggerate weight).
             claimed_data_size = len(client_indices[client_id])
 
-            # Create attacker based on attack_method
             if attack_method == 'ALIE':
-                # ========== ALIE Attack Client ==========
                 from attack.alie import ALIEAttackerClient
                 print(f"  Client {client_id}: ATTACKER (ALIE Attack)")
                 print(f"    Claimed data size D'_j(t): {claimed_data_size} (matches assigned data)")
                 
-                # Get ALIE-specific parameters
                 alie_z_max = config.get('alie_z_max', None)
                 alie_attack_start_round = config.get('alie_attack_start_round', None)
                 
@@ -354,7 +310,6 @@ def setup_experiment(config):
                     grad_clip_norm=config.get('grad_clip_norm', 1.0)
                 )
             elif attack_method == 'SignFlipping':
-                # ========== Sign-Flipping Attack Client (ICML '18: g^byz = -scale * g_own) ==========
                 from attack.sign_flipping import SignFlippingAttackerClient
                 print(f"  Client {client_id}: ATTACKER (Sign-Flipping Attack, ICML '18)")
                 print(f"    Claimed data size D'_j(t): {claimed_data_size} (matches assigned data)")
@@ -381,7 +336,7 @@ def setup_experiment(config):
                     grad_clip_norm=config.get('grad_clip_norm', 1.0)
                 )
             elif attack_method == 'Hallucination':
-                # ========== Hallucination Attack (Label-Flipping, this paper) ==========
+                # Label-flipping (this paper); per-round randomization in attack/hallucination.py.
                 from attack.hallucination import HallucinationAttackerClient
                 print(f"  Client {client_id}: ATTACKER (Hallucination Attack - Label Flipping)")
                 print(f"    Claimed data size D'_j(t): {claimed_data_size} (matches assigned data)")
@@ -393,8 +348,6 @@ def setup_experiment(config):
                 hallu_flip_map = config.get('hallu_flip_map', {0: 1, 1: 0, 2: 3, 3: 2})
                 # Keys may be strings if config is loaded from JSON; normalize to int.
                 hallu_flip_map = {int(k): int(v) for k, v in hallu_flip_map.items()}
-                # Per-round randomization knobs (None / False values reproduce
-                # the original frozen-flip behaviour exactly).
                 hallu_flip_ratio_range = config.get('hallu_flip_ratio_range', None)
                 if hallu_flip_ratio_range is not None:
                     hallu_flip_ratio_range = tuple(float(x) for x in hallu_flip_ratio_range)
@@ -418,7 +371,6 @@ def setup_experiment(config):
                     flip_ratio_range=hallu_flip_ratio_range,
                 )
             elif attack_method == 'Gaussian':
-                # ========== Gaussian (Random Model Poisoning) Attack - USENIX Security '20 ==========
                 from attack.gaussian import GaussianAttackerClient
                 print(f"  Client {client_id}: ATTACKER (Gaussian Attack, USENIX Security '20)")
                 print(f"    Claimed data size D'_j(t): {claimed_data_size} (matches assigned data)")
@@ -440,15 +392,8 @@ def setup_experiment(config):
                     gaussian_std_scale=gaussian_std_scale
                 )
             elif attack_method == 'AugMP':
-                # ========== AugMP (learned VGAE + GSP model-manipulation, stealth baseline) ==========
-                # Data-agnostic / omniscient attacker: performs NO local training
-                # (local_train returns zero); the malicious update is CONSTRUCTED in
-                # camouflage_update from the received benign updates via VGAE + GSP +
-                # Lagrangian constrained proxy optimisation. F(w'_g) is estimated on an
-                # INDEPENDENT clean proxy set (data_manager.get_proxy_eval_loader draws
-                # from the TRAIN distribution, disjoint from the test set). See
-                # attack/augmp.py. Server Phase 0.5 hands it global params + constraint
-                # bounds; Phase 3 drives receive_benign_updates -> camouflage_update.
+                # Learned VGAE+GSP stealth manipulation: no local training — the update
+                # is constructed from the received benign updates (see attack/augmp.py).
                 from attack.augmp import AttackerClient
                 print(f"  Client {client_id}: ATTACKER (AugMP - VGAE model manipulation)")
                 print(f"    Claimed data size D'_j(t): {claimed_data_size} (matches assigned data)")
@@ -639,7 +584,6 @@ def run_downstream_task2_if_configured(config: Dict, results_dir: Path) -> None:
         print(f"\nTask 2 finished; JSONL: {out_path}")
 
 
-# Run the experiment
 def run_experiment(config):
     server, results_dir = setup_experiment(config)
 
@@ -648,16 +592,10 @@ def run_experiment(config):
         'clean_acc': [],
         'acc_diff': [],
         'agg_update_norm': [],
-        # V2 M7: Classification Semantic Entropy, recorded each round.
         'cse': [],
     }
 
-    # ------------------------------------------------------------------
-    # Resume from a previously-saved per-round checkpoint, if available.
-    # On Colab the runtime can die at any time; this lets a re-launched
-    # run pick up where it left off without re-doing completed rounds.
-    # See fed_resume.py for the persisted state and fingerprint guard.
-    # ------------------------------------------------------------------
+    # Resume from a per-round checkpoint if one matches (Colab resilience; fed_resume.py).
     ckpt_subdir = config.get('round_checkpoint_subdir', 'round_checkpoint')
     payload, reason = load_round_checkpoint(config, results_dir, subdir=ckpt_subdir)
     start_round = 0
@@ -683,15 +621,13 @@ def run_experiment(config):
         for round_num in range(start_round, config['num_rounds']):
             round_log = server.run_round(round_num)
 
-            # Track metrics
             progressive_metrics['rounds'].append(round_num + 1)
             progressive_metrics['clean_acc'].append(round_log['clean_accuracy'])
             progressive_metrics['acc_diff'].append(round_log.get('acc_diff', 0.0))
             progressive_metrics['agg_update_norm'].append(round_log['aggregation'].get('aggregated_update_norm', 0.0))
             progressive_metrics['cse'].append(round_log.get('classification_semantic_entropy'))
 
-            # Persist a resumable snapshot.  Atomic write (.tmp + os.replace)
-            # so a kill mid-save leaves the previous good checkpoint intact.
+            # Atomic write — a kill mid-save leaves the previous checkpoint intact.
             try:
                 save_round_checkpoint(
                     server=server,
@@ -704,7 +640,6 @@ def run_experiment(config):
             except Exception as e:  # noqa: BLE001 — never let checkpointing kill training
                 print(f"  [resume] Warning: checkpoint save failed: {type(e).__name__}: {e}")
 
-            # Memory cleanup after each round
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -716,13 +651,11 @@ def run_experiment(config):
         import traceback
         traceback.print_exc()
 
-    # Save results
     attacker_ids = [
         c.client_id for c in server.clients
         if getattr(c, 'is_attacker', False)
     ]
-    # Detection-quality readout (attacker/benign gate means + suspicion AUROC).
-    # Pure post-processing of the per-round logs; None for FedAvg / no-attack.
+    # Post-hoc detection quality (None for FedAvg / no-attack).
     detection_summary = compute_detection_summary(server.log_data, attacker_ids)
     results_data = {
         'config': config,
@@ -747,21 +680,18 @@ def run_experiment(config):
 
     run_downstream_task2_if_configured(config, results_dir)
 
-    # Print detailed statistics for data collection
     attacker_ids = [client.client_id for client in server.clients 
                    if getattr(client, 'is_attacker', False)]
     print_detailed_statistics(server.log_data, progressive_metrics, 
                             server.history['local_accuracies'], attacker_ids, 
                             config['experiment_name'], results_dir)
     
-    # Generate visualizations
     print("\n" + "=" * 60)
     print("Generating Visualization Plots")
     print("=" * 60)
     
     visualizer = ExperimentVisualizer(results_dir=results_dir)
     
-    # Generate all figures
     visualizer.generate_all_figures(
         server_log_data=server.log_data,
         local_accuracies=server.history['local_accuracies'],
@@ -869,21 +799,9 @@ def print_detection_summary(summary: Optional[Dict]) -> None:
     print(f"  rounds with gate   : {summary['n_rounds_with_gate']}")
 
 
-# Detailed statistics printing for data collection
-def print_detailed_statistics(server_log_data, progressive_metrics, local_accuracies, attacker_ids, 
+def print_detailed_statistics(server_log_data, progressive_metrics, local_accuracies, attacker_ids,
                              experiment_name='experiment', results_dir=None):
-    """
-    Print detailed statistics for data collection and multi-run comparison.
-    Outputs all key metrics in tabular format for easy copying to Excel/CSV.
-    
-    Args:
-        server_log_data: List of round logs from server
-        progressive_metrics: Dictionary with progressive metrics
-        local_accuracies: Dictionary with local accuracies per client
-        attacker_ids: List of attacker client IDs
-        experiment_name: Name of the experiment (for file naming)
-        results_dir: Path to results directory (default: Path("results"))
-    """
+    """Print per-round metric tables and save them as CSVs for multi-run comparison."""
     import csv
     from pathlib import Path
     
@@ -901,18 +819,15 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
         print("⚠️  No rounds completed.")
         return
     
-    # Get all client IDs
     all_client_ids = set()
     for log in server_log_data:
         if 'local_accuracies' in log:
             all_client_ids.update(log['local_accuracies'].keys())
         if 'aggregation' in log and 'similarities' in log['aggregation']:
-            # Infer client IDs from similarities count (if available)
             similarities = log['aggregation'].get('similarities', [])
             accepted = log['aggregation'].get('accepted_clients', [])
             all_client_ids.update(accepted)
     
-    # Also include from local_accuracies history
     if local_accuracies:
         all_client_ids.update(local_accuracies.keys())
     
@@ -942,7 +857,6 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
     print("2️⃣  COSINE SIMILARITY (Per Round, Per Client)")
     print("-" * 80)
     
-    # Prepare header
     header = "Round | "
     for cid in all_client_ids:
         client_type = "A" if cid in attacker_ids_set else "B"
@@ -957,20 +871,17 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
         similarities = aggregation.get('similarities', [])
         accepted = aggregation.get('accepted_clients', [])
         
-        # Create similarity map
         all_clients_round = sorted(set(accepted))
         sim_map = {}
         if len(similarities) == len(all_clients_round):
             for idx, cid in enumerate(all_clients_round):
                 sim_map[cid] = similarities[idx]
         
-        # Print row
         row = f"{round_num:<6} | "
         for cid in all_client_ids:
             sim = sim_map.get(cid, 0.0)
             row += f"{sim:<14.6f} | "
         
-        # Calculate mean and std for this round
         sim_values = [sim_map.get(cid, 0.0) for cid in all_client_ids if cid in sim_map]
         mean_sim = np.mean(sim_values) if sim_values else 0.0
         std_sim = np.std(sim_values) if len(sim_values) > 1 else 0.0
@@ -1029,7 +940,6 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
     print("3️⃣  LOCAL ACCURACY (Per Round, Per Client)")
     print("-" * 80)
     
-    # Prepare header
     header = "Round | "
     for cid in all_client_ids:
         client_type = "A" if cid in attacker_ids_set else "B"
@@ -1042,7 +952,6 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
         round_num = log['round']
         local_accs_round = log.get('local_accuracies', {})
         
-        # Print row
         row = f"{round_num:<6} | "
         acc_values = []
         for cid in all_client_ids:
@@ -1050,7 +959,6 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
             acc_values.append(acc)
             row += f"{acc:<14.6f} | "
         
-        # Calculate mean and std
         mean_acc = np.mean(acc_values) if acc_values else 0.0
         std_acc = np.std(acc_values) if len(acc_values) > 1 else 0.0
         row += f"{mean_acc:<6.6f} | {std_acc:.6f}"
@@ -1059,11 +967,6 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
     print("-" * 80)
 
     # ========== 4. Aggregate Averages (across ALL rounds) ==========
-    # Three headline numbers for cross-run comparison:
-    #   - global model Clean Accuracy averaged over all rounds
-    #   - benign clients' local accuracy averaged over (round × benign client) pairs
-    #   - attacker clients' local accuracy averaged over (round × attacker client) pairs
-    # The benign/attacker splits use per-round local_accuracies logged by the server.
     print("\n" + "-" * 80)
     print("4️⃣  AGGREGATE AVERAGES (across all rounds)")
     print("-" * 80)
@@ -1106,7 +1009,6 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
     print("💾 SAVING DATA TO CSV FILES FOR EASY COLLECTION")
     print("-" * 80)
     
-    # Save Global Accuracy
     csv_path1 = results_dir / f"{experiment_name}_global_accuracy.csv"
     with open(csv_path1, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -1117,11 +1019,9 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
             writer.writerow([r, f"{acc:.6f}", f"{acc_change:.6f}"])
     print(f"✅ Global Accuracy saved to: {csv_path1}")
     
-    # Save Cosine Similarity
     csv_path2 = results_dir / f"{experiment_name}_cosine_similarity.csv"
     with open(csv_path2, 'w', newline='') as f:
         writer = csv.writer(f)
-        # Header
         header = ['Round'] + [f"Client_{cid}_{'A' if cid in attacker_ids_set else 'B'}" 
                                            for cid in all_client_ids] + ['Mean', 'Std']
         writer.writerow(header)
@@ -1151,11 +1051,9 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
             writer.writerow(row)
     print(f"✅ Cosine Similarity saved to: {csv_path2}")
     
-    # Save Local Accuracy
     csv_path3 = results_dir / f"{experiment_name}_local_accuracy.csv"
     with open(csv_path3, 'w', newline='') as f:
         writer = csv.writer(f)
-        # Header
         header = ['Round'] + [f"Client_{cid}_{'A' if cid in attacker_ids_set else 'B'}" 
                              for cid in all_client_ids] + ['Mean', 'Std']
         writer.writerow(header)
@@ -1177,7 +1075,6 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
             writer.writerow(row)
     print(f"✅ Local Accuracy saved to: {csv_path3}")
 
-    # Save Aggregate Averages (the three headline numbers from section 4)
     csv_path4 = results_dir / f"{experiment_name}_aggregate_averages.csv"
     with open(csv_path4, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -1195,7 +1092,6 @@ def print_detailed_statistics(server_log_data, progressive_metrics, local_accura
     print("   You can now easily collect data from multiple runs and compare them.")
     print("=" * 80)
 
-# Simple analysis
 def analyze_results(metrics):
     print("\n" + "=" * 50)
     print("Experiment Summary")
@@ -1215,207 +1111,76 @@ def analyze_results(metrics):
         print(f"Accuracy Change: {clean[-1] - clean[0]:+.4f}")
 
 def main():
-    # The dict below is the SINGLE authoritative config source. There is no
-    # override path — not a `config_overrides` argument, not a notebook-side
-    # `COLAB_CONFIG_OVERRIDES`, not a `run_suite()` sweep helper (all removed
-    # 2026-08-07). A second place to set a knob means a run's real config can
-    # differ from what this file says, and the archived `config.json` is the
-    # only record of which one won. To change ANY parameter — including for an
-    # A/B arm — edit it here, run, and edit it back.
+    # SINGLE authoritative config source — no override path exists (config_overrides /
+    # COLAB_CONFIG_OVERRIDES / run_suite() were all removed 2026-08-07). To change ANY
+    # parameter, including an A/B arm: edit here, run, edit back. Every arm MUST get
+    # its own experiment_name — fed_resume's fingerprint ignores defense_config, so a
+    # reused name silently resumes the previous arm's checkpoint.
+    #
+    # CURRENT ARM (2026-08-07): V4-REMOVE ablation — v4_reject_mult 0.10 -> 0.0 (hard
+    # removal), everything else identical to the archived 20260729 Qwen AG News V4
+    # companion. Pre-registered expectation, success criteria, and the Yahoo
+    # prohibition: docs/DECISION.md "V4-remove".
     config = {
-        # ========== Experiment Configuration ==========
-        # === CURRENT RUN: V4-REMOVE ABLATION — HMP-GAE V4
-        # === (trust_mode='v4_cse_reject', v4_reject_mult=0.0) vs Hallucination
-        # === on AG News (non-IID 0.5, 4 classes), Qwen2.5-0.5B backbone,
-        # === 5 benign + 2 attackers (N=7), seed=42 ===
-        # Companion to the ARCHIVED V4 run 20260729-...-qwen-zihao(v4) (Qwen
-        # AG non-IID, seed 42). Exactly ONE axis moves vs that companion:
-        # v4_reject_mult 0.10 -> 0.0. Do NOT touch anything else — the
-        # v5_*/v6_* keys below are inert under v4 mode and must stay at their
-        # documented values so the comparison remains controlled.
-        # WHAT THIS ARM ASKS — the detect-then-remove paper story: a client
-        # flagged by the CSE rule (top-num_byzantine by ratio AND r > 1.85)
-        # is EXCLUDED from that round's aggregate outright instead of keeping
-        # a 0.10 multiplier. Removal is PER-ROUND — flags are re-evaluated
-        # every round and an unflagged round re-admits the client. Sticky /
-        # permanent blacklisting stays deferred (docs/DECISION.md); with the
-        # archived flag stability (97/100 attacker-rounds flagged, 0 benign)
-        # per-round removal is a near-permanent exclusion in practice anyway.
-        # PRE-REGISTERED EXPECTATION (2026-08-07, written BEFORE the run):
-        # V4 already leaves attackers only ~2.4% of aggregate weight, and
-        # ~half the mean-CSE mass accrues in R1-R10 before detection fires
-        # (R1-R2 carry ~17% alone and are untouched by ANY multiplier).
-        # Extrapolating the measured V6 dose-response, removing the residual
-        # mass can improve mean/final CSE by AT MOST ~0.005 — INSIDE the
-        # seed-noise band (median |Δmean CSE| 13.1% over the 6 archived seed
-        # pairs). So: a within-noise CSE delta must be reported as a TIE, not
-        # a win. PPL / ppl_class_std judged by the same discipline — observed
-        # same-cell seed-pair PPL deltas are +6%/+38%/+65%, so only a
-        # regression beyond that band is evidence of harm; the V6 run's +6.5%
-        # "regression" sat at the bottom of the band and taught us the old +2%
-        # criterion was miscalibrated. SUCCESS for the paper story = no metric
-        # regresses beyond seed noise: then remove (m=0) and soft (m=0.10)
-        # are interchangeable and the cleaner story costs nothing.
-        # ⚠ DO NOT run Yahoo with v4_reject_mult=0.0 without a new DECISION
-        # entry: the 2026-07-29 coverage mechanism (10-class Dirichlet-0.5;
-        # down-weighting 2/7 clients already pushed PPL past the attack
-        # floor at m=0.10) predicts hard removal makes Yahoo PPL strictly
-        # worse. This arm is Qwen AG News ONLY until that entry exists.
-        # ⚠ THIS RUN HAS ITS OWN 'experiment_name' ('-v4remove-' below).
-        # fed_resume's fingerprint covers experiment_name / N / rounds /
-        # attackers / model / defense_method / lora / seed / dataset — it does
-        # NOT look inside defense_config, so under a reused name a leftover
-        # V4/V5/V6 checkpoint would resume into this arm with no mismatch
-        # warning at all.
-        # v4_tau_ratio=1.85 stays PRE-REGISTERED — do not re-tune it here.
-        # NOTE: Qwen/Qwen2.5-0.5B is NOT gated — no HF login required; fits a
-        # T4 15GB (A100 not needed for this arm).
+        # ========== Experiment ==========
         'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v4remove-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
-        'seed': 42,  # Random seed — matches the archived V4/V5 companions (trust_mode is the only moving axis)
+        'seed': 42,
 
         # ========== Federated Learning Setup ==========
-        'num_clients': 7,    # Total clients: 5 benign + 2 attackers (canonical arm)
-        'num_attackers': 2,  # 2 attackers (C5, C6 — the last clients), per-round randomized label-flip
-        'num_rounds': 50,    # 50 × 1 local epoch = the paper regime (~3-4 h on T4).
-                             # Also gives the suspicion EMA (β=0.6, ~2-3 round lag)
-                             # a long steady state; 10-round runs are smoke tests.
+        'num_clients': 7,    # 5 benign + 2 attackers (canonical arm)
+        'num_attackers': 2,  # the LAST client ids are the attackers
+        'num_rounds': 50,    # paper regime; 10-round runs are smoke tests
 
         # ========== Training Hyperparameters ==========
-        'client_lr': 5e-5,   # Learning rate for local client training
-        'server_lr': 1.0,    # Server aggregation lr (fixed at 1.0 for standard FedAvg aggregation)
-        'batch_size': 32,    # Kept at 32 for comparability with all prior runs.  With
-                             # Llama-3.2-1B (fp32) this requires an A100; a T4 15GB cannot
-                             # hold the ~3 GPU-resident 5GB copies regardless of batch size.
-        'test_batch_size': 64,   # Inference uses less VRAM; 64 is safe
-        'local_epochs': 1,   # 1 epoch per round: 50 rounds × 1 epoch sufficient for LoRA convergence
-                             # and keeps total wall-clock time manageable (~3-4 h on T4)
-        'grad_clip_norm': 1.0,  # Qwen2.5 / Llama-3.2 are typically stable at 1.0; reduce to 0.5 if NaN
-        'alpha': 0.0,  # FedProx μ: 0 = standard FedAvg local step; >0 penalises local drift from global
+        'client_lr': 5e-5,
+        'server_lr': 1.0,
+        'batch_size': 32,        # fixed across all runs for comparability
+        'test_batch_size': 64,
+        'local_epochs': 1,
+        'grad_clip_norm': 1.0,   # reduce to 0.5 if NaN
+        'alpha': 0.0,            # FedProx μ; 0 = plain FedAvg local step
         
-        # ========== Dataset Configuration ==========
-        # Choose dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers' — set num_labels and max_length accordingly
-        # Dataset 1: AG News
-        'dataset': 'ag_news',  # news classification (4 classes)
-        'num_labels': 4,       # AG News: 4 | IMDB: 2 | DBpedia: 14 | Yahoo Answers: 10
-        'max_length': 128,     # AG News: 128 | IMDB: 512/256 | DBpedia: 512 | Yahoo Answers: 256
-                               # (128 also matches ALL prior cross-dataset runs' truncation envelope)
-        # -------------------------------------------
-        # Dataset 2: IMDB
-        # 'dataset': 'imdb',   # sentiment (2 classes)
-        # 'num_labels': 2,
-        # 'max_length': 512,
-        # -------------------------------------------
-        # Dataset 3: DBpedia (14 classes, 560K train / 70K test)
-        # 'dataset': 'dbpedia',   # topic classification (14 classes)
-        # 'num_labels': 14,
-        # 'max_length': 512,
-        # -------------------------------------------
-        # Dataset 4: Yahoo Answers (10 classes, 1.4M train / 60K test)
-        # 'dataset': 'yahoo_answers',   # topic classification (10 classes, yassiracharki/Yahoo_Answers_10_categories_for_NLP)
-        # 'num_labels': 10,       # Yahoo Answers: 10 classes
-        # 'max_length': 128,      # Yahoo kept at 128 for consistency with ALL prior runs
-                                # (same truncation / wall-clock / memory envelope; README's
-                                # 256 recommendation is a separate ablation, not part of the
-                                # cross-dataset comparison).
+        # ========== Dataset ==========
+        # Set 'dataset' / 'num_labels' / 'max_length' together:
+        #   ag_news 4/128 | imdb 2/512 | dbpedia 14/512 | yahoo_answers 10/128
+        # (Yahoo stays at 128 for cross-run comparability; 256 is a separate ablation.)
+        'dataset': 'ag_news',
+        'num_labels': 4,
+        'max_length': 128,
         
         # ========== Data Distribution ==========
-        # Current regime: non-IID Dirichlet(0.5) — the setting the robust trust
-        # stack is designed for (median semantic reference tolerates legitimate
-        # benign heterogeneity; see defense_config below).  Switch to 'iid' to
-        # reproduce the earlier IID runs.
-        'data_distribution': 'non-iid',  # 'iid' uniform, 'non-iid' Dirichlet-heterogeneous
-        'dirichlet_alpha': 0.5,          # Only used when data_distribution='non-iid'. Lower = more heterogeneous.
-        # 'dataset_size_limit': None,  # Full dataset: AG News ~120K; IMDB 25K; DBpedia 560K; Yahoo Answers 1.4M
-        'dataset_size_limit': 10000,  # 10K train → ~1428 samples/client on average (7 clients;
-                                      # per-client sizes vary under Dirichlet); test ≤ 1500.
-                                      # Held fixed across ALL datasets for cross-dataset comparability
-                                      # (every loader subsamples with the same seeded rng(42))
+        'data_distribution': 'non-iid',  # 'iid' | 'non-iid' (Dirichlet)
+        'dirichlet_alpha': 0.5,          # lower = more heterogeneous
+        'dataset_size_limit': 10000,     # held fixed across datasets for comparability; None = full
 
-        # ========== Training Mode Configuration ==========
-        'use_lora': True,  # True for LoRA fine-tuning, False for full fine-tuning
-        # LoRA parameters (only used when use_lora=True)
-        # NOTE: Lower r values = faster training but potentially less capacity
-        # Recommended: r=8 for speed, r=16 for better performance (default)
-        'lora_r': 8,  # LoRA rank (controls the rank of low-rank matrices). r=8 for speed, r=16/32 for better capacity
-        'lora_alpha': 16,  # LoRA alpha (scaling factor, typically 2*r). Must match r: alpha=2*r
-        'lora_dropout': 0.1,  # LoRA dropout rate
-        'lora_target_modules': None,  # None = use default for DistilBERT (["q_lin", "k_lin", "v_lin", "out_lin"])
-        
-        # Model configuration
-        # Supported models:
-        # Encoder-only (BERT-style): 'distilbert-base-uncased', 'bert-base-uncased', 'roberta-base', 'microsoft/deberta-v3-base'
-        # 'model_name': 'distilbert-base-uncased',  # distilbert 67M
-        # # -------------------------------------------
-        # Decoder-only (GPT-style): 'gpt2', 'EleutherAI/pythia-160m', 'EleutherAI/pythia-1b', 'facebook/opt-125m', 'Qwen/Qwen2.5-0.5B'
-        # 'model_name': 'gpt2',                      # GPT-2 124M — stable decoder baseline
-        # 'model_name': 'EleutherAI/pythia-160m',    # Pythia-160M (may need grad_clip_norm=0.5)
-        # 'model_name': 'facebook/opt-125m',         # OPT-125M (Meta)
-        'model_name': 'Qwen/Qwen2.5-0.5B',         # Qwen2.5-0.5B ~494M (Alibaba, LLaMA-style arch, Apache 2.0) — use BASE for fine-tuning.
-                                                   # NOT gated; fits a T4 15GB comfortably.  Backbone of the
-                                                   # AG News results-table rows and the archived Qwen Yahoo
-                                                   # non-IID V3 baseline (the Qwen V4 confirmatory arm).
-        # 'model_name': 'meta-llama/Llama-3.2-1B',  # Llama-3.2-1B ~1.24B (Meta) — BASE, not Instruct.
-                                                  # GATED repo: accept the Llama 3.2 license on HF and provide
-                                                  # HF_TOKEN (Colab Step 2 logs in automatically).
-                                                  # LoRA targets auto-resolve via the "llama" branch in models.py
-                                                  # (q/k/v/o_proj, same as Qwen2); PPL eval uses LlamaAdapter in
-                                                  # decoder_adapters.py.  fp32 footprint ~5GB/copy: fine on A100
-                                                  # (peak ~3 GPU-resident copies ≈ 15GB), does NOT fit a T4 15GB.
-        # num_labels and max_length: set above in Dataset Configuration based on chosen dataset
+        # ========== Model & LoRA ==========
+        'use_lora': True,
+        'lora_r': 8,
+        'lora_alpha': 16,             # keep at 2*r
+        'lora_dropout': 0.1,
+        'lora_target_modules': None,  # None = auto-resolve per backbone in models.py
+                                      # (Qwen/Llama → q/k/v/o_proj; DistilBERT → *_lin)
+        # Backbones: 'distilbert-base-uncased' | 'gpt2' | 'EleutherAI/pythia-160m' |
+        # 'facebook/opt-125m' | 'Qwen/Qwen2.5-0.5B' (ungated, fits T4 15GB) |
+        # 'meta-llama/Llama-3.2-1B' (GATED: HF license + HF_TOKEN; fp32 needs A100).
+        'model_name': 'Qwen/Qwen2.5-0.5B',
         
 
-        # ========== Attack Configuration ==========
-        # Supported: 'NoAttack' | 'Hallucination' (this paper) | 'SignFlipping' | 'Gaussian' | 'ALIE'
-        # Current value is 'Hallucination' (paired with num_attackers=2, the
-        # canonical 5-benign+2-attacker arm): the proposed per-round randomized
-        # label-flipping attack. Switch to 'NoAttack' (with num_attackers=0)
-        # for the clean ceiling, or to one of the classical-baseline strings
-        # for V2 comparison runs.
+        # ========== Attack ==========
+        # 'NoAttack' | 'Hallucination' (this paper) | 'SignFlipping' | 'Gaussian' | 'ALIE' | 'AugMP'
         'attack_method': 'Hallucination',
-        'attack_start_round': None,  # None = attack active from round 0 (default)
+        'attack_start_round': None,  # None = active from round 0
 
-        # ---- Hallucination (label-flipping, this paper's attacker) ----
-        # Matches the paper's stealth threat model: ||omega_a - omega'_a|| <= eps is
-        # satisfied naturally because the attacker performs standard FedProx local
-        # training, only against label-flipped data.
-        #
-        # The defaults below run the "per-round randomized" variant: each round the
-        # attacker resamples (a) which subset of its samples gets flipped and
-        # (b) the random target class for each, plus (c) the flip_ratio itself is
-        # drawn from hallu_flip_ratio_range.  This produces non-stationary attack
-        # gradients, so attacker CSE / local_acc oscillate across rounds instead of
-        # smoothly converging.  Set hallu_per_round_reseed=False to recover the
-        # original frozen-100%-flip behaviour from the earlier experiments.
-        #
-        # ======================================================================
-        # [ATTACK-STRENGTH BASELINE — snapshot 2026-07-06]
-        # Canonical DEFAULT strength (all results before 2026-07-06 used this;
-        # do not change except on explicit request):
-        #   num_attackers          = 2 of 7 clients (~28.6% malicious)
-        #   hallu_flip_mode        = 'random'
-        #   hallu_per_round_reseed = True            (non-stationary flips)
-        #   hallu_flip_ratio_range = [0.3, 0.8]      (mean effective flip ~0.55)
-        #   hallu_flip_ratio       = 0.5             (inert while ratio_range set)
-        # CURRENTLY at DEFAULT strength [0.3, 0.8] (restored 2026-07-07).
-        # Escalation ladder if the attack proves too weak:
-        #   1) hallu_flip_ratio_range -> [0.6, 1.0]  (HIGH-strength arm)
-        #   2) hallu_flip_ratio_range -> [0.8, 1.0]  (near-frozen full flip)
-        #   3) num_attackers -> 3 (3/7 ≈ 43% malicious; keep N=7)
-        # ======================================================================
-        'hallu_flip_ratio': 0.5,                   # used only when hallu_flip_ratio_range is None
-        'hallu_flip_mode': 'random',               # 'pairwise' | 'targeted' | 'random'
-        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2},
-                                                   # only consumed in flip_mode='pairwise' (inert in
-                                                   # the active 'random' mode). Adjacent-pair bijection
-                                                   # sized for the ACTIVE dataset's num_labels
-                                                   # (4 = AG News); expand to {0:1,1:0,...,8:9,9:8}
-                                                   # for Yahoo Answers (10 classes).
-        'hallu_target_class': None,                # only for flip_mode='targeted'
+        # Hallucination (label-flipping). Canonical strength — do not change without
+        # explicit request: mode 'random', per-round reseed, flip_ratio ~ U[0.3, 0.8].
+        # Escalation ladder if too weak: range [0.6,1.0] → [0.8,1.0] → num_attackers=3.
+        'hallu_flip_ratio': 0.5,                     # used only when ratio_range is None
+        'hallu_flip_mode': 'random',                 # 'pairwise' | 'targeted' | 'random'
+        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2},  # 'pairwise' mode only; size to num_labels
+        'hallu_target_class': None,                  # 'targeted' mode only
         'hallu_attack_start_round': 0,
-        'hallu_per_round_reseed': True,            # re-sample flipped-label set each round
-        'hallu_flip_ratio_range': [0.3, 0.8],      # DEFAULT strength (mean effective flip ~0.55).
-                                                   # Per-round flip_ratio sampled uniformly here
-                                                   # (None -> scalar hallu_flip_ratio)
+        'hallu_per_round_reseed': True,              # False = legacy frozen-flip behaviour
+        'hallu_flip_ratio_range': [0.3, 0.8],        # None → scalar hallu_flip_ratio
 
         # ---- Classical Byzantine baselines (kept for V2 comparison) ----
         'sign_flip_scale': 10.0,                 # ICML '18: malicious = -scale * g_own
@@ -1425,443 +1190,152 @@ def main():
         'alie_z_max': None,                      # NeurIPS '19: None = auto by (num_clients, num_attackers)
         'alie_attack_start_round': None,
 
-        # ---- AugMP (learned VGAE+GSP stealth model manipulation; attack_method='AugMP') ----
-        # Only consumed when attack_method='AugMP' (attack/augmp.py). The attacker
-        # performs NO local training; it CONSTRUCTS its update from the received
-        # benign updates via VGAE + GSP + a Lagrangian constrained proxy optimisation
-        # that MAXIMISES the global-loss proxy F(w'_g) subject to distance + two-sided
-        # cosine-similarity constraints (mimics benign updates -> evades geometric
-        # robust-aggregation defenses like krum / median / fltrust). This is the
-        # strong, stealthy baseline for showing HMP-GAE's semantic signal catches
-        # geometry-evading attacks the baselines miss.
-        #
-        # COMPUTE: the proxy loop is the bottleneck (each step = one full LLM
-        # forward+backward). proxy_steps was cut 200 -> 30 (+ early stop) for ~2.2x
-        # faster runs; calibrate with a cheap `fedavg + AugMP` run first and raise to
-        # 50 only if attack damage collapses.
-        'dim_reduction_size': 1000,      # magnitude-ranked param subset for the VGAE graph (auto-clamped to LoRA numel)
-        'vgae_epochs': 20,               # VGAE training epochs (small graph -> cheap; NOT the bottleneck)
+        # ---- AugMP (learned VGAE+GSP stealth manipulation) ----
+        # Consumed only when attack_method='AugMP'; mechanics in attack/augmp.py.
+        # proxy_steps is the compute bottleneck; None bounds = auto from benign updates.
+        'dim_reduction_size': 1000,
+        'vgae_epochs': 20,
         'vgae_lr': 0.01,
         'vgae_hidden_dim': 32,
         'vgae_latent_dim': 16,
         'vgae_dropout': 0.0,
         'vgae_kl_weight': 0.1,
-        'graph_threshold': 0.5,          # cosine-sim threshold for the benign-update adjacency matrix
-        'proxy_step': 0.001,             # Adam lr for the proxy-parameter ascent
-        'proxy_steps': 30,               # BOTTLENECK: proxy optimisation steps/round/attacker (200 -> 30)
-        'early_stop_constraint_stability_steps': 2,  # stop after N consecutive constraint-satisfying steps
-        'attacker_use_proxy_data': True, # omniscient: estimate F(w'_g) on an INDEPENDENT clean proxy set
-                                         # (data_loader.get_proxy_eval_loader draws from TRAIN, disjoint from
-                                         # test -- no eval leakage). False = constraint-only (no data access).
-        'proxy_sample_size': 128,        # size of that clean proxy set
-        'proxy_max_batches_opt': 1,      # proxy batches per optimisation step
-        'proxy_max_batches_eval': 1,     # proxy batches for the final evaluation
+        'graph_threshold': 0.5,
+        'proxy_step': 0.001,
+        'proxy_steps': 30,
+        'early_stop_constraint_stability_steps': 2,
+        'attacker_use_proxy_data': True,
+        'proxy_sample_size': 128,
+        'proxy_max_batches_opt': 1,
+        'proxy_max_batches_eval': 1,
         'attacker_proxy_grad_clip_norm': 1.0,
-        'dist_bound': None,              # constraint (4b) distance bound; None = auto from benign-update max
-        'sim_bound_low': None,           # cosine lower bound; None = benign min
-        'sim_bound_up': None,            # cosine upper bound; None = benign mean
-        'use_lagrangian_dual': True,     # constrained-optimisation mechanism (the stealth machinery)
+        'dist_bound': None,
+        'sim_bound_low': None,
+        'sim_bound_up': None,
+        'use_lagrangian_dual': True,
         'use_cosine_similarity_constraint': True,
         'use_augmented_lagrangian': True,
         'lambda_dist_init': 0.1,
         'lambda_sim_low_init': 0.1,
         'lambda_sim_up_init': 0.1,
 
-        # ========== Defense Configuration ==========
-        # defense_method selects the server-side aggregation rule.
-        #   'fedavg'    — standard data-size-weighted FedAvg (no-defense baseline)
-        #   'hmp_gae'   — HMP-GAE immunization (this paper, requires hmp_gae/ subpackage)
-        #   'foolsgold' — FoolsGold (RAID '20), baseline defense
-        #   'fltrust'   — FLTrust (NDSS '21), baseline defense
-        # Current value is 'hmp_gae' (this paper, the canonical defended arm):
-        # the full defense_config block below is live.  server.py gates the
-        # per-round semantic probe forward on defense_method=='hmp_gae' AND
-        # semantic_weight>0.  The foolsgold/fltrust/krum keys below are INERT
-        # under hmp_gae (krum's num_byzantine is REUSED by the V4 rule as its
-        # rank cap — see the V4 block below).
+        # ========== Defense ==========
+        # 'fedavg' | 'hmp_gae' (this paper) | 'foolsgold' | 'fltrust'
         'defense_method': 'hmp_gae',
         'defense_config': {
+            # Baseline-defense knobs — inert under hmp_gae, EXCEPT num_byzantine:
+            # the V4+ CSE-reject family reuses it as its rank cap (must be < N/2).
+            'epsilon': 1e-6,       # foolsgold
+            'anchor': 'median',    # fltrust
+            'num_byzantine': 2,    # krum/multi-krum; ALSO the V4+ rank cap
 
-            # config for foolsgold
-            'epsilon': 1e-6,
-
-            # config for fltrust
-            'anchor': 'median',
-
-            # config for krum & multi-krum
-            'num_byzantine': 2,
-
-            # --- Node features (eta_i) ---
-            'proj_dim': 64,              # random-projection dim for flat update
-            'eta_dim': 64,               # output dim of f_enc MLP
-            'random_proj_seed': 42,      # shared across rounds
-            # --- Hypergraph (H) ---
-            'knn_k': 2,                  # k-NN neighbors; hyperedge size = k+1.
-                                         # k=2 for N=7: larger k forces benign nodes to include
-                                         # attackers in their hyperedges, diluting the isolation
-                                         # signal. k=2 keeps the 2-attacker sub-cluster tighter
-                                         # and the graph_residual contrast sharper.
-            # --- HMP encoder / decoder ---
+            # HMP-GAE geometry (symbols match hmp_gae/*.py and MATH_LOGIC.md)
+            'proj_dim': 64,
+            'eta_dim': 64,
+            'random_proj_seed': 42,
+            'knn_k': 2,                  # k=2 keeps the isolation contrast sharp at N=7
             'hidden_dim': 64,
             'latent_dim': 32,
-            'num_hmp_layers': 2,         # L
-            # --- Self-supervised training (per round) ---
+            'num_hmp_layers': 2,
             'train_steps_per_round': 5,
             'train_lr': 1e-3,
-            'lambda_H': 1.0,             # BCE(H, H_hat) weight
-            'lambda_A': 1.0,             # smoothness: sum A_hat_ij ||z_i - z_j||^2
-            'lambda_hist': 0.5,          # ||z_i - z_hist_i||^2 weight
+            'lambda_H': 1.0,
+            'lambda_A': 1.0,
+            'lambda_hist': 0.5,
             'weight_decay': 1e-5,
-            # --- Trust scoring ---
-            # Primary signal: graph-structural residual from hypergraph H
-            # (robust at cold start; attackers form tight sub-cluster with
-            # low hyperedge reach into the benign majority).
-            'graph_weight': 1.0,
-            # Secondary signal: learned A_hat residual (kicks in as encoder trains).
-            'residual_weight_alpha': 0.3,
-            # Tertiary signal: per-sample semantic divergence on a fixed probe
-            # subset (Signal 3 in trust_scorer). Off (=0.0) reproduces the
-            # original geometry-only HMP-GAE; >0 enables the output-behavior
-            # signal that catches geometrically-stealthy hallucination attackers.
-            # When >0, the server forwards each client's softmax over a fixed
-            # probe set into the runtime; otherwise no probe forward is done.
-            'semantic_weight': 1.0,
-            # Semantic-divergence reference distribution:
-            #   'pairwise' — legacy peer-consensus KL.  Under non-IID,
-            #       legitimately heterogeneous benign clients diverge from
-            #       peers and get penalized, and every benign score is
-            #       inflated by its distance to the attackers (contrast
-            #       compression).
-            #   'median'   — per-sample median consensus (recommended).
-            #       Attackers are a minority so they cannot move the median:
-            #       a benign score reduces to its own heterogeneity bias
-            #       while an attacker score measures systematic wrongness.
-            'semantic_reference': 'median',
-            # Weight each probe sample's divergence by the client's own max
-            # softmax prob ("confidently wrong" counts in full,
-            # "unconfidently different" — the typical non-IID benign — is
-            # discounted).  Off pending ablation.
+            # Trust-signal fusion (trust_scorer.py)
+            'graph_weight': 1.0,             # hypergraph isolation residual
+            'residual_weight_alpha': 0.3,    # learned A_hat residual
+            'semantic_weight': 1.0,          # >0 triggers the per-round probe forward
+                                             # AND auto-promotes gate_signal to 'combined'
+            'semantic_reference': 'median',  # 'pairwise' = legacy peer-consensus KL
             'semantic_confidence_weight': False,
-            # Class-stratified probe sampling (seeded by config['seed']).
-            # Labels are used ONLY to balance the probe set, never in the
-            # scoring, so the semantic signal stays label-free.  False =
-            # legacy head-of-test_loader snapshot (can be class-skewed).
-            'semantic_probe_stratified': True,
-            # Historical deviation disabled by default: benign clients learning
-            # real features drift more than attackers stuck on a fixed mislabel
-            # manifold, which can invert the signal. Re-enable with care.
-            'hist_weight_beta': 0.0,
-            # Round-dependent phase gating for hist signal.
-            # None  = always on (backward compatible; matches Y2/Y5 behavior).
-            # int N = enable hist for round_num < N (0-indexed), then beta_eff=0.
-            #
-            # Y5 (β=0.3, no gating) showed hist_dev signal direction is correct
-            # in R1-R11 (Phase 1, warmup, 100% atk>bgn) but inverts in R26+
-            # (Phase 3, steady state, only 28% atk>bgn). Setting
-            # hist_warmup_rounds=10 should capture the good Phase 1 signal
-            # without the Phase 3 inversion penalty.
-            'hist_warmup_rounds': None,
-            'softmax_tau': 0.1,          # only used when trust_mode='softmax'
-            # gate_signal: which suspicion signal feeds the rejection gate.
-            #   'graph'    -> graph_residual_z only (ignores recon/sem/hist).
-            #   'combined' -> z-score(-trust.s); folds in ALL enabled signals.
-            # Set explicitly so hist_weight_beta is guaranteed to drive the gate.
-            # (runtime.py only auto-promotes to 'combined' when semantic_weight>0,
-            #  so a future ablation with semantic_weight=0 + hist_weight_beta>0
-            #  would silently fall back to graph-only without this line.)
-            'gate_signal': 'combined',
-            # Trust-to-weight mapping:
-            #   'soft_reject_fedavg' (default): sigmoid gate on the gate_signal,
-            #       then data-size FedAvg among continuously-trusted clients.
-            #       Robust to threshold miscalibration; works for any N.
-            #   'reject_then_fedavg': hard binary rejection (gate_signal > threshold),
-            #       then FedAvg.  Calibrated for 8B/2A; fragile on other configs.
-            #   'softmax': pure softmax of trust logits (concentrates on 1-2 clients).
-            #   'v4_cse_reject' (V4, 2026-07-28): rejection driven by the
-            #       ABSOLUTE per-client full-test CSE, pool-median normalised
-            #       and rank-capped (trust_scorer.v4_cse_reject_weights):
-            #         r_i = local_cse_i / median(local_cse);
-            #         flag the top-num_byzantine clients by r with r >
-            #         v4_tau_ratio; flagged weight ×= v4_reject_mult;
-            #         final = normalize(mult × n_k).
-            #       The four geometry channels stay computed + logged as
-            #       diagnostics. The server then evaluates per-client local
-            #       CSE BEFORE aggregation every round (identical values to
-            #       the legacy post-aggregation eval — client models are
-            #       untouched by aggregation — so no extra eval cost at
-            #       eval_local_every_n_rounds=1). Requires num_byzantine < N/2
-            #       (validated at runtime construction). NOT supported with
-            #       update-forging attackers (AugMP).
-            #   'v5_cse_reject' (V5, 2026-08-06): V4's flag decision
-            #       byte-identical, but the flagged-client multiplier is a
-            #       linear ramp in the CSE ratio (trust_scorer.
-            #       v5_cse_reject_weights): ~1.0 just past tau (ambiguous
-            #       evidence, e.g. a borderline false positive), v5_m_floor
-            #       at ratio >= v5_r_hard (clear evidence). Same local-CSE
-            #       requirement / eval timing / AugMP incompatibility as V4.
-            #   'v6_cse_reject_geo' (V6, 2026-08-07): V5's flag decision AND
-            #       V5's CSE ramp, both byte-identical, times a ONE-SIDED
-            #       read-out of the HMP-GAE geometry gate on flagged clients
-            #       (trust_scorer.v6_cse_reject_geo_weights):
-            #         m = m_cse × (v6_geo_floor + (1-v6_geo_floor) × gate)
-            #       with gate = sigmoid(-soft_reject_k × (sus - threshold)),
-            #       the same gate V3's 'soft_reject_fedavg' uses. The factor
-            #       lies in [v6_geo_floor, 1], so V6's weight for a flagged
-            #       client is ALWAYS <= V5's — the geometry may tighten a
-            #       penalty, never loosen one, and CSE cannot regress by
-            #       construction. Unflagged clients keep exactly 1.0 (not the
-            #       gate), so a clean federation still aggregates at exactly
-            #       n_k/Σn — the "no scapegoat" property V3 could not hold.
-            #       Same local-CSE requirement / eval timing / AugMP
-            #       incompatibility as V4.
-            #   'v7_cse_reject_corrob' (V7, 2026-08-08): V6 byte-identical,
-            #       plus a Tier-2 iso-corroborated flag inside the CSE
-            #       cold-start window only (see the v7_* knob block below;
-            #       trust_scorer.v7_cse_reject_corrob_weights). ⚠ DO NOT run
-            #       this mode before the replay calibration
-            #       (replay_v7_calibration.py) passes — the v7_* constants
-            #       below are provisional (docs/DECISION.md "V7").
-            # CURRENT RUN: 'v4_cse_reject' with v4_reject_mult=0.0 below — the
-            # V4-REMOVE ablation. The ONE aggregation-behavior axis moved vs
-            # the archived Qwen AG News V4 companion (20260729) is that
-            # multiplier, 0.10 -> 0.0. Restore 0.10 to reproduce the
-            # companion; 'v5_cse_reject' / 'v6_cse_reject_geo' reproduce the
-            # later arms, 'soft_reject_fedavg' is V3.
+            'semantic_probe_stratified': True,   # labels only balance the probe, never score
+            'hist_weight_beta': 0.0,         # off: benign drift > attacker drift inverts it
+            'hist_warmup_rounds': None,      # int N = hist active only for rounds < N
+            'softmax_tau': 0.1,              # trust_mode='softmax' only
+            'gate_signal': 'combined',       # set explicitly (see AGENTS.md auto-promotion pitfall)
+            # trust_mode — trust-to-weight mapping. Mechanics: trust_scorer.py;
+            # design history + pre-registered constants: AGENTS.md and docs/DECISION.md.
+            #   'soft_reject_fedavg'   V3: sigmoid gate, then data-size FedAvg
+            #   'reject_then_fedavg'   legacy hard binary rejection
+            #   'softmax'              pure softmax of trust logits
+            #   'v4_cse_reject'        V4: CSE-ratio flag → constant multiplier
+            #   'v5_cse_reject'        V5: V4 flag + linear CSE ramp
+            #   'v6_cse_reject_geo'    V6: V5 × one-sided geometry factor (flagged only)
+            #   'v7_cse_reject_corrob' V7: V6 + Tier-2 corroborated flag in cold window
+            #                          (⚠ do NOT run before replay_v7_calibration.py passes)
+            # V4+ modes require per-round local CSE (server enforces, loud crash if
+            # missing) and are NOT compatible with update-forging attackers (AugMP).
             'trust_mode': 'v4_cse_reject',
-            # --- V4 CSE rejection knobs (INERT unless trust_mode='v4_cse_reject') ---
-            # v4_tau_ratio: pre-registered 1.85 (zero-FP plateau [1.785, 1.90]
-            #   over 51 archived runs / 17,850 client-round decisions,
-            #   including all 5 no-attacker baselines). Do NOT re-tune after
-            #   seeing a confirmatory run. Headroom is thin (max clean-run
-            #   ratio observed 1.7833) and Qwen-only — a Llama no-attack
-            #   baseline (validation plan Run 0) is the missing check.
-            # v4_reject_mult: rejection multiplier. THIS RUN: 0.0 — HARD
-            #   REMOVAL (pre-registered ablation arm, docs/DECISION.md
-            #   "V4-remove", 2026-08-07): a flagged client is excluded from
-            #   that round's aggregate outright. The default and the archived
-            #   companion's value is 0.10 (soft); 0.0 as a DEFAULT stays
-            #   rejected (FoolsGold's mechanism: worst archive PPL 1549 on
-            #   Qwen Yahoo). RESTORE 0.10 after this arm. Sweep set
-            #   {0.10, 0.05, 0.02, 0.0}.
-            # The rank cap REUSES 'num_byzantine' above (no new key); keep_min
-            #   below also applies.
+            # V4 knobs — both PRE-REGISTERED, do not re-tune (calibration: DECISION.md "V4").
             'v4_tau_ratio': 1.85,
-            'v4_reject_mult': 0.0,
-            # --- V5 graded-rejection knobs (INERT unless trust_mode='v5_cse_reject') ---
-            # V5 keeps V4's flag rule (top-num_byzantine AND ratio > v4_tau_ratio,
-            # byte-identical) and grades only the penalty of flagged clients:
-            #   t    = clamp((r - tau) / (v5_r_hard - tau), 0, 1)
-            #   mult = v5_m_floor + (1 - v5_m_floor) * (1 - t)
-            # v5_m_floor: plays v4_reject_mult's role at r >= v5_r_hard; same
-            #   rules (never 0.0 — hard zeroing rejected; the pre-authorized
-            #   sweep knob {0.05, 0.02}, which under V5 deepens the penalty
-            #   ONLY for clearly-guilty high-ratio attackers).
-            # v5_r_hard: PRE-REGISTERED 2.5 (2026-08-06), calibrated from the
-            #   archived V4 runs' steady-state (rounds>5) attacker ratio
-            #   minima — 2.38/2.43 Llama-Yahoo, 3.72 Llama-AG, 4.09 Qwen-AG,
-            #   2.02 Qwen-Yahoo(s42) — so steady-state attackers saturate to
-            #   m_floor (≈V4 behavior, CSE risk bounded by construction)
-            #   while a borderline flag near tau keeps most of its weight
-            #   (false-positive cost containment: archived benign max ratios
-            #   reach 1.89-2.73 in the AG cells, above tau, shielded only by
-            #   the rank cap). Do NOT re-tune after a confirmatory run.
+            'v4_reject_mult': 0.0,   # THIS ARM: hard removal (DECISION.md "V4-remove").
+                                     # Default/companion value 0.10 — RESTORE after this arm.
+            # V5 knobs — v5_r_hard PRE-REGISTERED 2026-08-06; m_floor never 0.0.
             'v5_m_floor': 0.10,
             'v5_r_hard': 2.5,
-            # --- V6 geometry-conjunction knob (INERT unless trust_mode='v6_cse_reject_geo') ---
-            # V6 keeps V5's flag rule AND V5's ramp (it reuses v5_m_floor /
-            # v5_r_hard above verbatim) and multiplies the flagged-client
-            # multiplier by a one-sided geometry factor:
-            #   geo  = v6_geo_floor + (1 - v6_geo_floor) * gate
-            #   mult = m_cse * geo          (flagged only; unflagged stay 1.0)
-            # v6_geo_floor: PRE-REGISTERED 0.5 (2026-08-07, before any V6 run).
-            #   Range is (0, 1]; 1.0 is legal and disables the geometry term,
-            #   reproducing V5 element-for-element — that is Run 0, the wiring
-            #   regression guard, and it must be run BEFORE this value.
-            #   0.5 says: a client the geometry considers maximally suspicious
-            #   keeps HALF the weight V5 would have left it; a client the
-            #   geometry considers benign keeps all of it. The floor is 0.5
-            #   rather than something aggressive because offline replay of the
-            #   archived runs shows the gate averages 0.766 on CONFIRMED
-            #   attackers in the Qwen AG cell — the geometry is unreliable
-            #   enough that it gets to tighten the penalty, never to set it.
-            #   Do NOT re-tune after seeing results; if v6_geo_mult logs at
-            #   ≈1.0 every round, report "geometry did not act".
+            # V6 knob — PRE-REGISTERED 2026-08-07; 1.0 disables geometry (= V5-identical
+            # wiring-regression arm).
             'v6_geo_floor': 0.5,
-            # --- V7 cold-window corroboration knobs (INERT unless trust_mode='v7_cse_reject_corrob') ---
-            # V7 = V6 byte-identical (Stage A: flags, ramp, geo factor) PLUS a
-            # Tier-2 "corroborated" flag armed ONLY inside the CSE cold-start
-            # window (78% of V4's replay false negatives are rounds <= 5;
-            # R1-R10 accrue ~half of mean-CSE mass):
-            #   Tier 2 (round v7_round_min..v7_round_max, 1-indexed):
-            #     budget = num_byzantine - |CSE flags|      (shared rank cap;
-            #                        CSE flags always take precedence)
-            #     flag i if  r_i > v7_tau_lo  AND  iso_i >= v7_iso_min
-            #                (iso = RAW graph_residual — never the z-scored
-            #                 gate; abstains when graph_min_distinct gates
-            #                 the channel)
-            #     mult   = v7_corrob_mult    (constant; unflagged stay 1.0)
-            # MECHANISM, honestly stated: an iso-corroborated THRESHOLD
-            # DISCOUNT. The hypergraph never flags alone and never detects in
-            # R1-R2 (attacker ratio ~1 there fails tau_lo); what it buys is
-            # safety for a sub-1.85 threshold — clean-run benign ratios reach
-            # 1.7833, so tau_lo=1.40 alone would false-flag; the iso conjunct
-            # is what makes it zero-FP (that premise is a replay PASS
-            # criterion, not an assumption).
-            # ⚠ ALL FOUR KNOBS ARE PROVISIONAL (2026-08-08) — no V7 training
-            # run may launch until replay_v7_calibration.py over the archived
-            # runs confirms a zero-FP plateau and picks the constants from the
-            # pre-committed grids (docs/DECISION.md "V7"): tau_lo in
-            # {1.30..1.80 step 0.05}, iso_min in {5/12, 7/12} (inter-level
-            # midpoints of the quantized channel — never ON a level),
-            # round_max in {5, 8, 10}. After that they are pre-registered.
-            # v7_round_max=0 disables the window = V6 bit-identical (the
-            # Run-0 wiring regression arm). v7_corrob_mult is (0,1), never 0
-            # (weaker evidence tier than a full CSE flag) and deliberately
-            # constant, not gate-modulated (archived attacker gate ~0.766
-            # would shrink a gate-modulated penalty into seed noise).
+            # V7 knobs — ⚠ ALL FOUR PROVISIONAL (2026-08-08): run replay_v7_calibration.py
+            # and pick from the pre-committed grids (DECISION.md "V7") before any V7 run.
+            # Window is 1-indexed; v7_round_max=0 = V6-identical wiring-regression arm.
             'v7_tau_lo': 1.40,
-            'v7_iso_min': 7.0 / 12.0,  # inter-level midpoint: only reach<=2 flags at N=7,knn_k=2
+            'v7_iso_min': 7.0 / 12.0,   # inter-level midpoint: only reach<=2 flags at N=7, knn_k=2
             'v7_corrob_mult': 0.5,
-            'v7_round_min': 3,      # R1-R2: no recall, noisiest signals
+            'v7_round_min': 3,
             'v7_round_max': 10,
-            # --- Robust suspicion scale (2026-07-04) ---
-            # zscore_mode 'mad': median/MAD z-scores.  mean/std gets polluted
-            #   as the attacker fraction grows (attackers drag the mean toward
-            #   themselves and inflate the std, shrinking their own z); the
-            #   median/MAD of the benign majority stays clean up to ~50%.
-            # zscore_clip: cap |z| so one extreme outlier cannot dominate the
-            #   weighted signal sum (mad-z explodes when the benign spread is
-            #   tiny).
-            # gate_rezscore False: gate on -s / ||w||₂ instead of re-z-scoring
-            #   -s.  The legacy double z-score forced every round onto a ±σ
-            #   scale, so even an all-benign round pushed its most extreme
-            #   client past the threshold — the "scapegoat tax" that shaved
-            #   benign weight (and accuracy) on every clean round.  With it
-            #   off, sus keeps an absolute scale and is divided by the L2
-            #   norm of the active signal weights, so the threshold lives in
-            #   per-signal robust-z units (invariant to weight rescaling and
-            #   signal on/off toggles) and is retuned to 2.5.
-            # sus_ema_beta 0.6: cross-round EMA of the suspicion score.
-            #   Benign clients rotate through the "most extreme this round"
-            #   seat, so their EMA reverts toward 0; attackers are suspicious
-            #   every round, so their EMA stays high.  Detection lag ≈ 2-3
-            #   rounds; 0.0 disables.
-            # Legacy behavior = {'zscore_mode': 'std', 'gate_rezscore': True,
-            #   'sus_ema_beta': 0.0, 'reject_z_threshold': 0.75,
-            #   'semantic_reference': 'pairwise',
-            #   'semantic_probe_stratified': False, 'graph_min_distinct': 0}
-            #   — override these seven keys to reproduce pre-2026-07 runs
-            #   bit-for-bit. (C1 2026-07-28 caveat: bit-for-bit holds because
-            #   the legacy set uses zscore_mode='std', where the relative
-            #   MAD-degeneracy guard is inert and std-z is self-bounded below
-            #   zscore_clip; zscore_mode='mad' runs are NOT bit-reproducible
-            #   across the C1 change — the old per-channel-clip/absolute-guard
-            #   behavior was the bug being fixed.)
+            # Robust suspicion scale (2026-07-04 rework + C1 hygiene 2026-07-28;
+            # rationale: docs/DECISION.md "C1"). Legacy pre-2026-07 reproduction =
+            # {'zscore_mode': 'std', 'gate_rezscore': True, 'sus_ema_beta': 0.0,
+            #  'reject_z_threshold': 0.75, 'semantic_reference': 'pairwise',
+            #  'semantic_probe_stratified': False, 'graph_min_distinct': 0}.
             'zscore_mode': 'mad',
-            # zscore_clip now bounds the FUSED score s (post-fusion, C1
-            # 2026-07-28), not each channel: per-channel clipping pinned a
-            # near-degenerate channel's attacker AND benign z at exactly ±10
-            # (an exact rank tie in 100% of saturated Yahoo rounds).
-            'zscore_clip': 10.0,
-            # C1 (2026-07-28): zero the graph channel (and drop its weight
-            # from the gate's weight_norm) in rounds where graph_residual
-            # resolves fewer than this many distinct values across clients.
-            # With knn_k=2 and N=7 it takes only 4-5 discrete levels
-            # (multiples of 1/6); its MAD was exactly 0 in 33-44 of 50 Yahoo
-            # rounds, silently falling back to std. Do NOT re-tune knn_k
-            # instead. 0 = off (legacy). Diagnostics-only under
-            # trust_mode='v4_cse_reject' / 'v5_cse_reject' (geometry does not
-            # drive rejection there) — but LIVE again under
-            # 'v6_cse_reject_geo', which reads the gate built from these
-            # channels. Same for the three gate knobs immediately below.
-            'graph_min_distinct': 4,
+            'zscore_clip': 10.0,         # bounds the FUSED score s (post-fusion since C1)
+            'graph_min_distinct': 4,     # zero the graph channel when it resolves < 4 values;
+                                         # diagnostics-only under V4/V5, LIVE under V6/V7
             'gate_rezscore': False,
-            'sus_ema_beta': 0.6,
-            'reject_z_threshold': 2.5,   # sigmoid midpoint, in per-signal robust-z
-                                         # units (suspicion = -s / ||w||₂); use 0.75
-                                         # when gate_rezscore=True — the two keys
-                                         # must be changed together.
-                                         # Under V6 this (with soft_reject_k) sets
-                                         # the geometry gate V6 multiplies in, so
-                                         # it is no longer inert: keep it at the
-                                         # V3-calibrated 2.5 so V6's gate is the
-                                         # SAME object the archived replay measured.
-            'soft_reject_k': 2.0,        # sigmoid steepness: 2=recommended, 3=near-binary
+            'sus_ema_beta': 0.6,         # cross-round suspicion EMA (~2-3 round lag)
+            'reject_z_threshold': 2.5,   # pair with gate_rezscore (use 0.75 when True).
+                                         # Under V6/V7 this shapes the geometry gate — keep 2.5.
+            'soft_reject_k': 2.0,
             'keep_min': 1,
-            # --- Cold start ---
-            # False (default): graph_residual works from round 0, no history needed.
-            # True: fall back to FedAvg on round 0 when no Z_hist exists yet.
             'cold_start_fallback': False,
-            # --- History (EMA) ---
             'hist_ema_beta': 0.9,
-            # --- Misc ---
-            'device': 'cpu',             # HMP-GAE runs on CPU (N is small)
+            'device': 'cpu',             # small N: CPU beats GPU round-trips
         },
-        # Probe-set size for the semantic-divergence signal (top-level key: the
-        # server owns the probe batches; defense_config.semantic_probe_stratified
-        # controls HOW they are sampled).  100 → 25 per class under stratified
-        # sampling on AG News's 4 classes (10/class on Yahoo's 10; the old
-        # default 64 left only 6-7).  Per-round cost is N clients × 100 short
-        # forwards — negligible.
+        # Semantic-probe size (server-owned; sampling mode = semantic_probe_stratified).
         'semantic_probe_size': 100,
 
-        # ========== Hallucination Evaluation (V2 M7) ==========
-        # CSE: Classification Semantic Entropy, computed every round on the
-        # SeqCLS softmax distribution (free -- shares the test-set forward pass
-        # with accuracy/loss). Always on.
-        #
-        # PPL: Perplexity on a balanced test subset computed by transferring
-        # the final LoRA-fine-tuned backbone into an AutoModelForCausalLM
-        # (see decoder_adapters.py). Runs once at end of FL, requires
-        # save_global_checkpoint=True.
-        'eval_classification_semantic_entropy': True,   # per round, essentially free
-        # Frequency of per-client local accuracy / CSE evaluation (Phase 5 of
-        # server.run_round). Default 1 = evaluate every round (current behaviour,
-        # gives the densest per-client diagnostic trace). Set to k>1 to evaluate
-        # only on round 0, the final round, and every k-th round in between --
-        # saves ~75% of local-eval time at k=5, at the cost of a coarser
-        # per-client curve. Global Clean Acc / CSE are unaffected (they ride
-        # the test-set forward done once per round on the global model).
-        'eval_local_every_n_rounds': 1,
-        'eval_perplexity': True,                         # end-of-FL, moderate cost
-        'ppl_num_samples': 200,                          # stratified across classes
+        # ========== Evaluation ==========
+        # CSE: every round, free (shares the test forward). PPL: once after FL via
+        # backbone → CausalLM transfer (decoder_adapters.py); needs the global checkpoint.
+        'eval_classification_semantic_entropy': True,
+        'eval_local_every_n_rounds': 1,   # k>1 = sparser per-client eval (V4+ modes force 1)
+        'eval_perplexity': True,
+        'ppl_num_samples': 200,
         'ppl_seed': 42,
-        'ppl_max_length': None,                          # None -> reuse config['max_length']
+        'ppl_max_length': None,           # None → config['max_length']
 
-        # ========== Global checkpoint (for downstream generation / transfer experiments) ==========
-        'save_global_checkpoint': True,  # True: save server.global_model after FL under results_dir/global_checkpoint_subdir
-        'global_checkpoint_subdir': 'global_checkpoint',  # Subfolder name under results/ (same run uses results_dir from setup)
-
-        # ========== Per-round checkpoint (Colab resilience) ==========
-        # After every round the FL loop atomically writes a compact snapshot
-        # (global flat params + server history + defense state + RNG) to
-        # results/<round_checkpoint_subdir>/checkpoint_last.pt.  On the next
-        # launch run_experiment looks for it and, if the run fingerprint
-        # matches, resumes from the next round — so a Colab disconnect costs
-        # at most the in-flight round.  Overhead is one torch.save of a few
-        # MB per round (LoRA-only), << 1% of a round's wall time.
-        # Set resume_from_checkpoint=False to force a fresh run; set
-        # save_round_checkpoint=False to disable the periodic save entirely.
+        # ========== Checkpoints ==========
+        'save_global_checkpoint': True,   # needed for PPL / downstream eval
+        'global_checkpoint_subdir': 'global_checkpoint',
+        # Per-round resume snapshot (Colab resilience; fingerprint guard: fed_resume.py)
         'save_round_checkpoint': True,
-        'resume_from_checkpoint': True,
+        'resume_from_checkpoint': True,   # False = force a fresh run
         'round_checkpoint_subdir': 'round_checkpoint',
-        # ========== Task 2: optional downstream causal generation (same run as FL) ==========
-        # V1 first experiment has PPL + CSE as hallucination metrics already; Task 2 generation is
-        # additional explanatory output. Keep off for a faster first run (saves ~2-3 min); switch
-        # to True if you want the per-probe JSONL explanations side-by-side.
-        'run_downstream_after_fl': False,  # True: subprocess run_downstream_generation.py after checkpoint save
-        'downstream_probes': None,  # e.g. Path to probe JSON; None skips Task 2 (no repo `data/` required)
-        'downstream_output': None,  # None -> results/<experiment_name>_downstream_gen.jsonl; else path (relative to results/ if not absolute)
-        'downstream_device': None,  # None -> cuda if available else cpu
-        # Extra CLI tokens for run_downstream_generation.py (SeqCLS classify + CausalLM explain)
+        # ========== Task 2: optional downstream generation after FL ==========
+        'run_downstream_after_fl': False,   # subprocess run_downstream_generation.py
+        'downstream_probes': None,          # probe JSON path; None skips Task 2
+        'downstream_output': None,          # None → results/<experiment_name>_downstream_gen.jsonl
+        'downstream_device': None,          # None → cuda if available else cpu
         'downstream_cli_args': [
             '--stable',
         ],
 
     }
 
-    # Run experiment (attack if num_attackers > 0 AND attack_method != 'NoAttack',
-    # otherwise baseline). 'NoAttack' overrides num_attackers (see setup_experiment).
     attack_method = config.get('attack_method', 'Hallucination')
     if config.get('num_attackers', 0) > 0 and attack_method != 'NoAttack':
         if attack_method == 'Hallucination':
