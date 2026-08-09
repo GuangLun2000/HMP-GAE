@@ -21,8 +21,7 @@
 #                            weights + Adam state + z_hist EMA; FedAvg: {})
 #   * rng                  : torch CPU / CUDA / numpy / python random states
 #   * fingerprint          : config fields that must match for resume to be
-#                            safe (experiment_name, num_clients, num_rounds,
-#                            model_name, defense_method, seed)
+#                            safe (including the complete defense_config)
 #
 # Why flat_params instead of full state_dict
 # ------------------------------------------
@@ -61,8 +60,9 @@ import torch
 CHECKPOINT_FILE = "checkpoint_last.pt"
 
 # Config fields that must match exactly between the saved checkpoint and the
-# currently-running config for resume to be safe.  If any of these differ we
-# refuse to resume (and the user starts fresh).
+# currently-running config for resume to be safe.  In particular, the complete
+# defense_config is included so switching V4/V5/V6/V7 cannot reuse an older
+# round checkpoint just because experiment_name was accidentally reused.
 _FINGERPRINT_KEYS = (
     "experiment_name",
     "num_clients",
@@ -74,6 +74,7 @@ _FINGERPRINT_KEYS = (
     "lora_r",
     "seed",
     "dataset",
+    "defense_config",
 )
 
 

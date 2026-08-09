@@ -1047,17 +1047,16 @@ def analyze_results(metrics):
 def main():
     # SINGLE authoritative config source — no override path exists (config_overrides /
     # COLAB_CONFIG_OVERRIDES / run_suite() were all removed 2026-08-07). To change ANY
-    # parameter, including an A/B arm: edit here, run, edit back. Every arm MUST get
-    # its own experiment_name — fed_resume's fingerprint ignores defense_config, so a
-    # reused name silently resumes the previous arm's checkpoint.
+    # parameter, including an A/B arm: edit here, run, edit back. Every arm SHOULD get
+    # its own experiment_name for readable artifacts; fed_resume also fingerprints the
+    # complete defense_config so changing V4/V5/V6/V7 cannot silently reuse its state.
     #
-    # CURRENT ARM (2026-08-07): V4-REMOVE ablation — v4_reject_mult 0.10 -> 0.0 (hard
-    # removal), everything else identical to the archived 20260729 Qwen AG News V4
-    # companion. Pre-registered expectation, success criteria, and the Yahoo
-    # prohibition: docs/DECISION.md "V4-remove".
+    # CURRENT ARM (user-requested): V7 iso-corroborated cold-window rejection.
+    # The V7 implementation is active below; its constants remain provisional
+    # because no archived *_results.json was available for replay calibration.
     config = {
         # ========== Experiment ==========
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v4remove-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v7-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
         'seed': 42,
 
         # ========== Federated Learning Setup ==========
@@ -1173,11 +1172,10 @@ def main():
             #                          (⚠ do NOT run before replay_v7_calibration.py passes)
             # V4+ modes require per-round local CSE (server enforces, loud crash if
             # missing) and are NOT compatible with update-forging (crafts_update) attackers.
-            'trust_mode': 'v4_cse_reject',
+            'trust_mode': 'v7_cse_reject_corrob',
             # V4 knobs — both PRE-REGISTERED, do not re-tune (calibration: DECISION.md "V4").
             'v4_tau_ratio': 1.85,
-            'v4_reject_mult': 0.0,   # THIS ARM: hard removal (DECISION.md "V4-remove").
-                                     # Default/companion value 0.10 — RESTORE after this arm.
+            'v4_reject_mult': 0.10,  # inert under V7; retained at the V4 companion default.
             # V5 knobs — v5_r_hard PRE-REGISTERED 2026-08-06; m_floor never 0.0.
             'v5_m_floor': 0.10,
             'v5_r_hard': 2.5,
@@ -1241,6 +1239,10 @@ def main():
         ],
 
     }
+
+    print("[config] experiment_name:", config['experiment_name'])
+    print("[config] defense_method:", config['defense_method'])
+    print("[config] trust_mode:", config['defense_config'].get('trust_mode'))
 
     attack_method = config.get('attack_method', 'Hallucination')
     if config.get('num_attackers', 0) > 0 and attack_method != 'NoAttack':
