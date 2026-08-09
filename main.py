@@ -245,13 +245,6 @@ def setup_experiment(config):
     num_attackers = config.get('num_attackers', 0)
     attack_method = config.get('attack_method', 'Hallucination')
 
-    # AugMP constraint bounds ride on the server (Phase 0.5 → set_constraint_params);
-    # None = auto-derive from benign-update statistics.
-    if attack_method == 'AugMP':
-        server.dist_bound = config.get('dist_bound', None)
-        server.sim_bound_low = config.get('sim_bound_low', None)
-        server.sim_bound_up = config.get('sim_bound_up', None)
-
     # 'NoAttack' forces every client benign even when num_attackers>0.
     if attack_method == 'NoAttack' and num_attackers > 0:
         print(f"  [config] attack_method='NoAttack' overrides num_attackers={num_attackers}: "
@@ -391,69 +384,10 @@ def setup_experiment(config):
                     grad_clip_norm=config.get('grad_clip_norm', 1.0),
                     gaussian_std_scale=gaussian_std_scale
                 )
-            elif attack_method == 'AugMP':
-                # Learned VGAE+GSP stealth manipulation: no local training — the update
-                # is constructed from the received benign updates (see attack/augmp.py).
-                from attack.augmp import AttackerClient
-                print(f"  Client {client_id}: ATTACKER (AugMP - VGAE model manipulation)")
-                print(f"    Claimed data size D'_j(t): {claimed_data_size} (matches assigned data)")
-                use_proxy = config.get('attacker_use_proxy_data', True)
-                if not use_proxy:
-                    print(f"    Proxy data disabled (attacker_use_proxy_data=False); constraint-only optimisation.")
-                client = AttackerClient(
-                    client_id=client_id,
-                    model=global_model,
-                    data_manager=data_manager,
-                    data_indices=client_indices[client_id],
-                    lr=config['client_lr'],
-                    local_epochs=config['local_epochs'],
-                    alpha=config['alpha'],
-                    dim_reduction_size=config.get('dim_reduction_size', 1000),
-                    vgae_epochs=config.get('vgae_epochs', 20),
-                    vgae_lr=config.get('vgae_lr', 0.01),
-                    graph_threshold=config.get('graph_threshold', 0.5),
-                    proxy_step=config.get('proxy_step', 0.001),
-                    claimed_data_size=claimed_data_size,
-                    proxy_sample_size=config.get('proxy_sample_size', 128),
-                    proxy_max_batches_opt=config.get('proxy_max_batches_opt', 1),
-                    proxy_max_batches_eval=config.get('proxy_max_batches_eval', 1),
-                    vgae_hidden_dim=config.get('vgae_hidden_dim', 32),
-                    vgae_latent_dim=config.get('vgae_latent_dim', 16),
-                    vgae_dropout=config.get('vgae_dropout', 0.0),
-                    vgae_kl_weight=config.get('vgae_kl_weight', 0.1),
-                    proxy_steps=config.get('proxy_steps', 30),
-                    grad_clip_norm=config.get('grad_clip_norm', 1.0),
-                    proxy_grad_clip_norm=config.get('attacker_proxy_grad_clip_norm', 1.0),
-                    early_stop_constraint_stability_steps=config.get('early_stop_constraint_stability_steps', 2),
-                    use_proxy_data=use_proxy,
-                )
-                # Lagrangian dual + (optional) augmented Lagrangian constraint wiring.
-                if config.get('use_lagrangian_dual', False):
-                    client.set_lagrangian_params(
-                        use_lagrangian_dual=config['use_lagrangian_dual'],
-                        lambda_dist_init=config.get('lambda_dist_init', 0.1),
-                        lambda_dist_lr=config.get('lambda_dist_lr', 0.01),
-                        use_cosine_similarity_constraint=config.get('use_cosine_similarity_constraint', False),
-                        use_pairwise_similarity_in_constraint=config.get('use_pairwise_similarity_in_constraint', False),
-                        lambda_sim_low_init=config.get('lambda_sim_low_init', 0.1),
-                        lambda_sim_up_init=config.get('lambda_sim_up_init', 0.1),
-                        lambda_sim_low_lr=config.get('lambda_sim_low_lr', 0.01),
-                        lambda_sim_up_lr=config.get('lambda_sim_up_lr', 0.01),
-                        use_augmented_lagrangian=config.get('use_augmented_lagrangian', False),
-                        lambda_update_mode=config.get('lambda_update_mode', 'classic'),
-                        rho_dist_init=config.get('rho_dist_init', 1.0),
-                        rho_sim_low_init=config.get('rho_sim_low_init', 1.0),
-                        rho_sim_up_init=config.get('rho_sim_up_init', 1.0),
-                        rho_adaptive=config.get('rho_adaptive', True),
-                        rho_theta=config.get('rho_theta', 0.5),
-                        rho_increase_factor=config.get('rho_increase_factor', 2.0),
-                        rho_min=config.get('rho_min', 1e-3),
-                        rho_max=config.get('rho_max', 1e3),
-                    )
             else:
                 raise ValueError(
                     f"Unknown attack_method={attack_method!r}. Supported: "
-                    "'NoAttack' | 'Hallucination' | 'SignFlipping' | 'Gaussian' | 'ALIE' | 'AugMP'."
+                    "'NoAttack' | 'Hallucination' | 'SignFlipping' | 'Gaussian' | 'ALIE'."
                 )
 
         server.register_client(client)
@@ -1167,7 +1101,7 @@ def main():
         
 
         # ========== Attack ==========
-        # 'NoAttack' | 'Hallucination' (this paper) | 'SignFlipping' | 'Gaussian' | 'ALIE' | 'AugMP'
+        # 'NoAttack' | 'Hallucination' (this paper) | 'SignFlipping' | 'Gaussian' | 'ALIE'
         'attack_method': 'Hallucination',
         'attack_start_round': None,  # None = active from round 0
 
@@ -1189,35 +1123,6 @@ def main():
         'gaussian_attack_start_round': None,
         'alie_z_max': None,                      # NeurIPS '19: None = auto by (num_clients, num_attackers)
         'alie_attack_start_round': None,
-
-        # ---- AugMP (learned VGAE+GSP stealth manipulation) ----
-        # Consumed only when attack_method='AugMP'; mechanics in attack/augmp.py.
-        # proxy_steps is the compute bottleneck; None bounds = auto from benign updates.
-        'dim_reduction_size': 1000,
-        'vgae_epochs': 20,
-        'vgae_lr': 0.01,
-        'vgae_hidden_dim': 32,
-        'vgae_latent_dim': 16,
-        'vgae_dropout': 0.0,
-        'vgae_kl_weight': 0.1,
-        'graph_threshold': 0.5,
-        'proxy_step': 0.001,
-        'proxy_steps': 30,
-        'early_stop_constraint_stability_steps': 2,
-        'attacker_use_proxy_data': True,
-        'proxy_sample_size': 128,
-        'proxy_max_batches_opt': 1,
-        'proxy_max_batches_eval': 1,
-        'attacker_proxy_grad_clip_norm': 1.0,
-        'dist_bound': None,
-        'sim_bound_low': None,
-        'sim_bound_up': None,
-        'use_lagrangian_dual': True,
-        'use_cosine_similarity_constraint': True,
-        'use_augmented_lagrangian': True,
-        'lambda_dist_init': 0.1,
-        'lambda_sim_low_init': 0.1,
-        'lambda_sim_up_init': 0.1,
 
         # ========== Defense ==========
         # 'fedavg' | 'hmp_gae' (this paper) | 'foolsgold' | 'fltrust'
@@ -1266,7 +1171,7 @@ def main():
             #   'v7_cse_reject_corrob' V7: V6 + Tier-2 corroborated flag in cold window
             #                          (⚠ do NOT run before replay_v7_calibration.py passes)
             # V4+ modes require per-round local CSE (server enforces, loud crash if
-            # missing) and are NOT compatible with update-forging attackers (AugMP).
+            # missing) and are NOT compatible with update-forging (crafts_update) attackers.
             'trust_mode': 'v4_cse_reject',
             # V4 knobs — both PRE-REGISTERED, do not re-tune (calibration: DECISION.md "V4").
             'v4_tau_ratio': 1.85,
@@ -1346,8 +1251,6 @@ def main():
             print("Running Sign-Flipping Attack (Model Poisoning Baseline)...")
         elif attack_method == 'Gaussian':
             print("Running Gaussian Attack (Random Model Poisoning Baseline)...")
-        elif attack_method == 'AugMP':
-            print("Running AugMP Attack (VGAE + GSP learned stealth model manipulation)...")
         else:
             print(f"Running attack: {attack_method}")
     else:

@@ -735,7 +735,7 @@ class Server:
                 each client's contribution. For honest / label-flip attackers the
                 two are numerically identical (client.model == w_global + Delta_i
                 after local_train, so results are unchanged to float precision).
-                For update-forging attackers that do NOT locally train (e.g. AugMP,
+                For update-forging attackers that do NOT locally train (crafts_update,
                 whose client.model stays == w_global while the malice lives only in
                 the crafted Delta), ``client.model`` would look perfectly benign;
                 passing w_global + Delta_i lets the semantic signal actually see the
@@ -873,14 +873,15 @@ class Server:
         self.broadcast_model()
 
         # Phase 0.5: Constrained-attacker setup (only for update-forging attackers
-        # that advertise crafts_update, i.e. AugMP). Hands each such attacker the
+        # that advertise crafts_update — none exist since AugMP's removal
+        # 2026-08-09, so this block always skips). Hands each such attacker the
         # current global params + constraint bounds so it can build the global-loss
         # proxy F(w'_g) and the distance/cosine-similarity constraints inside
         # camouflage_update. This whole block is SKIPPED for every existing run
         # (benign / hallucination / alie / gaussian / sign_flipping), so their code
         # path is byte-for-byte unchanged. dist_bound / sim_bound_* are read via
-        # getattr (default None = auto-derive from benign statistics); main.py sets
-        # them on the server only for attack_method='AugMP'.
+        # getattr (default None = auto-derive from benign statistics); main.py no
+        # longer sets them (AugMP removed 2026-08-09).
         needs_constraint_setup = any(getattr(c, 'crafts_update', False) for c in self.clients)
         if needs_constraint_setup:
             global_params = self.global_model.get_flat_params()
@@ -976,10 +977,9 @@ class Server:
         if self._needs_probe:
             # Semantic signal. For every ordinary client (benign, and attackers that
             # bake their poison into local training such as Hallucination) we probe
-            # client.model EXACTLY as before -- byte-for-byte identical to pre-AugMP
-            # behaviour. Only for update-forging attackers (crafts_update, i.e. AugMP,
-            # whose client.model stays == w_global while the malice lives in the
-            # crafted Delta) do we instead probe w_global + Delta_i, so the semantic
+            # client.model EXACTLY as before. Only for update-forging attackers
+            # (crafts_update, whose client.model stays == w_global while the malice
+            # lives in the crafted Delta) do we instead probe w_global + Delta_i, so the semantic
             # signal can actually see the submitted attack. self.global_model is still
             # the round-start global here (Phase 4 aggregation happens below).
             global_flat = None
@@ -1021,7 +1021,7 @@ class Server:
                     "CSE-reject trust modes (v4_cse_reject / v5_cse_reject / "
                     "v6_cse_reject_geo / v7_cse_reject_corrob) "
                     "are not supported with update-forging attackers "
-                    "(crafts_update, e.g. AugMP): local CSE evaluates "
+                    "(crafts_update): local CSE evaluates "
                     "client.model, which such attackers leave looking benign "
                     "(the poison lives only in the crafted update)."
                 )

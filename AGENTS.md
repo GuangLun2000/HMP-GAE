@@ -55,7 +55,6 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 | [client.py](client.py) | `BenignClient` (FedProx) 基类 |
 | [attack/hallucination.py](attack/hallucination.py) | 本论文攻击；per-round 随机化 flip 在此实现 |
 | [attack/{sign_flipping,gaussian,alie}.py](attack/) | 经典 Byzantine baseline——**不要改对外行为**（V2 横向对比锚点） |
-| [attack/augmp.py](attack/augmp.py) | AugMP 攻击（learned VGAE+GSP stealth model-manipulation，~3900 行，从 IoA-Attack-GRMP 移植）；懒加载，仅 `attack_method='AugMP'` 时 import，当前默认实验**不用** |
 | [evaluation_hallucination.py](evaluation_hallucination.py) | 全局 PPL 评估（FL 结束后一次；encoder-only 优雅跳过） |
 | [decoder_adapters.py](decoder_adapters.py) | SeqCLS → CausalLM backbone 迁移（PPL 评估前置） |
 | [models.py](models.py) | `NewsClassifierModel`（SeqCLS + LoRA 装配；`lora_target_modules` 在此） |
@@ -63,7 +62,7 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 | [fed_resume.py](fed_resume.py) | per-round 断点续跑（Colab 掉线恢复）；fingerprint 校验在此 |
 | [tests/test_trust_robustness.py](tests/test_trust_robustness.py) | trust-scoring CPU 回归（legacy 路径 bit-for-bit）；改 trust_scorer/runtime 后跑 |
 
-> **AugMP 隔离约定（token 节流）**：`attack/augmp.py` 约 3900 行、约 40K token，且当前实验不跑 AugMP（懒加载——`attack_method` 非 `'AugMP'` 时根本不 import，对运行时零成本）。**除非任务明确要改 AugMP，否则不要读取该文件**；全库阅读 / code review 时跳过它。其内部结构（VGAE 代理模型 + 增广拉格朗日约束优化：distance + 双边 cosine 约束）需要时再按需读取。
+> **AugMP 已整体移除（2026-08-09）**：`attack/augmp.py`（~3900 行 learned VGAE+GSP stealth 攻击）连同其全部 config 键与 main.py dispatch 已删除，需要时从 git 历史找回。server.py 的 `crafts_update` 协议支路保留（防御式 `getattr`，无人触发即跳过），CSE-reject 系模式对 `crafts_update` 型攻击者的不兼容守卫仍在。
 
 新算法沿用上表里的符号命名；新符号在对应文件顶部 docstring 简注即可。
 
@@ -82,8 +81,8 @@ Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关�
 - **requirements.txt 受 Colab 镜像约束**：特别是 `torchao` / `peft` / `transformers` 版本兼容（见文件内注释 line 11-13）
 - **LoRA `target_modules=None` 含义是"用 PEFT 默认"**：默认对 DistilBERT 友好；换冷门 backbone 时可能需要显式列出 attn projection 名
 - **CSE 每轮免费**（共享 test forward），**PPL 是 FL 结束后一次性**（需要 checkpoint）——不要把 PPL 计算挪进每轮循环
-- **`trust_mode: 'v4_cse_reject'`（V4，2026-07-28）改变 server 的评估时序**：server 会在**聚合前**对每个 client 做 full-test local eval（`Server._needs_local_cse`），并强制每轮 local eval（覆盖 `eval_local_every_n_rounds`）；缺 `local_cse` 会 loud crash（defense 层在 FedAvg-fallback try 之前校验，不会静默回退）。rank cap **复用 `num_byzantine`**（要求 < N/2，runtime 构造时校验）；`v4_tau_ratio=1.85` 是预注册值，跑完实验**不许回调**。与 AugMP（crafts_update）不兼容（local CSE 看不到伪造 update）。V4 信号**绝不过 `_zscore`**——被否决的替代方案与理由记录在 [docs/DECISION.md](docs/DECISION.md)
-- **`trust_mode: 'v5_cse_reject'`（V5，2026-08-06）= V4 的 flag 判定 + 连续惩罚 ramp**：flag 规则与 V4 逐字节相同，只把被 flag 客户端的乘子从常数 `v4_reject_mult` 换成 CSE ratio 的线性 ramp（`trust_scorer.v5_cse_reject_weights`；τ 附近 ≈1.0，`v5_r_hard` 以上饱和到 `v5_m_floor`）。评估时序 / local_cse 硬要求 / AugMP 不兼容 / rank cap 全部继承 V4。`v5_r_hard=2.5` 是预注册值（由归档 V4 run 的稳态 attacker ratio 最小值标定），`v5_m_floor` 禁 0（硬归零已被否决）——设计决策与标定依据见 [docs/DECISION.md](docs/DECISION.md)。V5 尚未跑过确证实验；诊断 CSV 复用 `v4_*` 通道族
+- **`trust_mode: 'v4_cse_reject'`（V4，2026-07-28）改变 server 的评估时序**：server 会在**聚合前**对每个 client 做 full-test local eval（`Server._needs_local_cse`），并强制每轮 local eval（覆盖 `eval_local_every_n_rounds`）；缺 `local_cse` 会 loud crash（defense 层在 FedAvg-fallback try 之前校验，不会静默回退）。rank cap **复用 `num_byzantine`**（要求 < N/2，runtime 构造时校验）；`v4_tau_ratio=1.85` 是预注册值，跑完实验**不许回调**。与伪造 update 的 `crafts_update` 型攻击者不兼容（local CSE 看不到伪造 update；此类攻击者已随 AugMP 移除，守卫保留）。V4 信号**绝不过 `_zscore`**——被否决的替代方案与理由记录在 [docs/DECISION.md](docs/DECISION.md)
+- **`trust_mode: 'v5_cse_reject'`（V5，2026-08-06）= V4 的 flag 判定 + 连续惩罚 ramp**：flag 规则与 V4 逐字节相同，只把被 flag 客户端的乘子从常数 `v4_reject_mult` 换成 CSE ratio 的线性 ramp（`trust_scorer.v5_cse_reject_weights`；τ 附近 ≈1.0，`v5_r_hard` 以上饱和到 `v5_m_floor`）。评估时序 / local_cse 硬要求 / crafts_update 不兼容 / rank cap 全部继承 V4。`v5_r_hard=2.5` 是预注册值（由归档 V4 run 的稳态 attacker ratio 最小值标定），`v5_m_floor` 禁 0（硬归零已被否决）——设计决策与标定依据见 [docs/DECISION.md](docs/DECISION.md)。V5 尚未跑过确证实验；诊断 CSV 复用 `v4_*` 通道族
 - **`trust_mode: 'v6_cse_reject_geo'`（V6，2026-08-07）= V5 的 ramp × 单向几何门**：Stage 1（flag）与 Stage 2（CSE ramp）与 V5 逐字节相同（直接复用 `v5_m_floor` / `v5_r_hard`），只在**被 flag 的客户端**上再乘一个几何因子（`trust_scorer.v6_cse_reject_geo_weights`）：`m = m_cse × (v6_geo_floor + (1-v6_geo_floor)·gate)`，`gate` 就是 V3 `soft_reject_fedavg` 用的那个 `sigmoid(-soft_reject_k·(sus-reject_z_threshold))`（EMA 平滑后的 sus）。因子落在 `[geo_floor, 1]`，所以**恒有 m_V6 ≤ m_V5**——几何只能加重惩罚、永不能减轻，CSE 在构造上不会回退；`v6_geo_floor=1.0` 与 V5 逐元素相同（首跑必须先用它做接线回归）。未被 flag 的客户端乘子恒为 `1.0`（**不是** gate），所以干净联邦仍精确等于 `n_k/Σn`。**副作用**：`graph_min_distinct` / `reject_z_threshold` / `soft_reject_k` / `semantic_weight` 在 V4/V5 下只是诊断，在 V6 下**重新变成真正影响 α 的旋钮**。`v6_geo_floor=0.5` 是预注册值，跑完不许回调；若 `v6_geo_mult` 每轮都 ≈1.0，说明几何没起作用——如实报告，不要调 floor 把效果调出来。设计依据见 [docs/DECISION.md](docs/DECISION.md)
 - **`trust_mode: 'v7_cse_reject_corrob'`（V7，2026-08-08）= V6 + 冷启动窗口内的超图佐证降阈**：Stage A 与 V6 逐字节相同；仅在 `v7_round_min..v7_round_max`（**1-indexed**，与归档日志 `round` 通道同单位）内新增 Tier-2 flag——未被 CSE flag 的客户端若同时满足 `r > v7_tau_lo`（低于 1.85 的降阈）**且** raw `graph_residual >= v7_iso_min`（**绝对阈值，绝不用 z-score 过的 gate 做 flag**），在共享 rank-cap 预算内（CSE flag 恒优先、不可被挤掉）乘常数 `v7_corrob_mult`。机制的诚实表述是"超图佐证的降阈"，不是"超图独立检测"：几何单独永不 flag（防 scapegoat）；R1-R2 由预注册窗口起点 `v7_round_min=3` 避开（实证依据是归档中 attacker r≈1 过不了 tau_lo——是约定+证据，非结构保证）。`v7_round_max=0` = 逐位等于 V6（接线回归臂）。⚠ **v7 knob 现值全部是占位符**：跑任何 V7 实验前必须先跑 [replay_v7_calibration.py](replay_v7_calibration.py)（stdlib，读归档 `*_results.json`）确认 zero-FP plateau 并按预注册选择规则定值；plateau 为空 = V7 负结果，**不许放宽网格**。`graph_min_distinct` gate 掉图通道的轮次 Tier-2 自动弃权。设计依据、被否决的替代方案（gate 做 flag / 邻域中位数 CSE / gate 调制惩罚）与威胁模型边界见 [docs/DECISION.md](docs/DECISION.md)
 

@@ -159,7 +159,7 @@ class HMPGAERuntime:
         #     signal to alpha — V4/V5 compute it and multiply it by zero —
         #     without letting it soften any CSE-driven penalty. v6_geo_floor=1.0
         #     reproduces V5 exactly. Same local-CSE requirement / eval timing /
-        #     AugMP incompatibility as V4.
+        #     crafts_update incompatibility as V4.
         #   'v7_cse_reject_corrob' (V7, 2026-08-08): V6 byte-identical, plus a
         #     Tier-2 flag armed ONLY inside the CSE cold-start window
         #     (v7_round_min..v7_round_max, 1-indexed): a client whose CSE

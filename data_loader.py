@@ -32,7 +32,7 @@ class NewsDataset(Dataset):
         self.include_target_mask = include_target_mask
 
         # Empty dataset (e.g. DataManager.get_empty_loader() for data-agnostic
-        # attackers like AugMP): build zero-row tensors directly. Calling the
+        # attackers): build zero-row tensors directly. Calling the
         # fast tokenizer on an empty list raises IndexError on newer
         # transformers (tokens_and_encodings[0][0]), so short-circuit it.
         if len(texts) == 0:
@@ -395,8 +395,8 @@ class DataManager:
 
     def get_proxy_eval_loader(self, sample_size: int = 128) -> DataLoader:
         """
-        Small clean proxy set for the (omniscient) AugMP attacker's F(w'_g)
-        estimation.
+        Small clean proxy set for attacker-side global-loss estimation
+        (used by ALIE, attack/alie.py).
 
         Fairness (critical): the proxy is drawn from the TRAINING distribution
         (``self.train_texts``), NEVER from the test set. The attacker must not
@@ -407,7 +407,7 @@ class DataManager:
         server root set) and keeps the reported metrics honest.
 
         The selection is deterministic (dedicated seed) and class-stratified for
-        a balanced loss estimate. Only AugMP attackers call this method, and it
+        a balanced loss estimate. Only attacker clients call this method, and it
         does not touch ``train_texts`` or the client partition, so existing
         (Hallucination / fedavg / baseline) experiments are unaffected.
         """
