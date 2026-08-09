@@ -1,6 +1,8 @@
 # server.py
 # This module implements the Server class for federated learning, including model aggregation.
 
+import math
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -113,11 +115,12 @@ class Server:
         # eval_local_every_n_rounds == 1).
         trust_mode_cfg = str(
             (self.defense_config or {}).get('trust_mode', '')
-        ).lower()
+        ).strip().lower()
         self._needs_local_cse = (
             self.defense_method in ('hmp_gae', 'hmpgae', 'hmp-gae')
             and trust_mode_cfg in (
-                'v4_cse_reject', 'v5_cse_reject', 'v6_cse_reject_geo'
+                'v4_cse_reject', 'v5_cse_reject', 'v6_cse_reject_geo',
+                'v7_cse_reject_corrob',
             )
         )
 
@@ -469,6 +472,22 @@ class Server:
                 f"k_cap={defense_stats.get('v4_k_cap')}, "
                 f"{mult_desc})"
             )
+        # V7 only: Tier-2 corroborated flags (cold-window, iso-corroborated
+        # sub-1.85 rejections). Printed separately from the CSE flags above so
+        # the log shows WHICH tier acted; 'none' inside the window is the
+        # honest "geometry did not act this round" datum.
+        v7_corrob_list = defense_stats.get('v7_corrob_flagged')
+        if isinstance(v7_corrob_list, list) and len(v7_corrob_list) == len(client_ids):
+            corrob_ids = [cid for cid, f in zip(client_ids, v7_corrob_list) if f]
+            print(
+                f"  🕸️ corrob:       {corrob_ids if corrob_ids else 'none'} "
+                f"(tau_lo={defense_stats.get('v7_tau_lo')}, "
+                f"iso_min={defense_stats.get('v7_iso_min')}, "
+                f"mult={defense_stats.get('v7_corrob_mult')}, "
+                f"window=[{defense_stats.get('v7_round_min')},"
+                f"{defense_stats.get('v7_round_max')}], "
+                f"geo_resolved={defense_stats.get('v7_geo_resolved')})"
+            )
         # V6 only: the geometry factor. It is APPLIED only to flagged clients
         # (marked '*'); for everyone else the applied multiplier is a hard 1.0
         # and the number below is counterfactual — what the geometry WOULD have
@@ -528,6 +547,9 @@ class Server:
                   'v4_median_cse', 'v4_tau_ratio', 'v4_k_cap', 'v4_reject_mult',
                   'v5_m_floor', 'v5_r_hard', 'v5_ramp_t',
                   'v6_geo_floor', 'v6_geo_gate', 'v6_geo_mult', 'v6_m_cse',
+                  'v7_corrob_flagged', 'v7_iso', 'v7_geo_resolved',
+                  'v7_tau_lo', 'v7_iso_min', 'v7_corrob_mult',
+                  'v7_round_min', 'v7_round_max',
                   'L_rec', 'L_smooth', 'L_hist',
                   'fallback_reason', 'defense_time_ms'):
             if k in defense_stats:
@@ -997,7 +1019,7 @@ class Server:
             if any(getattr(c, 'crafts_update', False) for c in self.clients):
                 raise RuntimeError(
                     "CSE-reject trust modes (v4_cse_reject / v5_cse_reject / "
-                    "v6_cse_reject_geo) "
+                    "v6_cse_reject_geo / v7_cse_reject_corrob) "
                     "are not supported with update-forging attackers "
                     "(crafts_update, e.g. AugMP): local CSE evaluates "
                     "client.model, which such attackers leave looking benign "
@@ -1013,6 +1035,26 @@ class Server:
                 )
             local_cse_vector = [float(local_cse_this_round[cid])
                                 for cid in sorted_client_ids]
+            # A NaN slips past the `missing` check above and then poisons the
+            # whole rule: torch.median propagates NaN, every ratio becomes
+            # NaN, `nan > tau` is False, so ZERO clients are flagged and the
+            # round silently degrades to FedAvg with full attacker weight —
+            # indistinguishable in the archive from a genuinely clean round.
+            # Same loud-crash contract as `missing`. +inf does NOT disable the
+            # rule (the median stays finite and that client flags normally),
+            # but it still means the local eval is broken, so both are
+            # rejected here rather than silently scored.
+            bad = [cid for cid, v in zip(sorted_client_ids, local_cse_vector)
+                   if not math.isfinite(v)]
+            if bad:
+                raise RuntimeError(
+                    "CSE-reject trust mode: non-finite local CSE for clients "
+                    f"{bad} (values "
+                    f"{[local_cse_this_round[c] for c in bad]}); the rejection "
+                    "rule would silently disable itself this round "
+                    "(NaN median -> no flags -> plain FedAvg). Aborting so "
+                    "the run is not silently invalidated."
+                )
 
         aggregation_log = self.aggregate_updates(
             final_update_list, sorted_client_ids,

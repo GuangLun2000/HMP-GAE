@@ -95,7 +95,7 @@ $$
 
 ## 3. HMP-GAE 防御:结构总览
 
-`hmp_gae/runtime.py: HMPGAERuntime.aggregate` (runtime.py:266-532)
+`hmp_gae/runtime.py: HMPGAERuntime.aggregate`
 
 每轮在服务器端执行(全部在 CPU,因 $N$ 小):
 
@@ -214,11 +214,11 @@ $$
 \mathcal{L}_{hist} = \frac{1}{N \cdot d_z} \lVert Z - Z^{hist} \rVert_F^2
 $$
 
-**训练细节**(runtime.py:299-342):$\lambda_H = \lambda_A = 1.0$,$\lambda_{hist} = 0.5$,$\lambda_{wd} = 10^{-5}$;每轮 Adam(lr $10^{-3}$)5 步;梯度裁剪 max-norm 5.0;超图 $H$ 每步随 $\eta$ 重建(即 $H$ 依赖当前 $f_{enc}$ 参数)。训练完成后以 eval 模式重新前向一次得到用于打分的 $\eta, H, Z, \hat{A}$。
+**训练细节**:$\lambda_H = \lambda_A = 1.0$,$\lambda_{hist} = 0.5$,$\lambda_{wd} = 10^{-5}$;每轮 Adam(lr $10^{-3}$)5 步;梯度裁剪 max-norm 5.0;超图 $H$ 每步随 $\eta$ 重建(即 $H$ 依赖当前 $f_{enc}$ 参数)。训练完成后以 eval 模式重新前向一次得到用于打分的 $\eta, H, Z, \hat{A}$。
 
 ### 4.6 历史嵌入 EMA($Z^{hist}$)
 
-`runtime.py: _update_history` (runtime.py:250-260)
+`runtime.py: _update_history`
 
 $$
 z^{hist}_i \leftarrow \beta_h\, z^{hist}_i + (1 - \beta_h)\, z_i^t, \qquad \beta_h = 0.9
@@ -230,11 +230,11 @@ $$
 
 ## 5. 信任打分(四信号)
 
-`hmp_gae/trust_scorer.py: compute_trust_weights` (trust_scorer.py:197-341)
+`hmp_gae/trust_scorer.py: compute_trust_weights`
 
 ### 5.1 Signal 1 — graph_residual(超图孤立度,主信号)
 
-基于**确定性** k-NN 超图 $H$(不依赖训练好的 encoder,round 0 即可用):
+基于**确定性**的 k-NN 超图 $H$(给定 $\eta$ 后构建是确定性的;$\eta$ 出自**当轮**自监督训练后的 node encoder $f_{enc}$——见 §4 训练细节,$H$ 随 $f_{enc}$ 参数变化——但不需要任何跨轮 warmup 或收敛的 GAE decoder,round 0 即可用):
 
 $$
 \text{reach}_i = \#\big\{\, j \ne i : (HH^\top)_{ij} > 0 \,\big\}, \qquad
@@ -253,9 +253,9 @@ $$
 
 ### 5.3 Signal 3 — sem_div(语义散度,行为指纹)
 
-`trust_scorer.py: _semantic_divergence_signal` (trust_scorer.py:115-194)
+`trust_scorer.py: _semantic_divergence_signal`
 
-**探针来源**(server.py:508-609):服务器持有固定 probe 集($K$ 条,当前 $K = 100$,类分层采样 `semantic_probe_stratified=True`——标签**只用于平衡采样,绝不进入打分**,信号保持 label-free)。每轮把每个客户端的本地模型($w_t + \Delta_i$)在 probe 集上前向,得 per-sample softmax $P_i^k \in \Delta^{C-1}$。
+**探针来源**:服务器持有固定 probe 集($K$ 条,当前 $K = 100$,类分层采样 `semantic_probe_stratified=True`——标签**只用于平衡采样,绝不进入打分**,信号保持 label-free)。每轮把每个客户端的本地模型($w_t + \Delta_i$)在 probe 集上前向,得 per-sample softmax $P_i^k \in \Delta^{C-1}$。
 
 **参考分布两种模式**:
 
@@ -286,11 +286,11 @@ $$
 r^{hist}_i = \lVert z_i - z^{hist}_i \rVert_2
 $$
 
-**默认关闭($\beta = 0$)**:实验(Y5)发现 benign 客户端在真实学习中的漂移**大于**被困在固定错误标签流形上的 attacker,信号方向在稳态会反转(warmup 期 R1-R11 方向正确 100%,稳态 R26+ 仅 28%)。保留 `hist_warmup_rounds` 相位门控:设为整数 $T_w$ 时仅在 $t < T_w$ 启用,$\beta_{eff} = \beta \cdot \mathbb{1}[t < T_w]$(runtime.py:359-366)。
+**默认关闭($\beta = 0$)**:实验(Y5)发现 benign 客户端在真实学习中的漂移**大于**被困在固定错误标签流形上的 attacker,信号方向在稳态会反转(warmup 期 R1-R11 方向正确 100%,稳态 R26+ 仅 28%)。保留 `hist_warmup_rounds` 相位门控:设为整数 $T_w$ 时仅在 $t < T_w$ 启用,$\beta_{eff} = \beta \cdot \mathbb{1}[t < T_w]$。
 
 ### 5.5 鲁棒标准化(z-score)
 
-`trust_scorer.py: _zscore` (trust_scorer.py:71-112)
+`trust_scorer.py: _zscore`
 
 每个信号跨客户端标准化后再融合(尺度不变性):
 
@@ -325,7 +325,7 @@ $\tau \to 0$ 退化为 Krum 式硬选择;$\tau \in [0.05, 0.5]$ 为软拒绝。�
 
 ## 6. 从信任到聚合权重(gating)
 
-`trust_scorer.py: _suspicion_signal / gate_diagnostics / reject_soft_weighted` + `runtime.py:385-448`
+`trust_scorer.py: _suspicion_signal / gate_diagnostics / reject_soft_weighted`(gate 的应用在 `runtime.py` 的 soft-reject 分支)
 
 ### 6.1 怀疑分数(suspicion)
 
@@ -345,7 +345,7 @@ $$
 
 ### 6.2 跨轮 suspicion EMA
 
-`runtime.py: _smooth_suspicion` (runtime.py:227-248)
+`runtime.py: _smooth_suspicion`
 
 $$
 \widetilde{\text{sus}}_i^t = \beta_s\, \widetilde{\text{sus}}_i^{t-1} + (1 - \beta_s)\, \text{sus}_i^t, \qquad \beta_s = 0.6
@@ -355,7 +355,7 @@ $$
 
 ### 6.3 Sigmoid 软拒绝门 + 数据量 FedAvg
 
-`trust_scorer.py: reject_soft_weighted` (trust_scorer.py:499-572)
+`trust_scorer.py: reject_soft_weighted`
 
 $$
 g_i = \sigma\big(-\kappa\, (\widetilde{\text{sus}}_i - \theta)\big), \qquad
@@ -394,7 +394,7 @@ $$
 
 ### 7.1 Clean Accuracy / Global Loss
 
-标准测试集准确率与平均交叉熵(server.py:621-685),每轮一次(全局模型)。
+标准测试集准确率与平均交叉熵,每轮一次(全局模型)。
 
 ### 7.2 CSE — Classification Semantic Entropy(每轮,免费)
 

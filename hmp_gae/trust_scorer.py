@@ -820,6 +820,211 @@ def v6_cse_reject_geo_weights(
     return w, diag
 
 
+def v7_cse_reject_corrob_weights(
+    local_cse: torch.Tensor,
+    data_sizes: torch.Tensor,
+    gate: torch.Tensor,
+    iso: Optional[torch.Tensor],
+    round_logged: int,
+    tau_ratio: float = 1.85,
+    k_cap: int = 2,
+    m_floor: float = 0.10,
+    r_hard: float = 2.5,
+    geo_floor: float = 0.5,
+    tau_lo: float = 1.40,
+    iso_min: float = 7.0 / 12.0,
+    corrob_mult: float = 0.5,
+    round_min: int = 3,
+    round_max: int = 10,
+    keep_min: int = 1,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    V7 iso-corroborated cold-window rule (2026-08-08): V6 byte-identical as
+    Stage A, plus a Tier-2 "corroborated" flag that exists ONLY inside the
+    CSE cold-start window, where the archive shows 78% of V4's residual
+    false negatives live (rounds <= 5; R1-R10 accrue ~half of mean-CSE mass).
+
+        # Stage A — exactly v6_cse_reject_geo_weights (flags, ramp, geo
+        #           factor). Outside the window, or when Tier 2 stays empty,
+        #           the output IS V6's, bit for bit (returned unchanged).
+        # Tier 2  — armed only for round_min <= round_logged <= round_max:
+        #   budget  = max_flags - |F_cse|          (SHARED rank-cap budget)
+        #   F_geo   = top-budget by iso of { i not in F_cse :
+        #                 r_i > tau_lo  AND  iso_i >= iso_min }
+        #             (tie-break: higher r, then lower index — pre-registered)
+        #   m_i     = corrob_mult                  for i in F_geo
+        #   m_i     = V6 multiplier                elsewhere (1.0 unflagged)
+        #   w       = normalize(m_i * n_i)
+
+    HONEST MECHANISM STATEMENT (wording matters — the panel critique showed
+    the stronger claim is false): the hypergraph does NOT detect ex nihilo.
+    Tier 2 is an iso-corroborated THRESHOLD DISCOUNT — a client whose CSE
+    ratio is elevated (r > tau_lo) but below the pre-registered 1.85 can be
+    flagged early only when the k-NN hypergraph independently isolates it
+    (iso >= iso_min). The necessity claim for the hypergraph is therefore:
+    WITHOUT the iso conjunct, no threshold below 1.85 survives the zero-FP
+    replay (archived clean-run benign ratio max 1.7833 > tau_lo), so the
+    geometry is what makes the discounted threshold safe. R1-R2 mass stays
+    untouched by V7's own physics (attacker r ~ 1 there fails tau_lo), and
+    the window deliberately opens at round_min=3 for that reason.
+
+    Design constraints honoured (see docs/DECISION.md "V7"):
+      * C2 — the Tier-2 conjunct is the RAW graph_residual (bounded [0,1],
+        absolute scale, quantized to multiples of 1/(N-1)); NEVER the EMA
+        sigmoid gate, whose suspicion input is built from pool-relative
+        _zscore values and is therefore banned from flag decisions. The gate
+        keeps its V6 role: penalty MAGNITUDE on Stage-A flagged clients only.
+      * CSE-flag priority — Tier 2 fills only rank-cap budget that Stage A
+        left unused; it can never displace, shrink, or re-rank a CSE flag
+        (the set form here is normative; there is no equivalent "rescaled
+        statistic" form — a plausible-looking one was shown to re-order CSE
+        flags and was rejected).
+      * Clean-federation property — unflagged clients keep the literal 1.0.
+        BUT: because tau_lo < 1.7833 (the archived clean benign max ratio),
+        clean exactness is no longer purely structural as in V4-V6; it rests
+        on the replay-verified premise that no clean benign client-round
+        jointly crosses (tau_lo, iso_min) inside the window. That premise is
+        a pre-registered PASS criterion of replay_v7_calibration.py, with a
+        stated margin — if it fails, V7 is reported dead, not re-tuned.
+      * Abstention — iso=None (runtime passes None when the graph channel is
+        resolution-gated via graph_min_distinct, i.e. quantization noise)
+        empties Tier 2 for the round: a degenerate channel must degrade to
+        the validated V6 rule, never invent a penalty. Per-client NaN iso
+        likewise sanitizes to 0.0 (cannot corroborate).
+      * Bounded damage — a mis-flagged benign client keeps corrob_mult (0,1;
+        default 0.5, never 0) of its weight for at most the window length,
+        with per-round re-evaluation. Constant, not gate-modulated: the
+        archived gate averages 0.766 on confirmed Qwen-AG attackers, so a
+        gate-modulated penalty would trim ~12% and vanish into seed noise.
+      * All V7 constants (tau_lo, iso_min, corrob_mult, round_min/max) are
+        PROVISIONAL until the replay calibration over the archived runs picks
+        them from the pre-committed candidate grids (see DECISION); they are
+        then pre-registered and never re-tuned after a confirmatory run.
+      * iso is computed in the TRAINED node-encoder embedding (eta), not raw
+        update geometry — cross-cell/round stability is a replay PASS
+        criterion, not an assumption (panel critique, "false stationarity").
+
+    Args:
+        local_cse:    (N,) per-client full-test CSE (absolute, NOT z-scored).
+        data_sizes:   (N,) raw data-size prior n_i.
+        gate:         (N,) geometry gate in [0,1] — V6 Stage-3 input only.
+        iso:          (N,) raw graph_residual in [0,1], or None to abstain.
+        round_logged: 1-INDEXED round number (= runtime round_num + 1), the
+                      same convention as the archived logs' 'round' channel,
+                      so replay and live runs read the window identically.
+        tau_lo:       Tier-2 CSE floor, must satisfy 1 < tau_lo < tau_ratio.
+        iso_min:      Tier-2 isolation floor. Sits at an INTER-LEVEL MIDPOINT
+                      of the quantized channel, never on a level: default
+                      7/12 captures only reach <= 2 at N=7/k=2 (residual 2/3,
+                      the maximal isolation level); candidate 5/12 also
+                      admits reach = 3 (residual 1/2).
+        corrob_mult:  Tier-2 constant multiplier in (0, 1).
+        round_min/max: window bounds on round_logged, inclusive.
+                      round_max=0 = window never arms = V6 bit-identical
+                      (the Run-0 wiring regression arm, house degeneracy
+                      guard in the geo_floor=1.0 / W=0 family).
+
+    Returns:
+        (weights, diag): V6's diag keys plus 'corrob_flagged' (N,) bool,
+        'iso' (N,) (sanitized; zeros when abstaining), 'geo_resolved' bool,
+        and 'multiplier' updated to the APPLIED (post-Tier-2) values.
+    """
+    if not (1.0 < float(tau_lo) < float(tau_ratio)):
+        raise ValueError(
+            "v7_cse_reject_corrob_weights requires 1 < tau_lo < tau_ratio; "
+            f"got tau_lo={tau_lo} tau_ratio={tau_ratio}"
+        )
+    if not (0.0 < float(corrob_mult) < 1.0):
+        raise ValueError(
+            "v7 corrob_mult must be in (0, 1) — 0.0 is hard zeroing on the "
+            "WEAKER (corroborated) evidence tier, rejected a fortiori; got "
+            f"{corrob_mult}"
+        )
+    if not (0.0 < float(iso_min) < 1.0):
+        raise ValueError(
+            f"v7 iso_min must be in (0, 1); got {iso_min}"
+        )
+    if int(round_min) < 1:
+        raise ValueError(
+            f"v7 round_min is 1-indexed and must be >= 1; got {round_min}"
+        )
+    if int(round_max) != 0 and int(round_max) < int(round_min):
+        raise ValueError(
+            "v7 round_max must be 0 (window disabled = V6 exactly) or "
+            f">= round_min; got round_max={round_max} round_min={round_min}"
+        )
+
+    # ---- Stage A: V6, byte-identical (shared guards live there too) ----- #
+    w6, diag = v6_cse_reject_geo_weights(
+        local_cse=local_cse, data_sizes=data_sizes, gate=gate,
+        tau_ratio=tau_ratio, k_cap=k_cap, m_floor=m_floor, r_hard=r_hard,
+        geo_floor=geo_floor, keep_min=keep_min, eps=eps,
+    )
+    x = local_cse.detach().to(dtype=torch.float32)
+    N = int(x.numel())
+    flagged = diag["flagged"]
+    ratio = diag["ratio"]
+
+    # ---- Tier 2: iso-corroborated flags, cold window only --------------- #
+    in_window = (
+        int(round_max) != 0
+        and int(round_min) <= int(round_logged) <= int(round_max)
+    )
+    geo_resolved = iso is not None
+    if geo_resolved:
+        iso_t = iso.detach().to(device=x.device, dtype=torch.float32)
+        if int(iso_t.numel()) != N:
+            raise ValueError(
+                f"iso length {int(iso_t.numel())} != local_cse length {N}"
+            )
+        # NaN cannot corroborate (0.0 = maximally connected = never flags);
+        # the sanitize direction is the OPPOSITE of the gate's NaN -> 1.0,
+        # same principle: a broken channel degrades to the validated rule.
+        iso_t = torch.nan_to_num(iso_t, nan=0.0).clamp(min=0.0, max=1.0)
+    else:
+        iso_t = torch.zeros_like(x)
+
+    corrob = torch.zeros(N, dtype=torch.bool, device=x.device)
+    if in_window and geo_resolved:
+        max_flags = min(max(0, int(k_cap)), max(0, N - max(1, int(keep_min))))
+        budget = max_flags - int(flagged.sum())
+        if budget > 0:
+            cand = [
+                i for i in range(N)
+                if (not bool(flagged[i]))
+                and float(ratio[i]) > float(tau_lo)
+                and float(iso_t[i]) >= float(iso_min)
+            ]
+            # Pre-registered tie-break: iso desc, then ratio desc, then index
+            # asc — iso is quantized at N=7 so ties are near-certain, and an
+            # unregistered tie-break would let run and replay disagree.
+            cand.sort(key=lambda i: (-float(iso_t[i]), -float(ratio[i]), i))
+            for i in cand[:budget]:
+                corrob[i] = True
+
+    diag["corrob_flagged"] = corrob
+    diag["iso"] = iso_t
+    diag["geo_resolved"] = bool(geo_resolved)
+
+    if not bool(corrob.any()):
+        # Bit-identical V6 by construction (w6 returned untouched).
+        return w6, diag
+
+    ds = data_sizes.detach().to(device=x.device, dtype=torch.float32)
+    mult = torch.where(
+        corrob, torch.full_like(x, float(corrob_mult)), diag["multiplier"]
+    )
+    w = mult * ds
+    total = w.sum()
+    if float(total) <= 0.0:
+        w = mult.clone()
+        total = w.sum().clamp(min=1.0)
+    w = w / total
+    diag["multiplier"] = mult
+    return w, diag
+
+
 def weighted_aggregate(updates, alpha: torch.Tensor) -> torch.Tensor:
     """
     Compute sum_i alpha_i * update_i with shape-robust accumulation.

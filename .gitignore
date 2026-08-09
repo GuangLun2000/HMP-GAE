@@ -7,9 +7,5 @@ __pycache__/
 # Re-created by `python main.py` (and Colab runs that call `main.main`).
 results/*
 !results/.gitkeep
-.DS_Store
 /.vscode
-.DS_Store
-.DS_Store
-.DS_Store
 .DS_Store

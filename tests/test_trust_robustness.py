@@ -35,6 +35,7 @@ from hmp_gae.trust_scorer import (
     v4_cse_reject_weights,
     v5_cse_reject_weights,
     v6_cse_reject_geo_weights,
+    v7_cse_reject_corrob_weights,
 )
 from hmp_gae.hypergraph import knn_hypergraph
 from hmp_gae.runtime import HMPGAERuntime
@@ -709,6 +710,232 @@ def test_v6_monotone_in_ratio_and_gate():
     print("PASS  v6 monotonicity in both ratio and gate, guards raise")
 
 
+# Shared fixtures for the V7 block. cse gives ONE genuine CSE flag (c6,
+# r=3.06 > 1.85) and ONE elevated-but-sub-threshold client (c5, r=1.53 in
+# (tau_lo, 1.85) — V4/V5/V6 structurally cannot touch it). iso is the RAW
+# quantized graph_residual channel (multiples of 1/6 at N=7): c0 is a benign
+# client the hypergraph dislikes (2/3) with r ~ 1 — the scapegoat probe.
+_V7_DS = _V6_DS
+_V7_CSE = torch.tensor([0.60, 0.55, 0.70, 0.58, 0.62, 0.95, 1.90])
+_V7_ISO = torch.tensor([2 / 3, 0.0, 1 / 6, 0.0, 1 / 6, 0.5, 2 / 3])
+_V7_GATE = torch.full((7,), 0.8)
+_V7_KW = dict(tau_ratio=1.85, k_cap=2, m_floor=0.10, r_hard=2.5,
+              geo_floor=0.5, tau_lo=1.40, iso_min=5 / 12, corrob_mult=0.5,
+              round_min=3, round_max=10)
+
+
+def test_v7_window_off_equals_v6():
+    """THE V7 regression guard (house degeneracy family, like geo_floor=1.0
+    -> V5): outside the cold window — round below round_min, above round_max,
+    or round_max=0 — V7 must reproduce v6_cse_reject_geo_weights bit-for-bit
+    (weights AND multipliers), for any iso vector at all. Same when iso=None
+    (graph channel resolution-gated: geometry abstains)."""
+    w6, d6 = v6_cse_reject_geo_weights(
+        _V7_CSE, _V7_DS, gate=_V7_GATE, tau_ratio=1.85, k_cap=2,
+        m_floor=0.10, r_hard=2.5, geo_floor=0.5,
+    )
+    cases = [dict(round_logged=1), dict(round_logged=2),
+             dict(round_logged=11), dict(round_logged=50),
+             dict(round_logged=5, round_max=0)]
+    for iso in (_V7_ISO, torch.ones(7), torch.zeros(7)):
+        for case in cases:
+            kw = dict(_V7_KW)
+            kw.update(case)
+            w7, d7 = v7_cse_reject_corrob_weights(
+                _V7_CSE, _V7_DS, gate=_V7_GATE, iso=iso, **kw)
+            assert torch.equal(w7, w6), (case, w7, w6)
+            assert torch.equal(d7["multiplier"], d6["multiplier"])
+            assert not bool(d7["corrob_flagged"].any())
+    # In-window but geometry abstains (iso=None) -> V6 exactly.
+    w7n, d7n = v7_cse_reject_corrob_weights(
+        _V7_CSE, _V7_DS, gate=_V7_GATE, iso=None, round_logged=5, **_V7_KW)
+    assert torch.equal(w7n, w6)
+    assert d7n["geo_resolved"] is False
+    assert not bool(d7n["corrob_flagged"].any())
+    print("PASS  v7 degeneracy: outside window / iso=None is bit-equal to V6")
+
+
+def test_v7_corroborated_flag_rule():
+    """The Tier-2 rule in isolation: in-window, a non-CSE-flagged client
+    crossing BOTH absolute floors (r > tau_lo AND iso >= iso_min) takes the
+    constant corrob_mult; each conjunct is necessary; the shared rank-cap
+    budget (CSE flags first) is respected; the pre-registered tie-break is
+    (iso desc, ratio desc, index asc)."""
+    w7, d7 = v7_cse_reject_corrob_weights(
+        _V7_CSE, _V7_DS, gate=_V7_GATE, iso=_V7_ISO, round_logged=5, **_V7_KW)
+    # c6 is the CSE flag (V6 handling, untouched); c5 is the corroborated one.
+    assert d7["flagged"].tolist() == [False] * 6 + [True]
+    assert d7["corrob_flagged"].tolist() == [False] * 5 + [True, False]
+    assert abs(float(d7["multiplier"][5]) - 0.5) < 1e-7
+    # c0: iso 2/3 (max isolation) but r ~ 1 -> UNTOUCHED. Isolation alone
+    # never flags — the anti-scapegoat conjunct.
+    assert float(d7["multiplier"][0]) == 1.0
+    # c6 keeps its V6 multiplier (ramp x geo factor), not corrob_mult.
+    _, d6 = v6_cse_reject_geo_weights(
+        _V7_CSE, _V7_DS, gate=_V7_GATE, tau_ratio=1.85, k_cap=2,
+        m_floor=0.10, r_hard=2.5, geo_floor=0.5,
+    )
+    assert abs(float(d7["multiplier"][6]) - float(d6["multiplier"][6])) < 1e-9
+    # Weights renormalise over m_i * n_i and still sum to 1.
+    assert abs(float(w7.sum()) - 1.0) < 1e-6
+    assert float(w7[5]) < float(_V7_DS[5] / _V7_DS.sum())
+    # Conjunct necessity: raise iso_min one midpoint (7/12) -> c5's iso 0.5
+    # no longer qualifies -> exactly V6 again.
+    kw = dict(_V7_KW); kw["iso_min"] = 7 / 12
+    _, d_hi = v7_cse_reject_corrob_weights(
+        _V7_CSE, _V7_DS, gate=_V7_GATE, iso=_V7_ISO, round_logged=5, **kw)
+    assert not bool(d_hi["corrob_flagged"].any())
+    # Conjunct necessity: r below tau_lo (raise tau_lo above c5's 1.53).
+    kw = dict(_V7_KW); kw["tau_lo"] = 1.60
+    _, d_lo = v7_cse_reject_corrob_weights(
+        _V7_CSE, _V7_DS, gate=_V7_GATE, iso=_V7_ISO, round_logged=5, **kw)
+    assert not bool(d_lo["corrob_flagged"].any())
+    # Budget sharing: with BOTH rank-cap slots consumed by CSE flags, Tier 2
+    # must stay empty no matter how isolated an elevated third client is.
+    cse_two = torch.tensor([0.60, 0.55, 0.90, 0.58, 0.62, 1.90, 2.10])
+    _, d_full = v7_cse_reject_corrob_weights(
+        cse_two, _V7_DS, gate=_V7_GATE, iso=torch.full((7,), 2 / 3),
+        round_logged=5, **_V7_KW)
+    assert d_full["flagged"].tolist() == [False] * 5 + [True, True]
+    assert not bool(d_full["corrob_flagged"].any()), \
+        "Tier 2 must never exceed the shared rank cap"
+    # Tie-break (a): equal iso -> higher ratio wins the last slot.
+    cse_tie = torch.tensor([0.60, 0.55, 0.90, 0.58, 0.62, 1.00, 1.90])
+    iso_tie = torch.tensor([0.0, 0.0, 2 / 3, 0.0, 0.0, 2 / 3, 0.0])
+    _, d_tie = v7_cse_reject_corrob_weights(
+        cse_tie, _V7_DS, gate=_V7_GATE, iso=iso_tie, round_logged=5, **_V7_KW)
+    assert d_tie["flagged"].tolist() == [False] * 6 + [True]
+    # candidates: c2 (r=1.45, iso 2/3) vs c5 (r=1.61, iso 2/3); budget 1.
+    assert d_tie["corrob_flagged"].tolist() == [False] * 5 + [True, False]
+    # Tie-break (b): iso ranks before ratio — c2 at higher iso beats c5.
+    iso_rank = torch.tensor([0.0, 0.0, 2 / 3, 0.0, 0.0, 0.5, 0.0])
+    _, d_rank = v7_cse_reject_corrob_weights(
+        cse_tie, _V7_DS, gate=_V7_GATE, iso=iso_rank, round_logged=5, **_V7_KW)
+    assert d_rank["corrob_flagged"].tolist() == \
+        [False, False, True, False, False, False, False]
+    # Tie-break (c): a FULL tie (equal iso AND equal ratio) resolves by
+    # index asc — the last pre-registered key, needed because the channel is
+    # quantized and dyadic CSE values can tie the ratio exactly too.
+    cse_full = torch.tensor([0.5, 0.5, 0.75, 0.5, 0.75, 0.5, 1.0])
+    iso_full = torch.tensor([0.0, 0.0, 2 / 3, 0.0, 2 / 3, 0.0, 0.0])
+    _, d_ix = v7_cse_reject_corrob_weights(
+        cse_full, _V7_DS, gate=_V7_GATE, iso=iso_full, round_logged=5,
+        **_V7_KW)
+    # c6 takes the CSE flag (r = 2.0); c2 and c4 are identical candidates
+    # (r = 1.5, iso = 2/3) for the single remaining slot -> lower index (c2).
+    assert d_ix["flagged"].tolist() == [False] * 6 + [True]
+    assert d_ix["corrob_flagged"].tolist() == \
+        [False, False, True, False, False, False, False]
+    # NaN iso cannot corroborate (sanitizes to 0.0 = maximally connected).
+    iso_nan = _V7_ISO.clone(); iso_nan[5] = float("nan")
+    _, d_nan = v7_cse_reject_corrob_weights(
+        _V7_CSE, _V7_DS, gate=_V7_GATE, iso=iso_nan, round_logged=5, **_V7_KW)
+    assert not bool(d_nan["corrob_flagged"][5])
+    # Weight formula is the normative w = normalize(m_i * n_i) — the n_i
+    # prior must survive the Tier-2 renormalization (kills a w = m_i mutant;
+    # _V7_DS is deliberately non-uniform).
+    exp_mult = d6["multiplier"].clone()
+    exp_mult[5] = 0.5
+    exp_w = exp_mult * _V7_DS
+    exp_w = exp_w / exp_w.sum()
+    assert torch.equal(w7, exp_w), (w7, exp_w)
+    # Window edges are INCLUSIVE on both sides (round_min=3, round_max=10).
+    for rl in (3, 10):
+        _, d_edge = v7_cse_reject_corrob_weights(
+            _V7_CSE, _V7_DS, gate=_V7_GATE, iso=_V7_ISO, round_logged=rl,
+            **_V7_KW)
+        assert d_edge["corrob_flagged"].tolist() == [False] * 5 + [True, False], rl
+    # Boundary strictness, pinned with exactly-representable dyadic values:
+    # ratio uses a STRICT > (r == tau_lo never flags), iso uses an INCLUSIVE
+    # >= (iso == iso_min flags). cse 0.75/median 0.5 = 1.5 exact in float32.
+    cse_b = torch.tensor([0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.75])
+    iso_b = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5])
+    kw_b = dict(_V7_KW); kw_b.update(tau_lo=1.5, iso_min=0.5)
+    _, d_strict = v7_cse_reject_corrob_weights(
+        cse_b, _V7_DS, gate=_V7_GATE, iso=iso_b, round_logged=5, **kw_b)
+    assert not bool(d_strict["corrob_flagged"].any()), \
+        "r == tau_lo must NOT flag (strict >)"
+    kw_b = dict(_V7_KW); kw_b.update(tau_lo=1.4375, iso_min=0.5)
+    _, d_incl = v7_cse_reject_corrob_weights(
+        cse_b, _V7_DS, gate=_V7_GATE, iso=iso_b, round_logged=5, **kw_b)
+    assert d_incl["corrob_flagged"].tolist() == [False] * 6 + [True], \
+        "iso == iso_min MUST flag (inclusive >=)"
+    print("PASS  v7 corrob rule: both floors + budget + tie-break, iso alone never flags")
+
+
+def test_v7_clean_federation_identity():
+    """Clean pool under V7: no CSE flags, no corroborated flags -> weights
+    are EXACTLY the n_k prior even in-window. The fixture deliberately
+    includes the archive's known hazard, a heterogeneous benign client with
+    an elevated ratio: r_2 = 0.98/0.62 = 1.58 > tau_lo — under V7 the iso
+    conjunct is what protects it (iso_2 = 1/6 < iso_min). NOTE the honest
+    caveat this fixture encodes: a clean benign client with BOTH r > tau_lo
+    AND iso >= iso_min inside the window WOULD be mis-flagged — V7's clean
+    exactness is conditional on the replay-verified premise that this joint
+    event never occurs in the clean archives (replay_v7_calibration.py PASS
+    criterion), unlike V4/V5/V6 whose exactness is structural. This test
+    pins the mechanics, not that premise."""
+    cse0 = torch.tensor([0.60, 0.55, 0.98, 0.58, 0.62, 0.70, 0.66])
+    # r_2 = 0.98/0.62 = 1.58 > tau_lo, but iso_2 = 1/6: below iso_min.
+    iso0 = torch.tensor([0.0, 1 / 6, 1 / 6, 0.0, 1 / 3, 0.0, 1 / 6])
+    w0, d0 = v7_cse_reject_corrob_weights(
+        cse0, _V7_DS, gate=torch.full((7,), 0.9), iso=iso0, round_logged=5,
+        **_V7_KW)
+    assert not bool(d0["flagged"].any())
+    assert not bool(d0["corrob_flagged"].any())
+    # Bit-exact, not allclose: the no-flag path multiplies by a literal 1.0
+    # vector, so w IS ds/ds.sum() to the last ulp.
+    assert torch.equal(w0, _V7_DS / _V7_DS.sum())
+    assert torch.equal(d0["multiplier"], torch.ones(7))
+    print("PASS  v7 clean federation: no flags -> exactly the n_k prior")
+
+
+def test_v7_monotone_vs_v6():
+    """m_v7 <= m_v6 pointwise for any iso and gate: Tier 2 can only replace a
+    1.0 with corrob_mult < 1 on unflagged clients; Stage-A (CSE) flags and
+    multipliers are byte-identical to V6's. V7 never softens anything."""
+    rng = np.random.default_rng(1)
+    for _ in range(20):
+        gate = torch.tensor(rng.random(7), dtype=torch.float32)
+        iso = torch.tensor(
+            rng.integers(0, 5, size=7) / 6.0, dtype=torch.float32)
+        w6, d6 = v6_cse_reject_geo_weights(
+            _V7_CSE, _V7_DS, gate=gate, tau_ratio=1.85, k_cap=2,
+            m_floor=0.10, r_hard=2.5, geo_floor=0.5,
+        )
+        _, d7 = v7_cse_reject_corrob_weights(
+            _V7_CSE, _V7_DS, gate=gate, iso=iso, round_logged=5, **_V7_KW)
+        assert d7["flagged"].tolist() == d6["flagged"].tolist()
+        assert torch.all(d7["multiplier"] <= d6["multiplier"] + 1e-9)
+        flagged = d6["flagged"]
+        assert torch.all(
+            d7["multiplier"][flagged] == d6["multiplier"][flagged]
+        ), "V7 must not touch a CSE-flagged client's V6 multiplier"
+    # Guards: every knob out of range raises (ValueError, at the function).
+    for bad in (dict(tau_lo=1.85), dict(tau_lo=1.0), dict(tau_lo=2.0),
+                dict(corrob_mult=0.0), dict(corrob_mult=1.0),
+                dict(corrob_mult=-0.5), dict(iso_min=0.0), dict(iso_min=1.0),
+                dict(round_min=0), dict(round_min=5, round_max=4)):
+        kw = dict(_V7_KW)
+        kw.update(bad)
+        try:
+            v7_cse_reject_corrob_weights(
+                _V7_CSE, _V7_DS, gate=_V7_GATE, iso=_V7_ISO,
+                round_logged=5, **kw)
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+    # A mis-sized iso is a plumbing bug: loud, not broadcast.
+    try:
+        v7_cse_reject_corrob_weights(
+            _V7_CSE, _V7_DS, gate=_V7_GATE, iso=torch.ones(3),
+            round_logged=5, **_V7_KW)
+        raise AssertionError("expected ValueError for a length-3 iso")
+    except ValueError:
+        pass
+    print("PASS  v7 monotone vs v6, CSE flags untouched, guards raise")
+
+
 # --------------------------------------------------------------------------- #
 # 5) runtime: suspicion EMA + checkpoint roundtrip                            #
 # --------------------------------------------------------------------------- #
@@ -947,6 +1174,163 @@ def test_runtime_v6_cse_reject_geo():
     print("PASS  runtime v6_cse_reject_geo: gate wired in, <= V5, guards")
 
 
+def test_runtime_v7_cse_reject_corrob():
+    """End-to-end runtime in V7 mode. Checks the four things only the wiring
+    can get wrong: (1) the Tier-2 iso input is the SAME vector the run logs
+    as 'residual' (raw graph_residual — NOT the z-scored gate); (2) the
+    window arithmetic is 1-indexed (round_num 2 = logged round 3 = armed;
+    round_num 0 = logged round 1 = V6 bit-identical); (3) when the graph
+    channel is resolution-gated (graph_min_distinct) the geometry abstains
+    end-to-end; (4) the v7_* diagnostics reach stats and stale v7 keys stay
+    inert under older modes."""
+    ids, ds = list(range(7)), [100.0] * 7
+    # c6: genuine CSE flag (r = 3.28). c5: elevated-but-sub-1.85 (r = 1.56)
+    # — V4/V5/V6 structurally cannot touch it; V7's cold window can, iff the
+    # hypergraph corroborates. With the seed-1 geometry the raw residuals
+    # resolve only 3 distinct levels, so graph_min_distinct=4 gates the
+    # channel; the in-window arms therefore run graph_min_distinct=0.
+    cse = [0.60, 0.62, 0.58, 0.61, 0.59, 0.95, 2.00]
+
+    def _run(cfg_extra, round_num=2):
+        torch.manual_seed(0)
+        rt = _runtime(dict({"num_byzantine": 2, "graph_min_distinct": 0},
+                           **cfg_extra))
+        rows_local = make_geometry(5, 2, dim=256, seed=1)
+        _, st = rt.aggregate([rows_local[i] for i in range(7)], ids, ds,
+                             round_num=round_num, local_cse=cse)
+        return st
+
+    v7_cfg = {"trust_mode": "v7_cse_reject_corrob",
+              "v7_tau_lo": 1.40, "v7_iso_min": 5 / 12,
+              "v7_corrob_mult": 0.5, "v7_round_min": 3, "v7_round_max": 10}
+
+    s7 = _run(v7_cfg, round_num=2)              # logged round 3: in-window
+    s6 = _run({"trust_mode": "v6_cse_reject_geo"}, round_num=2)
+    assert s7["trust_mode_used"] == "v7_cse_reject_corrob"
+    # (1) iso == the logged raw residual channel, and the geometry resolved.
+    assert np.allclose(s7["v7_iso"], s7["residual"], atol=1e-7)
+    assert s7["v7_geo_resolved"] is True
+    # Flag sets: CSE flag on c6 identical to V6; corroborated flag on c5
+    # (r=1.56 > tau_lo, residual 0.5 >= 5/12); the two benign clients the
+    # hypergraph dislikes MOST (c0/c3 at residual 2/3) stay untouched
+    # because their ratio is ~1 — iso alone never flags.
+    assert s7["v4_flagged"] == s6["v4_flagged"] == [0, 0, 0, 0, 0, 0, 1]
+    assert s7["v7_corrob_flagged"] == [0, 0, 0, 0, 0, 1, 0]
+    m7 = np.asarray(s7["v4_multiplier"])
+    assert abs(m7[5] - 0.5) < 1e-7
+    assert m7[0] == 1.0 and m7[3] == 1.0
+    assert np.asarray(s7["alpha"])[5] < np.asarray(s6["alpha"])[5]
+    # (2) out-of-window round: V7 == V6 bit-for-bit (logged round 1 < 3).
+    s7_cold = _run(v7_cfg, round_num=0)
+    s6_cold = _run({"trust_mode": "v6_cse_reject_geo"}, round_num=0)
+    assert np.allclose(s7_cold["alpha"], s6_cold["alpha"], atol=0.0, rtol=0.0)
+    assert s7_cold["v7_corrob_flagged"] == [0] * 7
+    # (3) graph channel gated -> geometry abstains -> V6 exactly, in-window.
+    s7_gated = _run(dict(v7_cfg, graph_min_distinct=4), round_num=2)
+    s6_gated = _run({"trust_mode": "v6_cse_reject_geo",
+                     "graph_min_distinct": 4}, round_num=2)
+    assert s7_gated["graph_channel_gated"] is True
+    assert s7_gated["v7_geo_resolved"] is False
+    assert s7_gated["v7_corrob_flagged"] == [0] * 7
+    assert np.allclose(s7_gated["alpha"], s6_gated["alpha"],
+                       atol=0.0, rtol=0.0)
+    # (3b) knob plumbing + inclusive edges with a NON-DEFAULT window: the
+    # config values must actually reach the scorer call (a dropped kwarg
+    # falls back to the function defaults and is invisible when the config
+    # repeats them), and round_max is the LAST armed round — this arm also
+    # kills a round_num+2 / exclusive-'<' wiring regression, because logged
+    # round 4 must NOT fire while logged round 3 (== round_max) must.
+    v7_edge = dict(v7_cfg, v7_round_min=2, v7_round_max=3,
+                   v7_corrob_mult=0.25)
+    s_edge = _run(v7_edge, round_num=2)      # logged 3 == round_max: armed
+    assert s_edge["v7_corrob_flagged"] == [0, 0, 0, 0, 0, 1, 0]
+    assert abs(np.asarray(s_edge["v4_multiplier"])[5] - 0.25) < 1e-7, \
+        "v7_corrob_mult must be plumbed, not the 0.5 default"
+    assert s_edge["v7_round_max"] == 3 and s_edge["v7_round_min"] == 2
+    s_lo = _run(v7_edge, round_num=1)        # logged 2 == round_min: armed
+    assert s_lo["v7_corrob_flagged"] == [0, 0, 0, 0, 0, 1, 0], \
+        "v7_round_min must be plumbed (default 3 would leave logged 2 cold)"
+    s_past = _run(v7_edge, round_num=3)      # logged 4 > round_max: V6 again
+    assert s_past["v7_corrob_flagged"] == [0] * 7
+    # tau_lo plumbing: a floor above c5's r = 1.56 must silence Tier 2
+    # (the 1.40 default would fire).
+    s_hi = _run(dict(v7_cfg, v7_tau_lo=1.60), round_num=2)
+    assert s_hi["v7_corrob_flagged"] == [0] * 7
+    # (4) diagnostics present and correctly labelled; V6 rounds carry none.
+    for key in ("v7_corrob_flagged", "v7_iso", "v7_geo_resolved",
+                "v7_tau_lo", "v7_iso_min", "v7_corrob_mult",
+                "v7_round_min", "v7_round_max",
+                "v6_geo_floor", "v6_geo_gate", "v6_geo_mult", "v6_m_cse",
+                "v5_m_floor", "v5_r_hard", "v5_ramp_t",
+                "v4_cse", "v4_ratio", "v4_median_cse"):
+        assert key in s7, f"missing diagnostic {key}"
+    assert "v4_reject_mult" not in s7
+    assert "v7_corrob_flagged" not in s6, \
+        "V6 rounds must not carry V7 diagnostics"
+
+    # Missing local_cse must raise, not silently degrade.
+    torch.manual_seed(0)
+    rt = _runtime({"trust_mode": "v7_cse_reject_corrob", "num_byzantine": 2})
+    rows = make_geometry(5, 2, dim=256, seed=1)
+    try:
+        rt.aggregate([rows[i] for i in range(7)], ids, ds, round_num=2)
+        raise AssertionError("expected ValueError when local_cse is missing")
+    except ValueError:
+        pass
+
+    # Config guards at CONSTRUCTION (same rationale as V6: a raise inside
+    # aggregate() would be eaten by the FedAvg fallback net).
+    _runtime({"trust_mode": "v7_cse_reject_corrob", "num_byzantine": 2,
+              "v7_round_max": 0})               # window-off arm is legal
+    for bad in ({"v7_tau_lo": 1.85}, {"v7_tau_lo": 1.0},
+                {"v7_corrob_mult": 0.0}, {"v7_corrob_mult": 1.0},
+                {"v7_iso_min": 0.0}, {"v7_iso_min": 1.0},
+                {"v7_round_min": 0}, {"v7_round_min": 5, "v7_round_max": 4},
+                {"v5_m_floor": 0.0}, {"v6_geo_floor": 0.0},
+                {"num_byzantine": 4}):
+        cfg = dict({"trust_mode": "v7_cse_reject_corrob", "num_byzantine": 2},
+                   **bad)
+        try:
+            _runtime(cfg)
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+    # ...and out-of-range v7 keys must stay INERT under V4/V5/V6 (a stale
+    # key in defense_config must not crash an older arm).
+    for mode in ("v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo"):
+        _runtime({"trust_mode": mode, "num_byzantine": 2,
+                  "v7_tau_lo": 5.0, "v7_corrob_mult": 0.0,
+                  "v7_round_min": 0})
+    print("PASS  runtime v7_cse_reject_corrob: iso wired raw, window 1-indexed, guards")
+
+
+def test_defense_facade_local_cse_guard():
+    """The loud-crash contract lives in the FACADE, before its FedAvg
+    fallback try/except: a CSE-reject trust_mode without a local_cse vector
+    must raise RuntimeError out of HMPGAEDefense.aggregate, never degrade to
+    50 silent FedAvg rounds. Includes a whitespace-padded mode string: the
+    runtime normalizes with .strip().lower(), so the facade (and
+    Server._needs_local_cse) must strip identically or the padded mode
+    slips past this guard while still running a CSE-reject rule."""
+    from defense import HMPGAEDefense
+    rows = make_geometry(5, 2, dim=256, seed=1)
+    updates = [rows[i] for i in range(7)]
+    for mode in ("v7_cse_reject_corrob", " v7_cse_reject_corrob ",
+                 "v4_cse_reject"):
+        d = HMPGAEDefense(num_clients=7, config={
+            "trust_mode": mode, "num_byzantine": 2, "device": "cpu",
+            "proj_dim": 32, "eta_dim": 32, "hidden_dim": 32,
+            "latent_dim": 16, "num_hmp_layers": 2, "knn_k": 2,
+            "train_steps_per_round": 2})
+        try:
+            d.aggregate(updates, list(range(7)), [100.0] * 7, 0,
+                        torch.device("cpu"))
+            raise AssertionError(f"expected RuntimeError for mode={mode!r}")
+        except RuntimeError:
+            pass
+    print("PASS  defense facade: missing local_cse raises before any fallback")
+
+
 def test_runtime_attackers_lose_weight_over_rounds():
     """End-to-end runtime with the production signal stack (semantic ON):
     after the EMA warms up, attackers hold negligible aggregation mass."""
@@ -989,9 +1373,15 @@ if __name__ == "__main__":
     test_v6_monotone_safety()
     test_v6_clean_federation_identity()
     test_v6_monotone_in_ratio_and_gate()
+    test_v7_window_off_equals_v6()
+    test_v7_corroborated_flag_rule()
+    test_v7_clean_federation_identity()
+    test_v7_monotone_vs_v6()
     test_runtime_ema_and_state_roundtrip()
     test_runtime_v4_cse_reject()
     test_runtime_v5_cse_reject()
     test_runtime_v6_cse_reject_geo()
+    test_runtime_v7_cse_reject_corrob()
+    test_defense_facade_local_cse_guard()
     test_runtime_attackers_lose_weight_over_rounds()
     print("\nAll trust-robustness tests passed.")

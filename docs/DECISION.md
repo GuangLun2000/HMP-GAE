@@ -282,6 +282,208 @@ sweep set is now {0.10, 0.05, 0.02, 0.0}.
   renormalise to the n_k prior, clean rounds bit-identical to soft V4,
   guard accepts 0.0 / refuses negatives).
 
+## V7 `v7_cse_reject_corrob`: iso-corroborated cold-window rejection (2026-08-08)
+
+**Adopted (design + implementation; NOT yet runnable):** V7 re-admits the
+hypergraph to the *flag decision* — the one place V6 structurally cannot
+reach — but only inside the CSE cold-start window and only as a
+corroborator. `trust_mode='v7_cse_reject_corrob'`
+(`trust_scorer.v7_cse_reject_corrob_weights`):
+
+- **Stage A = V6 byte-identical** (V4 flag rule → V5 ramp → V6 geometry
+  factor). Outside the window, or whenever Tier 2 stays empty, V7 *returns
+  V6's output tensor unchanged* — bit-identity by construction, tested.
+- **Tier 2 (the V7 delta), armed only for logged rounds
+  `v7_round_min..v7_round_max` (1-indexed, same units as the archives'
+  `round` channel):** a client NOT CSE-flagged is corroboration-flagged iff
+  `r > v7_tau_lo` **AND** `raw graph_residual >= v7_iso_min`, subject to the
+  shared rank-cap budget (`num_byzantine − |CSE flags|`; CSE flags always
+  take precedence and can never be displaced or re-ranked — the set form is
+  normative; a seemingly-equivalent "rescaled statistic" form was shown to
+  re-order CSE flags and is rejected). Candidate ranking is pre-registered:
+  iso desc, then ratio desc, then index asc (the channel is quantized at
+  N=7, ties are near-certain). Flagged multiplier = constant
+  `v7_corrob_mult`; everyone else keeps the literal 1.0.
+
+**Honest mechanism statement (wording is load-bearing):** V7 is an
+*iso-corroborated threshold discount*, not "the hypergraph detects in the
+cold window". Geometry never flags alone; R1–R2 stay untouched by V7's own
+physics (attacker r ≈ 1 there fails `tau_lo`) — which is why the window
+opens at round 3, where the archive puts 78% of V4's residual false
+negatives (rounds ≤ 5) and ~half the mean-CSE mass (R1–R10). The
+hypergraph's necessity claim is: **without the iso conjunct, no threshold
+below 1.85 survives zero-FP replay** (archived clean-run benign ratio max
+1.7833 > any useful `tau_lo`), so the geometry is what makes a sub-1.85
+threshold safe. Every Tier-2 flag with `r < 1.785` (bottom of the archived
+V4 plateau) is a detection no legal CSE threshold could have made —
+replayable, countable, hypergraph-attributable.
+
+Design choices and their reasons:
+
+- **The conjunct is the RAW `graph_residual`, never the sigmoid gate.** The
+  gate's suspicion input is a weighted sum of `_zscore`d (pool-relative)
+  channels; giving it flag authority is exactly what the V4 no-`_zscore`
+  rule forbids. The raw channel is bounded [0,1], absolute-scaled, quantized
+  to multiples of 1/(N−1), and archived per round as `residual`. The gate
+  keeps its V6 role: penalty *magnitude* on Stage-A-flagged clients.
+- **`v7_iso_min` sits at an inter-level midpoint** (7/12 = only reach ≤ 2
+  flags at N=7/knn_k=2; candidate 5/12 also admits reach = 3) — never ON a
+  quantization level, where float dust decides flags.
+- **Constant penalty, not gate-modulated:** the archived gate averages 0.766
+  on confirmed Qwen-AG attackers, so a gate-modulated Tier-2 penalty would
+  trim ~12% and vanish inside seed noise ("detection without penalty").
+  `v7_corrob_mult` ∈ (0,1), never 0 — this tier's evidence is weaker than a
+  full CSE flag, so hard removal is rejected *a fortiori*.
+- **Resolution abstention:** when `graph_min_distinct` gates the graph
+  channel (quantization-noise round), Tier 2 abstains entirely (`iso=None`
+  → V6 exactly). A degenerate channel must degrade to the validated rule.
+- **Honest demotion of the clean-federation property:** because
+  `tau_lo < 1.7833`, clean exactness is no longer purely structural as in
+  V4–V6. Unflagged clients still take the literal 1.0, but "no clean flags"
+  now rests on the replay-verified premise that no clean benign client-round
+  jointly crosses `(tau_lo, iso_min)` inside the window. That premise is a
+  pre-registered PASS criterion of the replay, with margins reported per
+  cell — and it is honestly weaker evidence than V4's: the armed window
+  holds only ~a few hundred clean client-round decisions, not 17,850.
+- **`graph_residual` is computed in the TRAINED node-encoder embedding**,
+  not raw update geometry — its cross-seed/backbone/round stability is a
+  replay PASS criterion (round-stratified histograms), not an assumption.
+
+**Pre-committed calibration ([replay_v7_calibration.py](../replay_v7_calibration.py),
+stdlib-only, runs on the archived `*_results.json`):** grids `tau_lo` ∈
+{1.30..1.80 step 0.05}, `iso_min` ∈ {5/12, 7/12}, `round_max` ∈ {5, 8, 10},
+`round_min` = 3. PASS = a ≥ 2-point contiguous zero-FP `tau_lo` plateau
+(cap-free AND budgeted counts both 0 over all admitted benign client-round
+decisions — the budget is an exposure bound here, NOT V4's structural
+shield, since Tier 2 ranks by iso in the regime where attacker
+iso-dominance is the unproven hypothesis). Selection is fully deterministic
+(windows NEST — the Tier-2 flag set at a smaller `round_max` is a subset of
+a larger one's, so zero-FP at the largest passing window implies zero-FP at
+every smaller candidate): (1) the most conservative `iso_min` with a
+passing plateau at any `round_max`; (2) the CERTIFIED plateau is the one at
+the largest passing `round_max`; (3) `tau_lo` = that plateau's midpoint
+rounded down to the grid (lower-middle element); (4) `round_max` = the
+smallest candidate covering ≥ 80% of the certified recall at the selected
+`(tau_lo, iso_min)`. An always-on arm (no window) is replayed
+for documentation: its expected steady-state FP failures justify the
+window's existence (the archive's top-1 geometry suspect is BENIGN in 45/50
+Llama-Yahoo and 34/50 Qwen-Yahoo steady-state rounds). Kill criteria:
+empty/point plateau, zero recall everywhere, or benign iso distributions
+shifting ≥ one quantization level across cells at matched rounds → V7 is
+recorded here as a negative result; the grids are NOT widened.
+
+**2026-08-08 post-implementation audit amendments (pre-data — nothing had
+been replayed when these were written; they tighten the calibration
+contract, they do not react to results):**
+
+- *The replay now mirrors the resolution abstention.* The initial script
+  counted Tier-2 decisions in rounds where `graph_min_distinct` gated the
+  graph channel — rounds where the live rule abstains (`iso=None`), and the
+  archive's MAJORITY case (the channel degenerates in 33–44 of 50 Yahoo
+  rounds). Gated rounds are now excluded from every statistic (FP, recall,
+  plateau, always-on arm) and the per-run excluded count is reported in
+  Phase 0, keeping the admitted-decision denominator auditable. Archives
+  predating the `graph_channel_gated` key reconstruct gating from the
+  persisted residual levels with the archived `graph_min_distinct`
+  (default 4).
+- *Pre-V4 archives are admitted by exact reconstruction.* Rounds lacking
+  as-run `v4_ratio`/`v4_flagged` (written before the V4 commit,
+  2026-07-28 — which includes the 5 no-attacker baselines behind the
+  zero-FP claim) recompute `ratio_i = cse_i / max(median_lower(cse), 1e-6)`
+  from the per-round `local_cse` dict, where `median_lower` is
+  torch.median's lower-middle convention (NOT `statistics.median`, which
+  averages at even N), and re-derive the as-run V4 flag set by the V4 rule
+  (rank by ratio desc / index asc, cap `min(k_cap, N − max(1, keep_min))`,
+  flag only `r > 1.85`). This is a float64 reconstruction of a float32
+  rule; the ~1e-6 relative error is four orders of magnitude below the
+  0.05 `tau_lo` grid step. Rounds without a complete `local_cse` dict are
+  excluded and counted.
+- *The replayed budget now carries the `keep_min` clamp*
+  (`min(k_cap, N − max(1, keep_min)) − |CSE flags|`), matching
+  `trust_scorer` exactly instead of the bare `k_cap`.
+- *Selection was made fully deterministic* (the nested-window rule above —
+  the original "plateau midpoint" left WHICH `round_max`'s plateau
+  unspecified when they differ).
+- *Exit codes are now load-bearing*: 0 = pass with a printed selection,
+  2 = no usable clean baseline (zero-FP premise uncertifiable), 3 =
+  negative result — so a notebook cell keying on exit status cannot
+  misread a kill as success. Phase 5 additionally emits the
+  round-stratified benign iso medians per cell that back the stability
+  kill criterion (previously stated here but not computed anywhere).
+
+**Current knob values in `main()` (`v7_tau_lo=1.40`, `v7_iso_min≈7/12`,
+`v7_corrob_mult=0.5`, `v7_round_min=3`, `v7_round_max=10`) are PROVISIONAL
+placeholders — no V7 training run may launch before the replay passes and
+this entry is amended with the selected constants.** `v7_round_max=0` is
+the wiring-regression arm (V6 bit-identical; the geo_floor=1.0 / W=0
+degeneracy family) and must be Run 0 of any V7 experiment plan.
+
+**Threat-model scope, stated up front:** fixed attack-from-round-1,
+non-adaptive label-flip. Known counterplay recorded now, not after review:
+(a) delayed-onset attackers re-open the cold hole past the window (the
+archive cannot test this — all archived attacks start at R1); (b) the
+roadmapped cosine+norm stealth attacker nulls the iso channel; (c)
+update-forging (AugMP) stays incompatible with the whole CSE family; (d)
+*mutual-selection reach inflation*: two colluding attackers that select
+each other with DISTINCT benign second picks reach 3 peers (residual 1/2)
+— under the preferred 7/12 floor, admitted only by the 5/12 candidate.
+`reach` counts ALL co-members (including the other attacker), so "isolated
+from the benign majority" is an interpretation, not the statistic; Phase 3
+of the replay reports the recovered attackers' in-window residual levels,
+so which regime the archived label-flip attackers actually occupy is
+measured, not assumed. Two upstream channel edge cases are recorded but
+deliberately left unfixed mid-campaign (changing the hypergraph
+construction now would desynchronize live runs from the archived channel
+the calibration replays): a NaN client update inverts the signal
+(`torch.topk` ranks NaN similarities on top, so every node selects the NaN
+client and its residual collapses to 0.0 — but a NaN-update client has a
+degenerate local model, which the CSE tier flags), and exact-duplicate
+updates fall back to topk's index order (`graph_min_distinct` gates such
+degenerate rounds). The
+"geometry owns update-forging / no-server-data" division-of-labor design
+(geometry EMA with independent flag authority) is the natural V8 direction
+but requires a *log-only phase first* (a raw-projection isolation statistic
+is not in the archive) and its own entry — explicitly deferred.
+
+**Rejected within this design:**
+
+- *Gate-as-flag-authority* — C2 violation (pool-relative z inside), plus
+  config-heterogeneity makes the archived gate uncalibratable across runs.
+- *Neighborhood-median CSE* (hypergraph inside the statistic) — at N=7,
+  knn_k=2 a hyperedge has 3 members; {A1, A2, benign} is attacker-majority
+  and the local median loses the benign-controlled-denominator guarantee.
+  One-sided fixes fail both ways (min() kills the 1.7833/1.85 headroom,
+  max() helps colluders). Pool median stays.
+- *Gate-modulated Tier-2 penalty* — see above; ~0.88 effective multiplier is
+  outcome noise.
+- *Sticky flags / permanent blacklisting* — still deferred (V5 entry).
+
+Falsification statistic: the per-run count of `v7_corrob_flagged`
+client-rounds. Zero everywhere = the cold-window tier never acted and V7 is
+V6 renamed — report it; do not widen the window or lower the floors.
+
+Tested (`tests/test_trust_robustness.py`): `test_v7_window_off_equals_v6`
+(bit-identity outside the window / at `round_max=0` / on iso=None),
+`test_v7_corroborated_flag_rule` (both floors necessary, budget sharing,
+CSE-flag priority, tie-break, NaN abstention),
+`test_v7_clean_federation_identity` (n_k prior exactly; the fixture encodes
+the elevated-ratio benign client protected by the iso floor),
+`test_v7_monotone_vs_v6` (m_V7 ≤ m_V6 pointwise; CSE flags untouched;
+guards), `test_runtime_v7_cse_reject_corrob` (iso wired from the logged raw
+`residual`, 1-indexed window arithmetic, resolution abstention end-to-end,
+construction-time guards, stale-key inertness under V4/V5/V6, and — added
+by the 2026-08-08 audit — non-default-knob plumbing with both window edges
+inclusive, killing `round_num+2` / exclusive-bound wiring mutants),
+`test_defense_facade_local_cse_guard` (the loud-crash contract at the
+facade, including a whitespace-padded `trust_mode` — pins the
+`.strip().lower()` normalization being identical across runtime, facade
+and `Server._needs_local_cse`). The pure-function tests additionally pin,
+per the same audit: the normative `w = normalize(m_i · n_i)` against a
+`w = m_i` mutant (non-uniform `n_k` fixture), strict `>` at `r == tau_lo`
+vs inclusive `>=` at `iso == iso_min` (dyadic exactly-representable
+fixtures), and the index-ascending final tie-break key under a full
+`(iso, ratio)` tie.
+
 ## C1 z-score hygiene (2026-07-28)
 
 - `_zscore` MAD degeneracy guard is **relative** (`scale < 1e-3·max|x|`), with

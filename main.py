@@ -1614,6 +1614,13 @@ def main():
             #       n_k/Σn — the "no scapegoat" property V3 could not hold.
             #       Same local-CSE requirement / eval timing / AugMP
             #       incompatibility as V4.
+            #   'v7_cse_reject_corrob' (V7, 2026-08-08): V6 byte-identical,
+            #       plus a Tier-2 iso-corroborated flag inside the CSE
+            #       cold-start window only (see the v7_* knob block below;
+            #       trust_scorer.v7_cse_reject_corrob_weights). ⚠ DO NOT run
+            #       this mode before the replay calibration
+            #       (replay_v7_calibration.py) passes — the v7_* constants
+            #       below are provisional (docs/DECISION.md "V7").
             # CURRENT RUN: 'v4_cse_reject' with v4_reject_mult=0.0 below — the
             # V4-REMOVE ablation. The ONE aggregation-behavior axis moved vs
             # the archived Qwen AG News V4 companion (20260729) is that
@@ -1680,6 +1687,43 @@ def main():
             #   Do NOT re-tune after seeing results; if v6_geo_mult logs at
             #   ≈1.0 every round, report "geometry did not act".
             'v6_geo_floor': 0.5,
+            # --- V7 cold-window corroboration knobs (INERT unless trust_mode='v7_cse_reject_corrob') ---
+            # V7 = V6 byte-identical (Stage A: flags, ramp, geo factor) PLUS a
+            # Tier-2 "corroborated" flag armed ONLY inside the CSE cold-start
+            # window (78% of V4's replay false negatives are rounds <= 5;
+            # R1-R10 accrue ~half of mean-CSE mass):
+            #   Tier 2 (round v7_round_min..v7_round_max, 1-indexed):
+            #     budget = num_byzantine - |CSE flags|      (shared rank cap;
+            #                        CSE flags always take precedence)
+            #     flag i if  r_i > v7_tau_lo  AND  iso_i >= v7_iso_min
+            #                (iso = RAW graph_residual — never the z-scored
+            #                 gate; abstains when graph_min_distinct gates
+            #                 the channel)
+            #     mult   = v7_corrob_mult    (constant; unflagged stay 1.0)
+            # MECHANISM, honestly stated: an iso-corroborated THRESHOLD
+            # DISCOUNT. The hypergraph never flags alone and never detects in
+            # R1-R2 (attacker ratio ~1 there fails tau_lo); what it buys is
+            # safety for a sub-1.85 threshold — clean-run benign ratios reach
+            # 1.7833, so tau_lo=1.40 alone would false-flag; the iso conjunct
+            # is what makes it zero-FP (that premise is a replay PASS
+            # criterion, not an assumption).
+            # ⚠ ALL FOUR KNOBS ARE PROVISIONAL (2026-08-08) — no V7 training
+            # run may launch until replay_v7_calibration.py over the archived
+            # runs confirms a zero-FP plateau and picks the constants from the
+            # pre-committed grids (docs/DECISION.md "V7"): tau_lo in
+            # {1.30..1.80 step 0.05}, iso_min in {5/12, 7/12} (inter-level
+            # midpoints of the quantized channel — never ON a level),
+            # round_max in {5, 8, 10}. After that they are pre-registered.
+            # v7_round_max=0 disables the window = V6 bit-identical (the
+            # Run-0 wiring regression arm). v7_corrob_mult is (0,1), never 0
+            # (weaker evidence tier than a full CSE flag) and deliberately
+            # constant, not gate-modulated (archived attacker gate ~0.766
+            # would shrink a gate-modulated penalty into seed noise).
+            'v7_tau_lo': 1.40,
+            'v7_iso_min': 7.0 / 12.0,  # inter-level midpoint: only reach<=2 flags at N=7,knn_k=2
+            'v7_corrob_mult': 0.5,
+            'v7_round_min': 3,      # R1-R2: no recall, noisiest signals
+            'v7_round_max': 10,
             # --- Robust suspicion scale (2026-07-04) ---
             # zscore_mode 'mad': median/MAD z-scores.  mean/std gets polluted
             #   as the attacker fraction grows (attackers drag the mean toward

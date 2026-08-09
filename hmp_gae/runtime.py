@@ -41,6 +41,7 @@ from .trust_scorer import (
     v4_cse_reject_weights,
     v5_cse_reject_weights,
     v6_cse_reject_geo_weights,
+    v7_cse_reject_corrob_weights,
 )
 
 
@@ -159,6 +160,18 @@ class HMPGAERuntime:
         #     without letting it soften any CSE-driven penalty. v6_geo_floor=1.0
         #     reproduces V5 exactly. Same local-CSE requirement / eval timing /
         #     AugMP incompatibility as V4.
+        #   'v7_cse_reject_corrob' (V7, 2026-08-08): V6 byte-identical, plus a
+        #     Tier-2 flag armed ONLY inside the CSE cold-start window
+        #     (v7_round_min..v7_round_max, 1-indexed): a client whose CSE
+        #     ratio is elevated but sub-1.85 (r > v7_tau_lo) AND whose RAW
+        #     hypergraph isolation crosses v7_iso_min gets the constant
+        #     v7_corrob_mult. Iso-corroborated threshold discount — the
+        #     hypergraph is what makes a sub-1.85 threshold safe; it never
+        #     flags alone and never displaces a CSE flag
+        #     (trust_scorer.v7_cse_reject_corrob_weights). v7_round_max=0
+        #     reproduces V6 exactly. ⚠ Constants provisional until the
+        #     replay calibration (replay_v7_calibration.py) passes — do NOT
+        #     launch a V7 training run before that (docs/DECISION.md "V7").
         self.trust_mode = str(
             self.cfg.get("trust_mode", "soft_reject_fedavg")
         ).strip().lower()
@@ -168,6 +181,7 @@ class HMPGAERuntime:
         _known_modes = {
             "soft_reject_fedavg", "reject_then_fedavg", "softmax",
             "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo",
+            "v7_cse_reject_corrob",
         }
         if self.trust_mode not in _known_modes:
             raise ValueError(
@@ -214,8 +228,39 @@ class HMPGAERuntime:
         #               report is "geometry did not act", not a lower floor.
         #               V6 reuses v5_m_floor / v5_r_hard for Stage 2 unchanged.
         self.v6_geo_floor = float(self.cfg.get("v6_geo_floor", 0.5))
+        # --- V7 knobs (inert unless trust_mode == 'v7_cse_reject_corrob') ---
+        # ALL PROVISIONAL until replay_v7_calibration.py picks them from the
+        # pre-committed grids on the archived logs (docs/DECISION.md "V7");
+        # after that they are pre-registered and never re-tuned post hoc.
+        #   v7_tau_lo     : Tier-2 CSE floor, 1 < tau_lo < v4_tau_ratio.
+        #                   Candidates {1.30..1.80 step 0.05}; provisional 1.40.
+        #                   NOTE tau_lo < 1.7833 (archived clean benign max
+        #                   ratio) — the iso conjunct is what keeps clean
+        #                   federations exact, and that premise is a replay
+        #                   PASS criterion, not an assumption.
+        #   v7_iso_min    : absolute floor on RAW graph_residual, at an
+        #                   inter-level midpoint of the quantized channel
+        #                   (levels are multiples of 1/(N-1)): 7/12 = only
+        #                   reach<=2 at N=7/k=2; candidate 5/12 also admits
+        #                   reach=3. Never place it ON a level.
+        #   v7_corrob_mult: constant Tier-2 multiplier in (0,1) — never 0
+        #                   (weaker evidence tier than a full CSE flag), never
+        #                   gate-modulated (archived attacker gate ~0.766
+        #                   would shrink the penalty into seed noise).
+        #   v7_round_min/max: cold window on the 1-INDEXED logged round
+        #                   (same units as the archives' 'round' channel).
+        #                   min=3 — R1-R2 have no recall (attacker r~1) and
+        #                   the noisiest signals, so they carry pure FP risk.
+        #                   max=0 disables the window = V6 bit-identical (the
+        #                   Run-0 wiring regression arm). Candidates {5,8,10}.
+        self.v7_tau_lo = float(self.cfg.get("v7_tau_lo", 1.40))
+        self.v7_iso_min = float(self.cfg.get("v7_iso_min", 7.0 / 12.0))
+        self.v7_corrob_mult = float(self.cfg.get("v7_corrob_mult", 0.5))
+        self.v7_round_min = int(self.cfg.get("v7_round_min", 3))
+        self.v7_round_max = int(self.cfg.get("v7_round_max", 10))
         if self.trust_mode in (
-            "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo"
+            "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo",
+            "v7_cse_reject_corrob",
         ):
             # The pool median must be benign-controlled: majority-poisoned
             # federations invert the rule. Raise (not assert) so a bad config
@@ -245,8 +290,11 @@ class HMPGAERuntime:
                     "(pre-registered ablation arm, DECISION 2026-08-07); "
                     f"got {self.v4_reject_mult}"
                 )
-        if self.trust_mode in ("v5_cse_reject", "v6_cse_reject_geo"):
-            # V6 reuses V5's Stage-2 ramp verbatim, so it inherits both guards.
+        if self.trust_mode in (
+            "v5_cse_reject", "v6_cse_reject_geo", "v7_cse_reject_corrob"
+        ):
+            # V6 reuses V5's Stage-2 ramp verbatim, so it inherits both
+            # guards; V7 embeds V6 as its Stage A and inherits them again.
             if not (0.0 < self.v5_m_floor < 1.0):
                 raise ValueError(
                     "v5_m_floor must be in (0, 1) — 0.0 is FoolsGold-style "
@@ -258,18 +306,50 @@ class HMPGAERuntime:
                     f"their difference); got v5_r_hard={self.v5_r_hard}, "
                     f"v4_tau_ratio={self.v4_tau_ratio}"
                 )
-        if self.trust_mode == "v6_cse_reject_geo":
+        if self.trust_mode in ("v6_cse_reject_geo", "v7_cse_reject_corrob"):
             # Upper bound is CLOSED: geo_floor == 1.0 is the V5-equivalence
             # point and must stay legal (it is the Run-0 regression guard).
             # Validated here, in __init__, and NOT inside aggregate(): a
             # ValueError raised from aggregate() is swallowed by
             # HMPGAEDefense.aggregate's FedAvg safety net, which would turn a
             # config typo into 50 silent rounds of plain FedAvg.
+            # V7 embeds V6's Stage 3 unchanged, so the guard applies there too.
             if not (0.0 < self.v6_geo_floor <= 1.0):
                 raise ValueError(
                     "v6_geo_floor must be in (0, 1] — 1.0 disables the "
                     "geometry term (= V5 exactly), 0.0 would let the gate "
                     f"zero a client outright (rejected); got {self.v6_geo_floor}"
+                )
+        if self.trust_mode == "v7_cse_reject_corrob":
+            # Same __init__-not-aggregate() rationale as the V6 guard above.
+            # The weights function re-validates (it is also called directly in
+            # tests/replay), but a config typo must die HERE, loudly, before
+            # the FedAvg safety net can eat it.
+            if not (1.0 < self.v7_tau_lo < self.v4_tau_ratio):
+                raise ValueError(
+                    "v7_tau_lo must satisfy 1 < tau_lo < v4_tau_ratio; got "
+                    f"v7_tau_lo={self.v7_tau_lo} v4_tau_ratio={self.v4_tau_ratio}"
+                )
+            if not (0.0 < self.v7_corrob_mult < 1.0):
+                raise ValueError(
+                    "v7_corrob_mult must be in (0, 1) — 0.0 is hard zeroing "
+                    "on the weaker (corroborated) evidence tier, rejected a "
+                    f"fortiori; got {self.v7_corrob_mult}"
+                )
+            if not (0.0 < self.v7_iso_min < 1.0):
+                raise ValueError(
+                    f"v7_iso_min must be in (0, 1); got {self.v7_iso_min}"
+                )
+            if self.v7_round_min < 1:
+                raise ValueError(
+                    "v7_round_min is 1-indexed (logged-round units) and must "
+                    f"be >= 1; got {self.v7_round_min}"
+                )
+            if self.v7_round_max != 0 and self.v7_round_max < self.v7_round_min:
+                raise ValueError(
+                    "v7_round_max must be 0 (window disabled = V6 exactly) or "
+                    f">= v7_round_min; got v7_round_max={self.v7_round_max} "
+                    f"v7_round_min={self.v7_round_min}"
                 )
         # reject_z_threshold: midpoint of the sigmoid gate for soft_reject_fedavg,
         # or the hard cutoff for reject_then_fedavg.  Same scale (gr_z units)
@@ -579,9 +659,10 @@ class HMPGAERuntime:
             used_alpha = alpha_cold
             used_mode = "cold_start_fedavg"
         elif self.trust_mode in (
-            "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo"
+            "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo",
+            "v7_cse_reject_corrob",
         ):
-            # V4/V5/V6: rejection driven by the absolute per-client full-test CSE.
+            # V4/V5/V6/V7: rejection driven by the absolute per-client full-test CSE.
             # local_cse is required — do NOT silently fall back (the defense
             # facade also validates this BEFORE its FedAvg-fallback net).
             # Deliberately routed AROUND _zscore: pool-relative scoring has no
@@ -621,7 +702,7 @@ class HMPGAERuntime:
                     r_hard=self.v5_r_hard,
                     keep_min=self.keep_min,
                 )
-            else:
+            elif self.trust_mode == "v6_cse_reject_geo":
                 # V6: V5's ramp, tightened (never loosened) on flagged clients
                 # by the geometry gate. `diag_gate` is the SAME tensor the
                 # soft_reject_fedavg path gates on — sigmoid(-k*(sus - thr))
@@ -636,6 +717,35 @@ class HMPGAERuntime:
                     m_floor=self.v5_m_floor,
                     r_hard=self.v5_r_hard,
                     geo_floor=self.v6_geo_floor,
+                    keep_min=self.keep_min,
+                )
+            else:
+                # V7: V6 plus the iso-corroborated cold-window tier. The
+                # Tier-2 conjunct is the RAW graph_residual — deliberately
+                # NOT diag_gate, whose suspicion input is pool-relative
+                # z-scores (C2 bans those from flag decisions; the gate keeps
+                # its V6 penalty-magnitude role). When the graph channel is
+                # resolution-gated this round (graph_min_distinct), Tier 2
+                # abstains: quantization noise must not flag.
+                used_alpha, v4_diag = v7_cse_reject_corrob_weights(
+                    local_cse=v4_cse_t,
+                    data_sizes=ds_tensor,
+                    gate=diag_gate,
+                    iso=None if trust.graph_gated else trust.graph_residual,
+                    # 1-indexed, matching the archived logs' 'round' channel
+                    # (server logs round_num + 1) so replay reads the window
+                    # identically to the live run.
+                    round_logged=int(round_num) + 1,
+                    tau_ratio=self.v4_tau_ratio,
+                    k_cap=self.v4_k_cap,
+                    m_floor=self.v5_m_floor,
+                    r_hard=self.v5_r_hard,
+                    geo_floor=self.v6_geo_floor,
+                    tau_lo=self.v7_tau_lo,
+                    iso_min=self.v7_iso_min,
+                    corrob_mult=self.v7_corrob_mult,
+                    round_min=self.v7_round_min,
+                    round_max=self.v7_round_max,
                     keep_min=self.keep_min,
                 )
             used_mode = self.trust_mode
@@ -742,12 +852,13 @@ class HMPGAERuntime:
             "graph_min_distinct": int(self.graph_min_distinct),
             "defense_time_ms": float(elapsed_ms),
         }
-        # V4/V5/V6 per-round diagnostics (trust_mode 'v4_cse_reject',
-        # 'v5_cse_reject' or 'v6_cse_reject_geo'). The "v4_" prefix names the
-        # shared CSE-reject diagnostic channel family — V5/V6 reuse it so the
-        # archive-side CSV tooling works unchanged; version-only extras carry
-        # a "v5_" / "v6_" prefix. NOTE: this must stay a THREE-way branch —
-        # an `if v4 / else` would silently label V6's rows as V5's.
+        # V4/V5/V6/V7 per-round diagnostics (trust_mode 'v4_cse_reject',
+        # 'v5_cse_reject', 'v6_cse_reject_geo' or 'v7_cse_reject_corrob').
+        # The "v4_" prefix names the shared CSE-reject diagnostic channel
+        # family — V5/V6/V7 reuse it so the archive-side CSV tooling works
+        # unchanged; version-only extras carry a "v5_" / "v6_" / "v7_"
+        # prefix. NOTE: this must stay a FOUR-way branch — an `if/else`
+        # collapse would silently mislabel one mode's rows as another's.
         if v4_diag is not None and v4_cse_t is not None:
             stats["v4_cse"] = v4_cse_t.detach().cpu().tolist()
             stats["v4_ratio"] = v4_diag["ratio"].detach().cpu().tolist()
@@ -764,7 +875,7 @@ class HMPGAERuntime:
                 stats["v5_m_floor"] = float(self.v5_m_floor)
                 stats["v5_r_hard"] = float(self.v5_r_hard)
                 stats["v5_ramp_t"] = v4_diag["ramp_t"].detach().cpu().tolist()
-            else:
+            elif self.trust_mode == "v6_cse_reject_geo":
                 # V6: V5's ramp channels (the Stage-2 knobs are literally the
                 # v5_* ones) plus the geometry read-out. v6_geo_mult and
                 # v6_m_cse are emitted for all N but only ACT where
@@ -779,6 +890,31 @@ class HMPGAERuntime:
                 stats["v6_geo_gate"] = v4_diag["geo_gate"].detach().cpu().tolist()
                 stats["v6_geo_mult"] = v4_diag["geo_mult"].detach().cpu().tolist()
                 stats["v6_m_cse"] = v4_diag["m_cse"].detach().cpu().tolist()
+            else:
+                # V7: the full V6 channel family (Stage A is V6 verbatim)
+                # plus the Tier-2 read-out. The falsification statistic for
+                # V7 is the per-run count of v7_corrob_flagged rounds: zero
+                # everywhere means the cold-window tier never acted and V7 is
+                # V6 renamed — report that honestly; do not widen the window
+                # or lower v7_tau_lo / v7_iso_min to make it move.
+                stats["v5_m_floor"] = float(self.v5_m_floor)
+                stats["v5_r_hard"] = float(self.v5_r_hard)
+                stats["v5_ramp_t"] = v4_diag["ramp_t"].detach().cpu().tolist()
+                stats["v6_geo_floor"] = float(self.v6_geo_floor)
+                stats["v6_geo_gate"] = v4_diag["geo_gate"].detach().cpu().tolist()
+                stats["v6_geo_mult"] = v4_diag["geo_mult"].detach().cpu().tolist()
+                stats["v6_m_cse"] = v4_diag["m_cse"].detach().cpu().tolist()
+                stats["v7_corrob_flagged"] = [
+                    int(b) for b in
+                    v4_diag["corrob_flagged"].detach().cpu().tolist()
+                ]
+                stats["v7_iso"] = v4_diag["iso"].detach().cpu().tolist()
+                stats["v7_geo_resolved"] = bool(v4_diag["geo_resolved"])
+                stats["v7_tau_lo"] = float(self.v7_tau_lo)
+                stats["v7_iso_min"] = float(self.v7_iso_min)
+                stats["v7_corrob_mult"] = float(self.v7_corrob_mult)
+                stats["v7_round_min"] = int(self.v7_round_min)
+                stats["v7_round_max"] = int(self.v7_round_max)
         # Probe-entropy diagnostic (V4 brief, decision (d)): the mean
         # per-sample entropy on the K-sample probe is the "free" pre-agg
         # statistic under option (ii). Logged whenever the probe exists so a

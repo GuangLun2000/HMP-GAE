@@ -104,8 +104,9 @@ class NodeFeatureEncoder(nn.Module):
 
     The concatenated raw feature is:
         in_dim = proj_dim + CONTEXT_DIM + hist_dim
-    We feed it through a small 2-layer MLP with ReLU and dropout to a fixed
-    `eta_dim` output (default 64).
+    We feed it through a small 2-layer MLP (Linear-ReLU-Linear, no dropout —
+    scoring must be deterministic given the inputs) to a fixed `eta_dim`
+    output (default 64).
     """
 
     def __init__(self, proj_dim: int, hist_dim: int, eta_dim: int, hidden_dim: Optional[int] = None):
