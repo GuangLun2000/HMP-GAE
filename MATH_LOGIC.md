@@ -554,20 +554,20 @@ $\text{NLL}_j$ = 第 $j$ 条样本的 shifted-label 平均 token 负对数似然
 
 ## 8. 权威默认配置(当前实验)
 
-来源:`main.py` 的 `main()` config dict(**唯一权威 config 源**;不标行号——main.py 常改)。**本表是撰写时快照,与 config 现值冲突时一律以 config 为准。** 当前实验名(随 config 变):`yahoo-(non-iid0.5)-hmpgae-v8-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b`。
+来源:`main.py` 的 `main()` config dict(**唯一权威 config 源**;不标行号——main.py 常改)。**本表是撰写时快照,与 config 现值冲突时一律以 config 为准。** 当前实验名(随 config 变):`agnews-(non-iid0.5)-hmpgae-v8-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b`。
 
 | 组 | 参数 | 值 |
 |---|---|---|
 | FL | $N$ / attackers / rounds | 7 (5 benign + 2 attacker) / 2 / 50 |
 | FL | client_lr / server_lr / local_epochs / FedProx $\mu$ | 5e-5 / 1.0 / 1 / 0.0 |
-| 模型 | backbone / LoRA | Qwen2.5-0.5B + LoRA($r{=}8$, $\alpha{=}16$, dropout 0.1) |
-| 数据 | dataset / 分布 / 规模 | Yahoo Answers($C{=}10$)/ non-IID Dirichlet(0.5) / 10K 子集, max_length 128 |
+| 模型 | backbone / LoRA | Llama-3.2-1B + LoRA($r{=}8$, $\alpha{=}16$, dropout 0.1) |
+| 数据 | dataset / 分布 / 规模 | AG News($C{=}4$)/ non-IID Dirichlet(0.5) / 10K 子集, max_length 128 |
 | 攻击 | mode / $\rho^t$ / reseed | random flip / $\mathcal{U}[0.3, 0.8]$ / per-round |
 | 超图 | proj_dim / eta_dim / $k$ | 64 / 64 / 2 |
 | GAE | hidden / latent / $L$ / steps / lr | 64 / 32 / 2 / 5 / 1e-3 |
 | 损失 | $\lambda_H$ / $\lambda_A$ / $\lambda_{hist}$ / wd | 1.0 / 1.0 / 0.5 / 1e-5 |
 | 信任 | $w_g$ / $w_r$ / $w_s$ / $\beta$ | 1.0 / 0.3 / 1.0 / 0.0 |
-| 语义 | reference / probe $K$ / stratified / conf-weight | median / 100(Yahoo 每类 10)/ True / False |
+| 语义 | reference / probe $K$ / stratified / conf-weight | median / 100(AG News 每类 25)/ True / False |
 | 鲁棒 | zscore_mode / clip / gate_rezscore / $\beta_s$ | mad / 10.0 / False / 0.6 |
 | 决策 | trust_mode / $\tau$ / rank cap / $m_{floor}$ / $r_{hard}$ | v8_hmp_cse_propagation / 1.85 / 2 / 0.10 / 2.5 |
 | 历史 | $\beta_h$ / hist_warmup | 0.9 / None |

@@ -1128,7 +1128,7 @@ def main():
     # V7 remains frozen for reproduction; V8 has its own trust_mode and name.
     config = {
         # ========== Experiment ==========
-        'experiment_name': 'yahoo-(non-iid0.5)-hmpgae-v8-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v8-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
         'seed': 42,
 
         # ========== Federated Learning Setup ==========
@@ -1149,8 +1149,8 @@ def main():
         # Set 'dataset' / 'num_labels' / 'max_length' together:
         #   ag_news 4/128 | imdb 2/512 | dbpedia 14/512 | yahoo_answers 10/128
         # (Yahoo stays at 128 for cross-run comparability; 256 is a separate ablation.)
-        'dataset': 'yahoo_answers',
-        'num_labels': 10,
+        'dataset': 'ag_news',
+        'num_labels': 4,
         'max_length': 128,
         
         # ========== Data Distribution ==========
@@ -1168,7 +1168,7 @@ def main():
         # Backbones: 'distilbert-base-uncased' | 'gpt2' | 'EleutherAI/pythia-160m' |
         # 'facebook/opt-125m' | 'Qwen/Qwen2.5-0.5B' (ungated, fits T4 15GB) |
         # 'meta-llama/Llama-3.2-1B' (GATED: HF license + HF_TOKEN; fp32 needs A100).
-        'model_name': 'Qwen/Qwen2.5-0.5B',
+        'model_name': 'meta-llama/Llama-3.2-1B',
         
 
         # ========== Attack ==========
@@ -1182,8 +1182,7 @@ def main():
         'hallu_flip_ratio': 0.5,                     # used only when ratio_range is None
         'hallu_flip_mode': 'random',                 # 'pairwise' | 'targeted' | 'random'
         'hallu_flip_map': {                         # 'pairwise' mode only; inert under current random mode
-            0: 1, 1: 0, 2: 3, 3: 2, 4: 5,
-            5: 4, 6: 7, 7: 6, 8: 9, 9: 8,
+            0: 1, 1: 0, 2: 3, 3: 2,
         },
         'hallu_target_class': None,                  # 'targeted' mode only
         'hallu_attack_start_round': 0,
@@ -1301,11 +1300,11 @@ def main():
 
         # ========== Checkpoints ==========
         'save_global_checkpoint': True,   # needed for PPL / downstream eval
-        'global_checkpoint_subdir': 'global_checkpoint',
+        'global_checkpoint_subdir': 'global_checkpoint_agnews_llama_v8_seed42',
         # Per-round resume snapshot (Colab resilience; fingerprint guard: fed_resume.py)
         'save_round_checkpoint': True,
         'resume_from_checkpoint': True,   # False = force a fresh run
-        'round_checkpoint_subdir': 'round_checkpoint',
+        'round_checkpoint_subdir': 'round_checkpoint_agnews_llama_v8_seed42',
         # ========== Task 2: optional downstream generation after FL ==========
         'run_downstream_after_fl': False,   # subprocess run_downstream_generation.py
         'downstream_probes': None,          # probe JSON path; None skips Task 2
