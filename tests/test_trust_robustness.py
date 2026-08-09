@@ -5,7 +5,7 @@
 #   - gate_rezscore=False + weight-norm scaling (no "scapegoat tax" on
 #     all-benign rounds; threshold in per-signal robust-z units)
 #   - suspicion EMA state + checkpoint roundtrip
-#   - the CSE-reject rules V4 / V5 / V6, including V6's three structural
+#   - the CSE-reject rules V4-V8, including V6's three structural
 #     guarantees (geo_floor=1.0 == V5 element-for-element, m_v6 <= m_v5 for
 #     every gate, and no-flags == the exact n_k prior)
 #   - bit-for-bit backward compatibility of all legacy code paths
@@ -36,8 +36,13 @@ from hmp_gae.trust_scorer import (
     v5_cse_reject_weights,
     v6_cse_reject_geo_weights,
     v7_cse_reject_corrob_weights,
+    v8_hmp_cse_propagation_weights,
 )
-from hmp_gae.hypergraph import knn_hypergraph
+from hmp_gae.hypergraph import (
+    knn_hypergraph,
+    consensus_propagation_hypergraph,
+    hypergraph_propagation_matrix,
+)
 from hmp_gae.runtime import HMPGAERuntime
 
 # The robust configuration under test (mirrors main.py defense_config).
@@ -937,7 +942,102 @@ def test_v7_monotone_vs_v6():
 
 
 # --------------------------------------------------------------------------- #
-# 5) runtime: suspicion EMA + checkpoint roundtrip                            #
+# 5) V8: CSE-seeded dual-view HMP propagation                                 #
+# --------------------------------------------------------------------------- #
+
+def test_v8_safe_degradation_to_v5():
+    """No seed, no edge, or exhausted cap must return V5 exactly."""
+    ds = torch.tensor([100., 120., 90., 110., 105., 95., 80.])
+    dense_T = torch.ones(7, 7) - torch.eye(7)
+
+    # Clean federation: no V5 seed, so even a dense graph has no authority.
+    clean = torch.tensor([0.60, 0.55, 0.70, 0.58, 0.62, 0.72, 0.66])
+    w5, _ = v5_cse_reject_weights(clean, ds)
+    w8, d8 = v8_hmp_cse_propagation_weights(clean, ds, dense_T)
+    assert torch.equal(w8, w5), "no-seed V8 must return V5 exactly"
+    assert not bool(d8["propagated_flagged"].any())
+
+    # One seed but no reliable cross-view edge: exact V5 again.
+    one_seed = torch.tensor([0.60, 0.55, 0.70, 0.58, 0.62, 0.90, 1.50])
+    w5e, _ = v5_cse_reject_weights(one_seed, ds)
+    w8e, d8e = v8_hmp_cse_propagation_weights(
+        one_seed, ds, torch.zeros(7, 7)
+    )
+    assert torch.equal(w8e, w5e), "zero-edge V8 must return V5 exactly"
+    assert float(d8e["propagated_risk"].sum()) == 0.0
+
+    # Two V5 seeds exhaust k_cap=2; propagation cannot displace either seed.
+    two_seeds = torch.tensor([0.60, 0.55, 0.70, 0.58, 0.62, 1.40, 1.50])
+    w5c, d5c = v5_cse_reject_weights(two_seeds, ds, k_cap=2)
+    w8c, d8c = v8_hmp_cse_propagation_weights(
+        two_seeds, ds, dense_T, k_cap=2
+    )
+    assert int(d5c["flagged"].sum()) == 2
+    assert torch.equal(w8c, w5c), "exhausted rank cap must return V5 exactly"
+    assert not bool(d8c["propagated_flagged"].any())
+    print("PASS  v8 safe degradation: no seed/edge/budget == V5 exactly")
+
+
+def test_v8_propagates_only_joint_evidence():
+    """A V5 seed can softly expose one connected, moderate-CSE peer."""
+    ds = torch.ones(7)
+    cse = torch.tensor([0.60, 0.55, 0.70, 0.58, 0.62, 0.90, 1.50])
+    # median=.60: c6 ratio=2.5 is a V5 seed; c5 ratio=1.5 is below tau.
+    T = torch.zeros(7, 7)
+    T[5, 6] = 0.8
+    w5, d5 = v5_cse_reject_weights(cse, ds, k_cap=2)
+    w8, d8 = v8_hmp_cse_propagation_weights(cse, ds, T, k_cap=2)
+    assert d5["flagged"].tolist() == [False] * 6 + [True]
+    assert d8["flagged"].tolist() == d5["flagged"].tolist(), \
+        "V8 must not change the high-confidence CSE seed set"
+    assert d8["propagated_flagged"].tolist() == \
+        [False, False, False, False, False, True, False]
+    assert 0.0 < float(d8["joint_evidence"][5]) < 1.0
+    assert float(d8["multiplier"][5]) < 1.0
+    assert float(w8[5]) < float(w5[5])
+    assert int(d8["flagged"].sum() + d8["propagated_flagged"].sum()) <= 2
+    # A connected client at/below the benign-controlled median has zero CSE
+    # evidence and therefore cannot consume the remaining budget.
+    low = cse.clone()
+    low[5] = 0.60
+    w8_low, d8_low = v8_hmp_cse_propagation_weights(low, ds, T, k_cap=2)
+    w5_low, _ = v5_cse_reject_weights(low, ds, k_cap=2)
+    assert torch.equal(w8_low, w5_low)
+    assert not bool(d8_low["propagated_flagged"].any())
+    print("PASS  v8 joint evidence: seed + HMP relation + elevated CSE required")
+
+
+def test_v8_dual_view_consensus_and_affinity_mass():
+    """Only mutual edges shared by both views propagate, with GAE attenuation."""
+    update_H = torch.eye(4)
+    behavior_H = torch.eye(4)
+    # Shared mutual pair 0<->1.
+    update_H[1, 0] = update_H[0, 1] = 1.0
+    behavior_H[1, 0] = behavior_H[0, 1] = 1.0
+    # View-specific pairs must not survive the intersection.
+    update_H[2, 1] = update_H[1, 2] = 1.0
+    behavior_H[3, 2] = behavior_H[2, 3] = 1.0
+    prop_H, _, _, consensus = consensus_propagation_hypergraph(
+        update_H, behavior_H
+    )
+    expected = torch.zeros(4, 4, dtype=torch.bool)
+    expected[0, 1] = expected[1, 0] = True
+    assert torch.equal(consensus, expected)
+
+    affinity = torch.zeros(4, 4)
+    affinity[0, 1] = affinity[1, 0] = 0.25
+    T = hypergraph_propagation_matrix(prop_H, pair_affinity=affinity)
+    assert abs(float(T[0, 1]) - 0.25) < 1e-6
+    assert abs(float(T[1, 0]) - 0.25) < 1e-6
+    assert float(T[2:].abs().sum()) == 0.0
+    assert float(T[:, 2:].abs().sum()) == 0.0
+    # Load-bearing: do not renormalize the only weak edge back to 1.
+    assert float(T.max()) < 0.3
+    print("PASS  v8 topology: dual-view mutual consensus + sub-stochastic affinity")
+
+
+# --------------------------------------------------------------------------- #
+# 6) runtime: suspicion EMA + checkpoint roundtrip                            #
 # --------------------------------------------------------------------------- #
 
 def _runtime(cfg_extra=None):
@@ -1304,6 +1404,61 @@ def test_runtime_v7_cse_reject_corrob():
     print("PASS  runtime v7_cse_reject_corrob: iso wired raw, window 1-indexed, guards")
 
 
+def test_runtime_v8_hmp_cse_propagation():
+    """V8 end-to-end: fixed dual-view topology, learned affinity, and CSE
+    seed propagation all reach the applied weights and archived diagnostics."""
+    torch.manual_seed(0)
+    rt = _runtime({
+        "trust_mode": "v8_hmp_cse_propagation",
+        "num_byzantine": 2,
+        "semantic_weight": 1.0,
+        "graph_min_distinct": 4,
+    })
+    ids, ds = list(range(7)), [100.0] * 7
+    rows = make_geometry(5, 2, dim=256, seed=19)
+    # Make the two suspicious clients exact update-view neighbors.
+    rows[6] = rows[5].clone()
+    probes = make_probe_dists(5, 2, seed=19)
+    # And exact behavior-view neighbors; labels never enter this graph.
+    probes[6] = probes[5].clone()
+    cse = [0.60, 0.55, 0.70, 0.58, 0.62, 0.90, 1.50]
+    _, stats = rt.aggregate(
+        [rows[i] for i in range(7)], ids, ds, round_num=0,
+        probe_distributions=probes, local_cse=cse,
+    )
+    assert stats["trust_mode_used"] == "v8_hmp_cse_propagation"
+    assert stats["v4_flagged"] == [0, 0, 0, 0, 0, 0, 1]
+    assert stats["v8_propagated_flagged"] == [0, 0, 0, 0, 0, 1, 0]
+    assert stats["v8_consensus_mutual"][5][6] == 1
+    assert stats["v8_consensus_edge_count"] >= 1
+    assert 0.0 < stats["v8_propagated_risk"][5] <= 1.0
+    assert stats["v4_multiplier"][5] < 1.0
+    assert "L_struct" in stats and "v8_recon_error" in stats
+    assert abs(sum(stats["alpha"]) - 1.0) < 1e-6
+
+    # Both required inputs fail loudly in the runtime itself.
+    try:
+        rt.aggregate([rows[i] for i in range(7)], ids, ds, round_num=1,
+                     local_cse=cse)
+        raise AssertionError("expected ValueError for missing V8 probe")
+    except ValueError:
+        pass
+    try:
+        rt.aggregate([rows[i] for i in range(7)], ids, ds, round_num=1,
+                     probe_distributions=probes)
+        raise AssertionError("expected ValueError for missing V8 local_cse")
+    except ValueError:
+        pass
+    # A V8 config cannot disable the independent behavior view.
+    try:
+        _runtime({"trust_mode": "v8_hmp_cse_propagation",
+                  "num_byzantine": 2, "semantic_weight": 0.0})
+        raise AssertionError("expected ValueError for semantic_weight=0 in V8")
+    except ValueError:
+        pass
+    print("PASS  runtime v8: dual-view HMP propagates one CSE seed to its peer")
+
+
 def test_defense_facade_local_cse_guard():
     """The loud-crash contract lives in the FACADE, before its FedAvg
     fallback try/except: a CSE-reject trust_mode without a local_cse vector
@@ -1316,7 +1471,7 @@ def test_defense_facade_local_cse_guard():
     rows = make_geometry(5, 2, dim=256, seed=1)
     updates = [rows[i] for i in range(7)]
     for mode in ("v7_cse_reject_corrob", " v7_cse_reject_corrob ",
-                 "v4_cse_reject"):
+                 "v8_hmp_cse_propagation", "v4_cse_reject"):
         d = HMPGAEDefense(num_clients=7, config={
             "trust_mode": mode, "num_byzantine": 2, "device": "cpu",
             "proj_dim": 32, "eta_dim": 32, "hidden_dim": 32,
@@ -1328,6 +1483,21 @@ def test_defense_facade_local_cse_guard():
             raise AssertionError(f"expected RuntimeError for mode={mode!r}")
         except RuntimeError:
             pass
+    # V8's missing probe is also a pre-fallback plumbing error. Supply CSE so
+    # the probe guard itself is the one being exercised.
+    d8 = HMPGAEDefense(num_clients=7, config={
+        "trust_mode": "v8_hmp_cse_propagation", "num_byzantine": 2,
+        "semantic_weight": 1.0, "device": "cpu",
+        "proj_dim": 32, "eta_dim": 32, "hidden_dim": 32,
+        "latent_dim": 16, "num_hmp_layers": 2, "knn_k": 2,
+        "train_steps_per_round": 2,
+    })
+    try:
+        d8.aggregate(updates, list(range(7)), [100.0] * 7, 0,
+                     torch.device("cpu"), local_cse=[0.6] * 7)
+        raise AssertionError("expected RuntimeError for missing V8 probe")
+    except RuntimeError:
+        pass
     print("PASS  defense facade: missing local_cse raises before any fallback")
 
 
@@ -1377,11 +1547,15 @@ if __name__ == "__main__":
     test_v7_corroborated_flag_rule()
     test_v7_clean_federation_identity()
     test_v7_monotone_vs_v6()
+    test_v8_safe_degradation_to_v5()
+    test_v8_propagates_only_joint_evidence()
+    test_v8_dual_view_consensus_and_affinity_mass()
     test_runtime_ema_and_state_roundtrip()
     test_runtime_v4_cse_reject()
     test_runtime_v5_cse_reject()
     test_runtime_v6_cse_reject_geo()
     test_runtime_v7_cse_reject_corrob()
+    test_runtime_v8_hmp_cse_propagation()
     test_defense_facade_local_cse_guard()
     test_runtime_attackers_lose_weight_over_rounds()
     print("\nAll trust-robustness tests passed.")

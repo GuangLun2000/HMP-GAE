@@ -666,10 +666,11 @@ def compute_detection_summary(server_log_data, attacker_ids) -> Optional[Dict]:
     For every round whose aggregation log carries per-client 'gate' / 'sus_z'
     (HMP-GAE rounds; FedAvg and fallback rounds are skipped), computes the
     attacker vs benign mean gate and the AUROC of the suspicion score against
-    the ground-truth attacker labels.  This isolates "is the trust scorer
-    pointing at the right clients" from "did the run converge", so signal /
-    threshold changes get a direct readout that is independent of training
-    noise.  Returns None when there are no attackers or no gate-bearing rounds.
+    the ground-truth attacker labels. For V8 it additionally measures the
+    APPLIED two-tier decision: CSE-seed recall/FPR and hypergraph-propagated
+    incremental recall/FPR/precision. The gate remains a geometry diagnostic
+    under CSE modes and must not be confused with V8's applied decision.
+    Returns None when there are no attackers or no gate-bearing rounds.
     """
     atk = {int(a) for a in (attacker_ids or [])}
     if not atk:
@@ -694,6 +695,27 @@ def compute_detection_summary(server_log_data, attacker_ids) -> Optional[Dict]:
             atk_sus = [s for cid, s in zip(cids, sus) if int(cid) in atk]
             bgn_sus = [s for cid, s in zip(cids, sus) if int(cid) not in atk]
             entry['sus_auroc'] = _rank_auroc(atk_sus, bgn_sus)
+        seeds = agg.get('v4_flagged')
+        propagated = agg.get('v8_propagated_flagged')
+        if (isinstance(seeds, list) and isinstance(propagated, list)
+                and len(seeds) == len(cids) == len(propagated)):
+            is_atk = [int(cid) in atk for cid in cids]
+            seed_b = [bool(v) for v in seeds]
+            prop_b = [bool(v) for v in propagated]
+            entry.update({
+                'v8_seed_atk': sum(s and a for s, a in zip(seed_b, is_atk)),
+                'v8_seed_bgn': sum(s and not a for s, a in zip(seed_b, is_atk)),
+                'v8_prop_atk': sum(p and a for p, a in zip(prop_b, is_atk)),
+                'v8_prop_bgn': sum(p and not a for p, a in zip(prop_b, is_atk)),
+                'v8_atk_total': sum(is_atk),
+                'v8_bgn_total': len(is_atk) - sum(is_atk),
+                'v8_atk_nonseed': sum(
+                    a and not s for a, s in zip(is_atk, seed_b)
+                ),
+                'v8_bgn_nonseed': sum(
+                    (not a) and not s for a, s in zip(is_atk, seed_b)
+                ),
+            })
         per_round.append(entry)
     if not per_round:
         return None
@@ -703,7 +725,7 @@ def compute_detection_summary(server_log_data, attacker_ids) -> Optional[Dict]:
         return float(np.mean(vals)) if vals else None
 
     second_half = per_round[len(per_round) // 2:]
-    return {
+    result = {
         # Mean over all gate-bearing rounds / over the steady-state 2nd half.
         'attacker_gate_mean': _mean_of('attacker_gate_mean', per_round),
         'benign_gate_mean': _mean_of('benign_gate_mean', per_round),
@@ -714,6 +736,39 @@ def compute_detection_summary(server_log_data, attacker_ids) -> Optional[Dict]:
         'n_rounds_with_gate': len(per_round),
         'per_round': per_round,
     }
+    v8_rows = [r for r in per_round if 'v8_seed_atk' in r]
+    if v8_rows:
+        def _sum(key):
+            return int(sum(r[key] for r in v8_rows))
+
+        seed_atk, seed_bgn = _sum('v8_seed_atk'), _sum('v8_seed_bgn')
+        prop_atk, prop_bgn = _sum('v8_prop_atk'), _sum('v8_prop_bgn')
+        atk_total, bgn_total = _sum('v8_atk_total'), _sum('v8_bgn_total')
+        atk_nonseed = _sum('v8_atk_nonseed')
+        bgn_nonseed = _sum('v8_bgn_nonseed')
+        result['v8_decision_summary'] = {
+            'n_rounds': len(v8_rows),
+            'seed_attacker_client_rounds': seed_atk,
+            'seed_benign_client_rounds': seed_bgn,
+            'seed_attacker_recall': seed_atk / atk_total if atk_total else None,
+            'seed_benign_fpr': seed_bgn / bgn_total if bgn_total else None,
+            'propagated_attacker_client_rounds': prop_atk,
+            'propagated_benign_client_rounds': prop_bgn,
+            'propagated_incremental_recall': (
+                prop_atk / atk_nonseed if atk_nonseed else None
+            ),
+            'propagated_benign_fpr': (
+                prop_bgn / bgn_nonseed if bgn_nonseed else None
+            ),
+            'propagated_precision': (
+                prop_atk / (prop_atk + prop_bgn)
+                if prop_atk + prop_bgn else None
+            ),
+            'rounds_with_any_propagation': sum(
+                (r['v8_prop_atk'] + r['v8_prop_bgn']) > 0 for r in v8_rows
+            ),
+        }
+    return result
 
 
 def print_detection_summary(summary: Optional[Dict]) -> None:
@@ -731,6 +786,24 @@ def print_detection_summary(summary: Optional[Dict]) -> None:
           f"  (2nd half {fmt(summary['sus_auroc_mean_2nd_half'])})"
           f"  [1.0 perfect, 0.5 chance]")
     print(f"  rounds with gate   : {summary['n_rounds_with_gate']}")
+    v8 = summary.get('v8_decision_summary')
+    if v8:
+        print("  V8 applied decision (client-round level):")
+        print(
+            f"    CSE seed recall/FPR       : "
+            f"{fmt(v8['seed_attacker_recall'])} / "
+            f"{fmt(v8['seed_benign_fpr'])}"
+        )
+        print(
+            f"    propagated recall/FPR    : "
+            f"{fmt(v8['propagated_incremental_recall'])} / "
+            f"{fmt(v8['propagated_benign_fpr'])}"
+        )
+        print(
+            f"    propagated precision     : "
+            f"{fmt(v8['propagated_precision'])} "
+            f"({v8['rounds_with_any_propagation']}/{v8['n_rounds']} rounds active)"
+        )
 
 
 def print_detailed_statistics(server_log_data, progressive_metrics, local_accuracies, attacker_ids,
@@ -1049,14 +1122,13 @@ def main():
     # COLAB_CONFIG_OVERRIDES / run_suite() were all removed 2026-08-07). To change ANY
     # parameter, including an A/B arm: edit here, run, edit back. Every arm SHOULD get
     # its own experiment_name for readable artifacts; fed_resume also fingerprints the
-    # complete defense_config so changing V4/V5/V6/V7 cannot silently reuse its state.
+    # complete defense_config so changing V4-V8 cannot silently reuse its state.
     #
-    # CURRENT ARM (user-requested): V7 iso-corroborated cold-window rejection.
-    # The V7 implementation is active below; its constants remain provisional
-    # because no archived *_results.json was available for replay calibration.
+    # CURRENT ARM (user-requested): V8 dual-view HMP + CSE-seeded propagation.
+    # V7 remains frozen for reproduction; V8 has its own trust_mode and name.
     config = {
         # ========== Experiment ==========
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v7-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
+        'experiment_name': 'yahoo-(non-iid0.5)-hmpgae-v8-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b',
         'seed': 42,
 
         # ========== Federated Learning Setup ==========
@@ -1077,8 +1149,8 @@ def main():
         # Set 'dataset' / 'num_labels' / 'max_length' together:
         #   ag_news 4/128 | imdb 2/512 | dbpedia 14/512 | yahoo_answers 10/128
         # (Yahoo stays at 128 for cross-run comparability; 256 is a separate ablation.)
-        'dataset': 'ag_news',
-        'num_labels': 4,
+        'dataset': 'yahoo_answers',
+        'num_labels': 10,
         'max_length': 128,
         
         # ========== Data Distribution ==========
@@ -1109,7 +1181,10 @@ def main():
         # Escalation ladder if too weak: range [0.6,1.0] → [0.8,1.0] → num_attackers=3.
         'hallu_flip_ratio': 0.5,                     # used only when ratio_range is None
         'hallu_flip_mode': 'random',                 # 'pairwise' | 'targeted' | 'random'
-        'hallu_flip_map': {0: 1, 1: 0, 2: 3, 3: 2},  # 'pairwise' mode only; size to num_labels
+        'hallu_flip_map': {                         # 'pairwise' mode only; inert under current random mode
+            0: 1, 1: 0, 2: 3, 3: 2, 4: 5,
+            5: 4, 6: 7, 7: 6, 8: 9, 9: 8,
+        },
         'hallu_target_class': None,                  # 'targeted' mode only
         'hallu_attack_start_round': 0,
         'hallu_per_round_reseed': True,              # False = legacy frozen-flip behaviour
@@ -1170,12 +1245,14 @@ def main():
             #   'v6_cse_reject_geo'    V6: V5 × one-sided geometry factor (flagged only)
             #   'v7_cse_reject_corrob' V7: V6 + Tier-2 corroborated flag in cold window
             #                          (⚠ do NOT run before replay_v7_calibration.py passes)
+            #   'v8_hmp_cse_propagation' V8: V5 CSE seeds + fixed update/probe
+            #                          consensus hypergraph + learned HMP propagation
             # V4+ modes require per-round local CSE (server enforces, loud crash if
             # missing) and are NOT compatible with update-forging (crafts_update) attackers.
-            'trust_mode': 'v7_cse_reject_corrob',
+            'trust_mode': 'v8_hmp_cse_propagation',
             # V4 knobs — both PRE-REGISTERED, do not re-tune (calibration: DECISION.md "V4").
             'v4_tau_ratio': 1.85,
-            'v4_reject_mult': 0.10,  # inert under V7; retained at the V4 companion default.
+            'v4_reject_mult': 0.10,  # inert under V8; retained at the V4 companion default.
             # V5 knobs — v5_r_hard PRE-REGISTERED 2026-08-06; m_floor never 0.0.
             'v5_m_floor': 0.10,
             'v5_r_hard': 2.5,
@@ -1198,11 +1275,11 @@ def main():
             'zscore_mode': 'mad',
             'zscore_clip': 10.0,         # bounds the FUSED score s (post-fusion since C1)
             'graph_min_distinct': 4,     # zero the graph channel when it resolves < 4 values;
-                                         # diagnostics-only under V4/V5, LIVE under V6/V7
+                                         # diagnostics-only under V4/V5/V8, LIVE under V6/V7
             'gate_rezscore': False,
             'sus_ema_beta': 0.6,         # cross-round suspicion EMA (~2-3 round lag)
             'reject_z_threshold': 2.5,   # pair with gate_rezscore (use 0.75 when True).
-                                         # Under V6/V7 this shapes the geometry gate — keep 2.5.
+                                         # Under V6/V7 this shapes the geometry gate; V8 ignores it.
             'soft_reject_k': 2.0,
             'keep_min': 1,
             'cold_start_fallback': False,

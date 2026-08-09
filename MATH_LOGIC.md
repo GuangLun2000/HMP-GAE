@@ -97,7 +97,7 @@ $$
 
 `hmp_gae/runtime.py: HMPGAERuntime.aggregate`
 
-每轮在服务器端执行(全部在 CPU,因 $N$ 小):
+V1–V7 的基础 HMP-GAE 每轮在服务器端执行(全部在 CPU,因 $N$ 小):
 
 ```
 Δ (N×d)  ──η_i 特征提取──▶  η (N×64)
@@ -112,6 +112,9 @@ $$
 ```
 
 encoder/decoder 参数与 Adam 状态**跨轮持久化**(不重置),即 GAE 随 FL 轮次持续在线学习。
+当前 V8 保留节点特征、HMP 与跨轮状态，但替换了超图固定方式、decoder
+目标和最终决策协作方式；完整定义见 §6.6。不要用上图的“每 step 重建 H +
+scalar gate”描述 V8。
 
 ---
 
@@ -214,7 +217,7 @@ $$
 \mathcal{L}_{hist} = \frac{1}{N \cdot d_z} \lVert Z - Z^{hist} \rVert_F^2
 $$
 
-**训练细节**:$\lambda_H = \lambda_A = 1.0$,$\lambda_{hist} = 0.5$,$\lambda_{wd} = 10^{-5}$;每轮 Adam(lr $10^{-3}$)5 步;梯度裁剪 max-norm 5.0;超图 $H$ 每步随 $\eta$ 重建(即 $H$ 依赖当前 $f_{enc}$ 参数)。训练完成后以 eval 模式重新前向一次得到用于打分的 $\eta, H, Z, \hat{A}$。
+**V1–V7 训练细节**:$\lambda_H = \lambda_A = 1.0$,$\lambda_{hist} = 0.5$,$\lambda_{wd} = 10^{-5}$;每轮 Adam(lr $10^{-3}$)5 步;梯度裁剪 max-norm 5.0;超图 $H$ 每步随 $\eta$ 重建(即 $H$ 依赖当前 $f_{enc}$ 参数)。训练完成后以 eval 模式重新前向一次得到用于打分的 $\eta, H, Z, \hat{A}$。V8 不采用这个自指训练目标，见 §6.6。
 
 ### 4.6 历史嵌入 EMA($Z^{hist}$)
 
@@ -388,6 +391,133 @@ $$
 - **冷启动**:Signal 1 只依赖原始投影更新的 k-NN 超图,**round 0 即生效**;`cold_start_fallback=False`(默认)不做首轮 FedAvg 回退;
 - **CLAUDE.md 备注**:超图信号在小 $N$ 下不稳(文档写 $N \le 4$ fallback,代码实际阈值为 $N \le 2$——论文表述时以代码为准并注明小 $N$ 局限)。
 
+### 6.6 V8：CSE 种子驱动的双视图超图传播（当前主路径）
+
+`trust_mode='v8_hmp_cse_propagation'` 不再把超图压缩成单个孤立度阈值，
+而是让 CSE 与超图承担互补角色：CSE 提供高精度异常种子，超图利用客户端
+关系找出与种子同机制、但自身 CSE 尚未越过硬阈值的同伴。
+
+**(a) 两个独立且当轮固定的视图。** 更新视图不使用可训练的 $\eta$ 构图，
+而使用固定 JL 投影
+
+$$
+u_i=R\Delta_i,\qquad
+\varepsilon_i^u=\{i\}\cup\operatorname{topk}_{j\ne i}\cos(u_i,u_j),
+$$
+
+得到 $H^u$。行为视图只使用共享 probe 上的 per-sample softmax
+$P_i^{(q)}$，不使用 probe label：
+
+$$
+\operatorname{JS}_{ij}=\frac1K\sum_q\frac12\left[
+  \operatorname{KL}(P_i^{(q)}\Vert M_{ij}^{(q)})+
+  \operatorname{KL}(P_j^{(q)}\Vert M_{ij}^{(q)})
+\right],\quad
+M_{ij}^{(q)}=\frac{P_i^{(q)}+P_j^{(q)}}2,
+$$
+
+$$
+S^b_{ij}=1-\frac{\operatorname{JS}_{ij}}{\log 2},\qquad
+\varepsilon_i^b=\{i\}\cup\operatorname{topk}_{j\ne i}S^b_{ij},
+$$
+
+得到 $H^b$。令 $M^v_{ij}=1$ 当且仅当 $i,j$ 在视图 $v$ 中互相选择，
+则共识关系
+
+$$
+C=M^u\odot M^b.
+$$
+
+传播超图 $H^c$ 以每个节点为中心，包含自身及 $C$ 中与其互邻的节点。
+因此单一更新几何偶合或单一行为偶合都无权传播风险。
+
+**(b) 固定拓扑上的可学习 HMP-GAE。** 当轮 5 个优化 step 都使用同一个
+$H^u$；这切断了旧路径“可学习 $\eta\to H\to$ 重构同一个 $H$”的反馈环。
+V8 的每层加入残差和 LayerNorm：
+
+$$
+E^{(l)}=\operatorname{ReLU}\!\left((D_E^u)^{-1}(H^u)^\top
+Z^{(l)}W_E^{(l)}\right),
+$$
+
+$$
+Z^{(l+1)}=\operatorname{LN}\!\left((D_V^u)^{-1}H^uE^{(l)}W_V^{(l)}
++Z^{(l)}W_{skip}^{(l)}\right).
+$$
+
+最后一层不做 ReLU，允许 signed latent。成对 decoder 改为固定尺度
+$\gamma=4$ 的 cosine logit：
+
+$$
+a_{ij}=\gamma\frac{z_i^\top z_j}{\lVert z_i\rVert_2\lVert z_j\rVert_2},
+\qquad \hat A_{ij}=\sigma(a_{ij}).
+$$
+
+这样非邻居可以得到负 logit 和 $\hat A_{ij}<0.5$；旧版 final-ReLU 加
+$ZZ^\top$ 无法保证这一点。V8 的结构目标是固定的 direct-mutual update
+邻接 $A^u=M^u$，而不是 decoder 自己产生的平滑权重：
+
+$$
+\mathcal L_{V8}=\lambda_H\operatorname{BCE}(H^u,\hat H)+
+\lambda_A\operatorname{BCE}_{i\ne j}(A^u,a)+
+\lambda_{hist}\mathcal L_{hist}+\lambda_{wd}\lVert\theta\rVert_2^2.
+$$
+
+每节点的第二项均值作为 V8 的真实 `recon_residual`。
+
+**(c) HMP 风险传播。** 先由共识超图计算 node→edge→node 算子，删除
+对角并对剩余质量按行归一：
+
+$$
+P=\operatorname{RowNorm}\!\left(\operatorname{OffDiag}\left[
+(D_V^c)^{-1}H^c(D_E^c)^{-1}(H^c)^\top\right]\right).
+$$
+
+再用 GAE affinity 衰减，而**不把衰减后的质量重新归一到 1**：
+
+$$
+T=P\odot\hat A,\qquad \sum_jT_{ij}\le1.
+$$
+
+这个“次随机”约束是必要的；否则节点只有一条边时，任意弱 affinity 都会
+被重新放大成 1，GAE 实际不起作用。
+
+**(d) CSE 决策权与共享 rank cap。** V8 Stage A 与 V5 完全相同。令
+$r_i=\operatorname{CSE}_i/\max(\operatorname{median}_{lower}(\operatorname{CSE}),
+\epsilon)$，V5 在 top-$K_B$ rank cap 内取 $r_i>\tau$ 的集合 $F$，其成员
+使用原 V5 ramp multiplier。它们作为不可被替换的种子：
+
+$$
+q_i=\sum_{j\in F}T_{ij},\qquad
+e_i=\operatorname{clip}\left(\frac{r_i-1}{\tau-1},0,1\right),\qquad
+J_i=q_i e_i.
+$$
+
+只有 $i\notin F$、$J_i>0$ 且 CSE flag 后仍有 rank-cap 余额的客户端，
+才能按 $(J_i,r_i,-i)$ 排序进入传播集合 $G$；CSE flag 永远优先。传播
+客户端的连续乘子为
+
+$$
+m_i^{prop}=1-(1-m_{floor})J_i,
+$$
+
+最终 $m_i$ 对 $F$ 取 V5 ramp、对 $G$ 取 $m_i^{prop}$、其余精确取 1，
+并按数据量归一：
+
+$$
+\alpha_i=\frac{D_i m_i}{\sum_jD_jm_j}.
+$$
+
+**结构保证与可证伪条件。** 无 V5 种子、无通向种子的双视图共识路径、
+无 $r_i>1$ 的同伴，或 rank cap 无余额时，代码直接返回 V5 tensor，
+逐元素相同；弱 affinity 则产生同比例的轻惩罚，而不是被重新放大。
+超图是否产生增量必须从 `v8_propagated_flagged`、`v8_joint_evidence`、
+`v8_consensus_edge_count` 与 `v8_propagation_matrix` 判断；若全程无传播，
+实验结论就是 V8 退化为 V5，不能把 CSE 的收益归因于超图。反过来，若两个
+攻击者都未形成 CSE 种子，V8 也不会自行检测；这是防止几何 scapegoat 的
+保守边界。该模式仍依赖服务器 full-test local CSE，且与只伪造 update、
+不改变 `client.model` 的 `crafts_update` 攻击不兼容。
+
 ---
 
 ## 7. 评估指标
@@ -424,22 +554,22 @@ $\text{NLL}_j$ = 第 $j$ 条样本的 shifted-label 平均 token 负对数似然
 
 ## 8. 权威默认配置(当前实验)
 
-来源:`main.py` 的 `main()` config dict(**唯一权威 config 源**;不标行号——main.py 常改)。**本表是撰写时快照,与 config 现值冲突时一律以 config 为准。** 当前实验名(随 config 变):`yahoo-(non-iid0.5)-hmpgae-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b`。
+来源:`main.py` 的 `main()` config dict(**唯一权威 config 源**;不标行号——main.py 常改)。**本表是撰写时快照,与 config 现值冲突时一律以 config 为准。** 当前实验名(随 config 变):`yahoo-(non-iid0.5)-hmpgae-v8-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-qwen2.5-0.5b`。
 
 | 组 | 参数 | 值 |
 |---|---|---|
 | FL | $N$ / attackers / rounds | 7 (5 benign + 2 attacker) / 2 / 50 |
 | FL | client_lr / server_lr / local_epochs / FedProx $\mu$ | 5e-5 / 1.0 / 1 / 0.0 |
-| 模型 | backbone / LoRA | Llama-3.2-1B (~1.24B, BASE) + LoRA($r{=}8$, $\alpha{=}16$, dropout 0.1) |
+| 模型 | backbone / LoRA | Qwen2.5-0.5B + LoRA($r{=}8$, $\alpha{=}16$, dropout 0.1) |
 | 数据 | dataset / 分布 / 规模 | Yahoo Answers($C{=}10$)/ non-IID Dirichlet(0.5) / 10K 子集, max_length 128 |
 | 攻击 | mode / $\rho^t$ / reseed | random flip / $\mathcal{U}[0.3, 0.8]$ / per-round |
 | 超图 | proj_dim / eta_dim / $k$ | 64 / 64 / 2 |
 | GAE | hidden / latent / $L$ / steps / lr | 64 / 32 / 2 / 5 / 1e-3 |
 | 损失 | $\lambda_H$ / $\lambda_A$ / $\lambda_{hist}$ / wd | 1.0 / 1.0 / 0.5 / 1e-5 |
 | 信任 | $w_g$ / $w_r$ / $w_s$ / $\beta$ | 1.0 / 0.3 / 1.0 / 0.0 |
-| 语义 | reference / probe $K$ / stratified / conf-weight | median / 100(每类 10)/ True / False |
+| 语义 | reference / probe $K$ / stratified / conf-weight | median / 100(Yahoo 每类 10)/ True / False |
 | 鲁棒 | zscore_mode / clip / gate_rezscore / $\beta_s$ | mad / 10.0 / False / 0.6 |
-| 门控 | gate_signal / trust_mode / $\theta$ / $\kappa$ / keep_min | combined / soft_reject_fedavg / 2.5 / 2.0 / 1 |
+| 决策 | trust_mode / $\tau$ / rank cap / $m_{floor}$ / $r_{hard}$ | v8_hmp_cse_propagation / 1.85 / 2 / 0.10 / 2.5 |
 | 历史 | $\beta_h$ / hist_warmup | 0.9 / None |
 
 **Legacy(2026-07 前)复现开关**(六键同时覆盖):`{'zscore_mode':'std', 'gate_rezscore':True, 'sus_ema_beta':0.0, 'reject_z_threshold':0.75, 'semantic_reference':'pairwise', 'semantic_probe_stratified':False}`。
@@ -448,9 +578,9 @@ $\text{NLL}_j$ = 第 $j$ 条样本的 shifted-label 平均 token 负对数似然
 
 ## 9. 论文写作要点(叙事逻辑备忘)
 
-1. **三信号正交性**是核心论点:graph + recon 是纯更新几何信号(便宜,但 cosine/norm-projection 型 stealth attacker 可模仿);sem_div 是输出行为信号——attacker 必须*同时*匹配更新统计量*且*产生 benign 式 per-sample 概率,这与 hallucination 的目标(注入错误事实关联)不相容。
-2. **detection 与 weighting 解耦**:信任信号只做检测(sigmoid gate),权重回归数据量 FedAvg——避免 softmax 权重集中破坏协作学习。
+1. **V8 的互补分工**是核心论点:CSE 提供高精度种子，update/probe 双视图超图保留关系并提升漏检同伴的 recall，GAE affinity 只做连续衰减；任何单通道都不能独立扩权。
+2. **detection、传播与 weighting 解耦**:CSE 决定不可替换的 seed，HMP 只使用剩余 rank cap，最后仍回归数据量 FedAvg——避免 softmax 权重集中破坏协作学习。
 3. **鲁棒统计栈的动机链**:std z-score 被 attacker 污染 → MAD;双重 z-score 有"替罪羊税" → 绝对尺度 sus + 权重范数归一;单轮噪声 → 跨轮 EMA;pairwise KL 在非 IID 下压缩对比度 → median 参考。每步都有对应的失效模式与修复。
 4. **hist_dev 的负结果**可以写:方向在 warmup 正确、稳态反转(benign 学真特征漂移 > attacker 困在错误标签流形)——这解释了为何 $\beta = 0$ 且保留相位门控接口。
 5. **符号对照**:$\eta_i$ ↔ node_features.py;$H, D_V, D_E$ ↔ hypergraph.py;eq.15/16 ↔ encoder.py;$\hat{A}, \hat{H}$ (eq.17/18) ↔ decoder.py;eq.21 ↔ losses.py;$s, \alpha$ ↔ trust_scorer.py。
-6. **与论文可能不同的实现细节**(写作时注意):平滑项按 $N^2$ 归一;BCE 带 pos_weight(cap 10);$M = N$ 中心节点超图构造;超图每个训练 step 随 $\eta$ 重建;GAE 跨轮在线持续训练(非每轮重训)。
+6. **版本不能混写**:V1–V7 是 final-ReLU、inner-product decoder、每 step 随 $\eta$ 重建 $H$ 和 self-smoothness；V8 是 fixed-JL topology、residual/signed HMP、cosine decoder 和 fixed-topology BCE。GAE 都跨轮在线持续训练，但机制与损失不可互相冒充。

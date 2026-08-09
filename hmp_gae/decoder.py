@@ -15,6 +15,7 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def inner_product_decoder(Z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -31,6 +32,23 @@ def inner_product_decoder(Z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     logits = Z @ Z.t()
     probs = torch.sigmoid(logits)
     return logits, probs
+
+
+def normalized_cosine_decoder(
+    Z: torch.Tensor,
+    scale: float = 4.0,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """V8 adjacency decoder with a signed, normalized similarity logit.
+
+    The legacy encoder ends in ReLU and ``Z @ Z.T`` can therefore never emit a
+    negative logit.  V8 uses a signed final latent and cosine normalization, so
+    non-neighbors can reconstruct below probability 0.5 while the fixed scale
+    avoids a new learned calibration parameter on the N=7 online problem.
+    """
+    Z_n = F.normalize(Z, p=2, dim=1, eps=eps)
+    logits = float(scale) * (Z_n @ Z_n.t())
+    return logits, torch.sigmoid(logits)
 
 
 class HyperedgeDecoder(nn.Module):

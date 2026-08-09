@@ -209,9 +209,8 @@ class HMPGAEDefense(Defense):
             stats["fallback_reason"] = f"N={len(updates)} <= 2"
             return agg, stats
 
-        # V4/V5/V6/V7 (trust_mode 'v4_cse_reject' / 'v5_cse_reject' /
-        # 'v6_cse_reject_geo' / 'v7_cse_reject_corrob') hard-require the
-        # per-client CSE vector.
+        # V4-V8 hard-require the per-client CSE vector. V8 additionally needs
+        # the label-free probe tensor for its independent behavior graph.
         # Validate BEFORE the runtime try/except below: a missing vector is a
         # server-plumbing bug and must crash the run loudly, not silently
         # degrade to FedAvg for 50 rounds.
@@ -222,12 +221,18 @@ class HMPGAEDefense(Defense):
         _tm = str(self.cfg.get("trust_mode", "")).strip().lower()
         if _tm in (
             "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo",
-            "v7_cse_reject_corrob",
+            "v7_cse_reject_corrob", "v8_hmp_cse_propagation",
         ) and local_cse is None:
             raise RuntimeError(
                 f"HMPGAEDefense: trust_mode='{_tm}' but no local_cse "
                 "vector was provided — the server must evaluate per-client "
                 "local CSE BEFORE aggregation (see Server._needs_local_cse)."
+            )
+        if _tm == "v8_hmp_cse_propagation" and probe_distributions is None:
+            raise RuntimeError(
+                "HMPGAEDefense: trust_mode='v8_hmp_cse_propagation' but no "
+                "probe_distributions tensor was provided — V8 requires the "
+                "shared label-free probe to construct its behavior graph."
             )
 
         if not self._initialized:

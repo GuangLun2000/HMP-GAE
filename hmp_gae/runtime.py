@@ -28,10 +28,17 @@ from .node_features import (
     compute_node_features,
     CONTEXT_DIM,
 )
-from .hypergraph import knn_hypergraph
+from .hypergraph import (
+    knn_hypergraph,
+    semantic_js_similarity,
+    knn_hypergraph_from_similarity,
+    mutual_neighbor_adjacency,
+    consensus_propagation_hypergraph,
+    hypergraph_propagation_matrix,
+)
 from .encoder import HMPEncoder
-from .decoder import inner_product_decoder, HyperedgeDecoder
-from .losses import total_loss
+from .decoder import inner_product_decoder, normalized_cosine_decoder, HyperedgeDecoder
+from .losses import total_loss, total_loss_v8, per_node_adjacency_recon_error
 from .trust_scorer import (
     compute_trust_weights,
     weighted_aggregate,
@@ -42,6 +49,7 @@ from .trust_scorer import (
     v5_cse_reject_weights,
     v6_cse_reject_geo_weights,
     v7_cse_reject_corrob_weights,
+    v8_hmp_cse_propagation_weights,
 )
 
 
@@ -172,6 +180,14 @@ class HMPGAERuntime:
         #     reproduces V6 exactly. ⚠ Constants provisional until the
         #     replay calibration (replay_v7_calibration.py) passes — do NOT
         #     launch a V7 training run before that (docs/DECISION.md "V7").
+        #   'v8_hmp_cse_propagation' (V8, 2026-08-09): V5 remains the
+        #     high-confidence CSE decision layer.  Its flags seed risk on a
+        #     fixed dual-view hypergraph: raw-update and label-free probe
+        #     behavior must agree on mutual neighbors.  HMP/GAE learns a
+        #     signed affinity on the fixed update topology and attenuates
+        #     node-edge-node propagation.  Only directionally elevated-CSE
+        #     peers can consume unused rank-cap budget; no seed/reliable edge/
+        #     budget returns V5 exactly.
         self.trust_mode = str(
             self.cfg.get("trust_mode", "soft_reject_fedavg")
         ).strip().lower()
@@ -181,12 +197,19 @@ class HMPGAERuntime:
         _known_modes = {
             "soft_reject_fedavg", "reject_then_fedavg", "softmax",
             "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo",
-            "v7_cse_reject_corrob",
+            "v7_cse_reject_corrob", "v8_hmp_cse_propagation",
         }
         if self.trust_mode not in _known_modes:
             raise ValueError(
                 f"Unknown trust_mode={self.trust_mode!r}; expected one of "
                 f"{sorted(_known_modes)}"
+            )
+        self.is_v8 = self.trust_mode == "v8_hmp_cse_propagation"
+        if self.is_v8 and self.semantic_weight <= 0.0:
+            raise ValueError(
+                "trust_mode='v8_hmp_cse_propagation' requires "
+                "semantic_weight > 0 so the independent probe-behavior "
+                "hypergraph is available"
             )
         # --- V4 knobs (inert unless trust_mode == 'v4_cse_reject') ---
         #   v4_tau_ratio  : pre-registered 1.85 (zero-FP plateau [1.785, 1.90]
@@ -260,7 +283,7 @@ class HMPGAERuntime:
         self.v7_round_max = int(self.cfg.get("v7_round_max", 10))
         if self.trust_mode in (
             "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo",
-            "v7_cse_reject_corrob",
+            "v7_cse_reject_corrob", "v8_hmp_cse_propagation",
         ):
             # The pool median must be benign-controlled: majority-poisoned
             # federations invert the rule. Raise (not assert) so a bad config
@@ -291,7 +314,8 @@ class HMPGAERuntime:
                     f"got {self.v4_reject_mult}"
                 )
         if self.trust_mode in (
-            "v5_cse_reject", "v6_cse_reject_geo", "v7_cse_reject_corrob"
+            "v5_cse_reject", "v6_cse_reject_geo", "v7_cse_reject_corrob",
+            "v8_hmp_cse_propagation",
         ):
             # V6 reuses V5's Stage-2 ramp verbatim, so it inherits both
             # guards; V7 embeds V6 as its Stage A and inherits them again.
@@ -398,6 +422,8 @@ class HMPGAERuntime:
             hidden_dim=self.hidden_dim,
             latent_dim=self.latent_dim,
             num_layers=self.num_hmp_layers,
+            residual=self.is_v8,
+            signed_output=self.is_v8,
         ).to(self.device)
         # M = N: one hyperedge per client (center-node construction).
         self.hyperedge_decoder = HyperedgeDecoder(
@@ -522,6 +548,44 @@ class HMPGAERuntime:
         else:
             probe_arg = None
 
+        # V8 separates topology construction from the learned encoder.  The
+        # update view uses the fixed JL projection (stable basis, no optimizer
+        # feedback); the behavior view uses label-free per-sample probe
+        # distributions.  Both graphs are built ONCE per round and detached.
+        # Older modes keep rebuilding H from learned eta exactly as before.
+        v8_update_mutual = None
+        v8_behavior_mutual = None
+        v8_consensus_mutual = None
+        v8_propagation_H = None
+        v8_adjacency_target = None
+        if self.is_v8:
+            if probe_arg is None:
+                raise ValueError(
+                    "trust_mode='v8_hmp_cse_propagation' requires "
+                    "probe_distributions; the server must collect the shared "
+                    "label-free semantic probe before aggregation"
+                )
+            with torch.no_grad():
+                stable_update_view = self.projection(updates_stack).detach()
+                fixed_H, fixed_D_V_inv, fixed_D_E_inv = knn_hypergraph(
+                    stable_update_view, k=self.knn_k
+                )
+                behavior_sim = semantic_js_similarity(probe_arg)
+                behavior_H, _, _ = knn_hypergraph_from_similarity(
+                    behavior_sim, k=self.knn_k
+                )
+                v8_update_mutual = mutual_neighbor_adjacency(fixed_H)
+                v8_behavior_mutual = mutual_neighbor_adjacency(behavior_H)
+                (
+                    v8_propagation_H,
+                    _,
+                    _,
+                    v8_consensus_mutual,
+                ) = consensus_propagation_hypergraph(fixed_H, behavior_H)
+                v8_adjacency_target = v8_update_mutual.to(
+                    dtype=updates_stack.dtype
+                )
+
         # ---- 2) self-supervised training steps ---- #
         self.node_encoder.train()
         self.hmp_encoder.train()
@@ -536,26 +600,52 @@ class HMPGAERuntime:
                 encoder=self.node_encoder,
                 history=hist_mat if has_hist else None,
             )
-            H, D_V_inv, D_E_inv = knn_hypergraph(eta, k=self.knn_k)
+            if self.is_v8:
+                H, D_V_inv, D_E_inv = (
+                    fixed_H, fixed_D_V_inv, fixed_D_E_inv
+                )
+            else:
+                H, D_V_inv, D_E_inv = knn_hypergraph(eta, k=self.knn_k)
             Z = self.hmp_encoder(eta, H, D_V_inv, D_E_inv)
 
-            _, A_probs = inner_product_decoder(Z)
+            if self.is_v8:
+                A_logits, A_probs = normalized_cosine_decoder(Z)
+            else:
+                A_logits, A_probs = inner_product_decoder(Z)
             H_hat_logits, _ = self.hyperedge_decoder(Z)
 
-            bundle = total_loss(
-                H=H,
-                H_hat_logits=H_hat_logits,
-                A_hat=A_probs,
-                Z=Z,
-                Z_hist=Z_hist_arg,
-                lambda_H=self.lambda_H,
-                lambda_A=self.lambda_A,
-                lambda_hist=self.lambda_hist,
-                weight_decay=self.weight_decay,
-                params=list(self.node_encoder.parameters())
-                    + list(self.hmp_encoder.parameters())
-                    + list(self.hyperedge_decoder.parameters()),
+            loss_params = (
+                list(self.node_encoder.parameters())
+                + list(self.hmp_encoder.parameters())
+                + list(self.hyperedge_decoder.parameters())
             )
+            if self.is_v8:
+                bundle = total_loss_v8(
+                    H=H,
+                    H_hat_logits=H_hat_logits,
+                    adjacency_target=v8_adjacency_target,
+                    adjacency_logits=A_logits,
+                    Z=Z,
+                    Z_hist=Z_hist_arg,
+                    lambda_H=self.lambda_H,
+                    lambda_A=self.lambda_A,
+                    lambda_hist=self.lambda_hist,
+                    weight_decay=self.weight_decay,
+                    params=loss_params,
+                )
+            else:
+                bundle = total_loss(
+                    H=H,
+                    H_hat_logits=H_hat_logits,
+                    A_hat=A_probs,
+                    Z=Z,
+                    Z_hist=Z_hist_arg,
+                    lambda_H=self.lambda_H,
+                    lambda_A=self.lambda_A,
+                    lambda_hist=self.lambda_hist,
+                    weight_decay=self.weight_decay,
+                    params=loss_params,
+                )
             bundle.total.backward()
             # Mild gradient clipping for stability when N is small.
             torch.nn.utils.clip_grad_norm_(
@@ -578,9 +668,25 @@ class HMPGAERuntime:
                 encoder=self.node_encoder,
                 history=hist_mat if has_hist else None,
             )
-            H, D_V_inv, D_E_inv = knn_hypergraph(eta, k=self.knn_k)
+            if self.is_v8:
+                H, D_V_inv, D_E_inv = (
+                    fixed_H, fixed_D_V_inv, fixed_D_E_inv
+                )
+            else:
+                H, D_V_inv, D_E_inv = knn_hypergraph(eta, k=self.knn_k)
             Z = self.hmp_encoder(eta, H, D_V_inv, D_E_inv)
-            _, A_probs = inner_product_decoder(Z)
+            if self.is_v8:
+                A_logits, A_probs = normalized_cosine_decoder(Z)
+                v8_recon_error = per_node_adjacency_recon_error(
+                    v8_adjacency_target, A_logits
+                )
+                v8_propagation = hypergraph_propagation_matrix(
+                    v8_propagation_H, pair_affinity=A_probs
+                )
+            else:
+                _, A_probs = inner_product_decoder(Z)
+                v8_recon_error = None
+                v8_propagation = None
 
             # Phase-gated β: hist signal only active in warmup window.
             # hist_warmup_rounds is None  -> always on (backward compatible)
@@ -607,6 +713,7 @@ class HMPGAERuntime:
                 semantic_reference=self.semantic_reference,
                 semantic_confidence_weight=self.semantic_confidence_weight,
                 graph_min_distinct=self.graph_min_distinct,
+                recon_error_override=v8_recon_error,
             )
 
         # ---- 3b) Suspicion score + cross-round EMA smoothing ---- #
@@ -660,7 +767,7 @@ class HMPGAERuntime:
             used_mode = "cold_start_fedavg"
         elif self.trust_mode in (
             "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo",
-            "v7_cse_reject_corrob",
+            "v7_cse_reject_corrob", "v8_hmp_cse_propagation",
         ):
             # V4/V5/V6/V7: rejection driven by the absolute per-client full-test CSE.
             # local_cse is required — do NOT silently fall back (the defense
@@ -719,7 +826,7 @@ class HMPGAERuntime:
                     geo_floor=self.v6_geo_floor,
                     keep_min=self.keep_min,
                 )
-            else:
+            elif self.trust_mode == "v7_cse_reject_corrob":
                 # V7: V6 plus the iso-corroborated cold-window tier. The
                 # Tier-2 conjunct is the RAW graph_residual — deliberately
                 # NOT diag_gate, whose suspicion input is pool-relative
@@ -746,6 +853,20 @@ class HMPGAERuntime:
                     corrob_mult=self.v7_corrob_mult,
                     round_min=self.v7_round_min,
                     round_max=self.v7_round_max,
+                    keep_min=self.keep_min,
+                )
+            else:
+                # V8: V5 CSE flags are immutable high-confidence seeds.  The
+                # fixed cross-view hypergraph may use only the unused rank-cap
+                # budget to softly penalize a connected, elevated-CSE peer.
+                used_alpha, v4_diag = v8_hmp_cse_propagation_weights(
+                    local_cse=v4_cse_t,
+                    data_sizes=ds_tensor,
+                    propagation_matrix=v8_propagation,
+                    tau_ratio=self.v4_tau_ratio,
+                    k_cap=self.v4_k_cap,
+                    m_floor=self.v5_m_floor,
+                    r_hard=self.v5_r_hard,
                     keep_min=self.keep_min,
                 )
             used_mode = self.trust_mode
@@ -852,12 +973,11 @@ class HMPGAERuntime:
             "graph_min_distinct": int(self.graph_min_distinct),
             "defense_time_ms": float(elapsed_ms),
         }
-        # V4/V5/V6/V7 per-round diagnostics (trust_mode 'v4_cse_reject',
-        # 'v5_cse_reject', 'v6_cse_reject_geo' or 'v7_cse_reject_corrob').
+        # V4-V8 per-round diagnostics.
         # The "v4_" prefix names the shared CSE-reject diagnostic channel
-        # family — V5/V6/V7 reuse it so the archive-side CSV tooling works
-        # unchanged; version-only extras carry a "v5_" / "v6_" / "v7_"
-        # prefix. NOTE: this must stay a FOUR-way branch — an `if/else`
+        # family — V5-V8 reuse it so archive-side CSV tooling works unchanged;
+        # version-only extras carry their own prefix. NOTE: this must stay an
+        # explicit mode branch — an early `else`
         # collapse would silently mislabel one mode's rows as another's.
         if v4_diag is not None and v4_cse_t is not None:
             stats["v4_cse"] = v4_cse_t.detach().cpu().tolist()
@@ -890,7 +1010,7 @@ class HMPGAERuntime:
                 stats["v6_geo_gate"] = v4_diag["geo_gate"].detach().cpu().tolist()
                 stats["v6_geo_mult"] = v4_diag["geo_mult"].detach().cpu().tolist()
                 stats["v6_m_cse"] = v4_diag["m_cse"].detach().cpu().tolist()
-            else:
+            elif self.trust_mode == "v7_cse_reject_corrob":
                 # V7: the full V6 channel family (Stage A is V6 verbatim)
                 # plus the Tier-2 read-out. The falsification statistic for
                 # V7 is the per-run count of v7_corrob_flagged rounds: zero
@@ -915,6 +1035,56 @@ class HMPGAERuntime:
                 stats["v7_corrob_mult"] = float(self.v7_corrob_mult)
                 stats["v7_round_min"] = int(self.v7_round_min)
                 stats["v7_round_max"] = int(self.v7_round_max)
+            else:
+                # V8 Stage A is V5 (not V6/V7). Emit every input and
+                # intermediate needed to falsify the mechanism from an
+                # archived result: no seeds, no seed-connected consensus path,
+                # no elevated-CSE peer, or no propagated flags each explain
+                # exact V5 behavior.
+                stats["v5_m_floor"] = float(self.v5_m_floor)
+                stats["v5_r_hard"] = float(self.v5_r_hard)
+                stats["v5_ramp_t"] = v4_diag["ramp_t"].detach().cpu().tolist()
+                stats["v8_seed"] = v4_diag["seed"].detach().cpu().tolist()
+                stats["v8_propagated_risk"] = (
+                    v4_diag["propagated_risk"].detach().cpu().tolist()
+                )
+                stats["v8_cse_evidence"] = (
+                    v4_diag["cse_evidence"].detach().cpu().tolist()
+                )
+                stats["v8_joint_evidence"] = (
+                    v4_diag["joint_evidence"].detach().cpu().tolist()
+                )
+                stats["v8_propagated_flagged"] = [
+                    int(b) for b in
+                    v4_diag["propagated_flagged"].detach().cpu().tolist()
+                ]
+                stats["v8_propagated_multiplier"] = (
+                    v4_diag["propagated_multiplier"].detach().cpu().tolist()
+                )
+                stats["v8_propagation_matrix"] = (
+                    v8_propagation.detach().cpu().tolist()
+                )
+                stats["v8_update_mutual"] = (
+                    v8_update_mutual.to(dtype=torch.int8).cpu().tolist()
+                )
+                stats["v8_behavior_mutual"] = (
+                    v8_behavior_mutual.to(dtype=torch.int8).cpu().tolist()
+                )
+                stats["v8_consensus_mutual"] = (
+                    v8_consensus_mutual.to(dtype=torch.int8).cpu().tolist()
+                )
+                stats["v8_update_edge_count"] = int(
+                    v8_update_mutual.sum().item() // 2
+                )
+                stats["v8_behavior_edge_count"] = int(
+                    v8_behavior_mutual.sum().item() // 2
+                )
+                stats["v8_consensus_edge_count"] = int(
+                    v8_consensus_mutual.sum().item() // 2
+                )
+                stats["v8_recon_error"] = (
+                    v8_recon_error.detach().cpu().tolist()
+                )
         # Probe-entropy diagnostic (V4 brief, decision (d)): the mean
         # per-sample entropy on the K-sample probe is the "free" pre-agg
         # statistic under option (ii). Logged whenever the probe exists so a
@@ -929,6 +1099,8 @@ class HMPGAERuntime:
         if last_loss_bundle is not None:
             stats["L_rec"] = float(last_loss_bundle.L_rec_H.item())
             stats["L_smooth"] = float(last_loss_bundle.L_smooth.item())
+            if self.is_v8:
+                stats["L_struct"] = float(last_loss_bundle.L_smooth.item())
             stats["L_hist"] = float(last_loss_bundle.L_hist.item())
         # Keep Z around so the caller can persist it for visualization,
         # but do not let it leak into the standard JSON log (defense
@@ -944,14 +1116,11 @@ class HMPGAERuntime:
     # the Adam optimizer, and the EMA latent cache z_hist.  The fixed random
     # projection and all hyperparameters are reconstructed deterministically
     # from config + random_proj_seed at __init__, so they are not stored.
-    # The V4/V5/V6 rules ('v4_cse_reject' / 'v5_cse_reject' /
-    # 'v6_cse_reject_geo') are deliberately STATELESS across rounds (per-round
-    # median ratio; V5's ramp and V6's geometry factor are pure per-round
-    # functions of that ratio and of the gate — whose own cross-round state,
-    # the suspicion EMA, is already serialized below as `sus_ema`). They add
-    # nothing here; if any of them ever grows cross-round state (e.g. sticky
-    # flags), serialize it alongside sus_ema or resumed runs will silently
-    # restart it.
+    # V4-V8 decisions are deliberately STATELESS across rounds. V8's two
+    # topology views are rebuilt from the current round and its learned
+    # denoiser lives in the already-serialized modules. If any rule ever grows
+    # cross-round state (e.g. sticky flags), serialize it alongside sus_ema or
+    # resumed runs will silently restart it.
 
     def state_dict(self) -> Dict[str, Any]:
         # Deep-copy the module/optimizer payloads: torch's .state_dict()

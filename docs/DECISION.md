@@ -439,11 +439,12 @@ the calibration replays): a NaN client update inverts the signal
 client and its residual collapses to 0.0 — but a NaN-update client has a
 degenerate local model, which the CSE tier flags), and exact-duplicate
 updates fall back to topk's index order (`graph_min_distinct` gates such
-degenerate rounds). The
-"geometry owns update-forging / no-server-data" division-of-labor design
-(geometry EMA with independent flag authority) is the natural V8 direction
-but requires a *log-only phase first* (a raw-projection isolation statistic
-is not in the archive) and its own entry — explicitly deferred.
+degenerate rounds). The earlier natural-V8 idea was "geometry owns
+update-forging / no-server-data" (geometry EMA with independent flag
+authority), but it required a log-only raw-projection phase absent from the
+archive. It remains rejected for the current V8: geometry still has no
+independent flag authority. The adopted V8 below instead uses confirmed CSE
+flags as propagation seeds.
 
 **Rejected within this design:**
 
@@ -514,3 +515,111 @@ fixtures), and the index-ascending final tie-break key under a full
   without it, and changing it breaks FedAvg comparability for every run.
 - Adaptive per-channel weighting: improves Llama Yahoo but degrades Llama AG
   (−79% → −45% attacker mass), the paper's strongest block. Deferred.
+
+## V8 `v8_hmp_cse_propagation`: CSE-seeded dual-view HMP propagation (2026-08-09)
+
+**Adopted and implemented; no FL outcome has been observed yet.** V7 is frozen.
+V8 is a separate trust mode and starts from V5, not V6/V7. This is deliberate:
+V6 can only tighten clients CSE already flagged, while V7's scalar-isolation
+conjunct was empirically inactive. V8 asks the hypergraph a relational question
+instead: given a high-confidence CSE seed, which other client is connected to
+that seed by the same update and probe-behavior mechanism?
+
+### Construction
+
+1. **Stable update view.** Build centered k-NN incidence `H_update` from the
+   fixed JL projection of this round's submitted updates. It is detached and
+   built once per round. It never depends on the trainable node encoder.
+2. **Independent behavior view.** Compute pairwise Jensen-Shannon similarity
+   from clients' per-sample softmax distributions on the shared probe. Probe
+   labels do not enter similarity (labels may only stratify probe selection),
+   then build a second centered k-NN incidence `H_behavior`.
+3. **Conservative consensus relation.** A pair survives only if it is mutual
+   k-NN in both views. The consensus pairs form `H_prop`. Self-only columns are
+   legal but carry no risk because the propagation operator removes its
+   diagonal.
+4. **Fixed-target HMP-GAE.** The encoder message-passes on the round-fixed
+   `H_update`, with residual projections + LayerNorm and a signed final latent.
+   The decoder uses `sigmoid(4*cos(z_i,z_j))`; its adjacency target is the
+   fixed direct-mutual update graph. Training is incidence BCE + off-diagonal
+   adjacency BCE + the existing history/L2 terms. This fixes two concrete old
+   failure modes: learnable-eta topology reconstructing itself, and final-ReLU
+   inner products that cannot emit negative logits.
+5. **Sub-stochastic denoising.** Form the off-diagonal row-normalized
+   node-edge-node operator on `H_prop`, then multiply by learned adjacency
+   affinity. Do not renormalize after the multiplication. Otherwise a node's
+   single weak edge becomes 1 and the GAE is mathematically erased.
+
+### Decision authority
+
+Stage A calls `v5_cse_reject_weights` directly. Its flag set and ramp remain
+unchanged. Let those flags be seeds `F`; for each non-seed:
+
+```
+propagated_risk_i = sum_j T[i,j] * 1[j in F]
+cse_evidence_i    = clip((ratio_i - 1) / (tau_ratio - 1), 0, 1)
+joint_i           = propagated_risk_i * cse_evidence_i
+m_prop_i          = 1 - (1 - v5_m_floor) * joint_i
+```
+
+Only positive-joint candidates may use the remaining shared rank-cap budget
+`min(k_cap, N - max(1, keep_min)) - |F|`. Ordering is deterministic: joint
+descending, CSE ratio descending, index ascending. Seeds cannot be displaced or
+re-ranked. The final weight remains `normalize(data_size_i * multiplier_i)`.
+
+The pool median remains the sole CSE denominator. Neighborhood-median CSE stays
+rejected because two colluding attackers can control a three-member hyperedge.
+The hypergraph propagates detached seed evidence; it does not redefine CSE.
+
+### Structural guarantees and honest claims
+
+- No V5 seed, no consensus path to a seed, no directionally elevated peer, or
+  no remaining rank-cap budget returns V5's weight tensor unchanged exactly.
+  Weak learned affinity produces a proportionally weak penalty; it is not
+  renormalized back to full strength.
+- A clean federation with no V5 flag is therefore exactly the data-size prior,
+  independent of hypergraph topology.
+- V8 cannot discover an attacker cluster if none of its members becomes a CSE
+  seed. This is the price of denying geometry independent flag authority.
+- A false-positive CSE seed can propagate a mild penalty to a related benign
+  client whose ratio is above the pool median. The cross-view mutual relation,
+  continuous multiplier, and shared rank cap contain but do not eliminate this
+  risk. It must be measured, not claimed away.
+- The current implementation uses full-test local CSE. It therefore assumes a
+  server evaluation set and remains incompatible with `crafts_update` attackers
+  whose poison exists only in a forged update while `client.model` stays benign.
+  A paper must call this server-data assumption out; a future clean protocol
+  should use a held-out validation set rather than the reported test split.
+
+The defensible paper statement is: **CSE supplies high-precision seeds;
+cross-view hypergraph relations expand recall within a bounded budget; the GAE
+learns continuous relation confidence.** Do not claim that the hypergraph alone
+detects attackers or that V8 improves accuracy until matched FL experiments show
+it.
+
+### Falsification and experiment contract
+
+Every round persists `v8_seed`, `v8_propagated_risk`, `v8_cse_evidence`,
+`v8_joint_evidence`, `v8_propagated_flagged`, the applied multiplier, all three
+mutual-adjacency matrices, the final propagation matrix, edge counts, true
+per-node reconstruction error, and `L_struct`.
+
+- If `v8_propagated_flagged` is zero throughout, V8 reduced to V5; report a
+  negative mechanism result and do not relax consensus after seeing outcomes.
+- If propagation mostly selects benign clients, the relational premise failed,
+  even if aggregate CSE happens to improve by noise.
+- A hypergraph-attributable performance claim requires matched V5 versus V8
+  runs with identical seed/model/data/attack config, plus nonzero attacker
+  propagation and acceptable propagated benign false positives.
+- Report clean accuracy, mean/final CSE and PPL together. A CSE gain that harms
+  clean accuracy or moves PPL beyond the predeclared noise band is not a win.
+- Component ablations needed before paper submission are: update view only
+  versus dual-view consensus, learned affinity versus unit affinity, and V5
+  versus full V8. Each arm needs a distinct `experiment_name`; no notebook
+  overrides.
+
+Tested by `test_v8_safe_degradation_to_v5`,
+`test_v8_propagates_only_joint_evidence`,
+`test_v8_dual_view_consensus_and_affinity_mass`, and
+`test_runtime_v8_hmp_cse_propagation`, plus the expanded facade guard. These
+tests prove wiring and invariants, not FL convergence or performance.

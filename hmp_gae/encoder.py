@@ -25,11 +25,25 @@ class HMPLayer(nn.Module):
     Single HMP layer with a node-side and hyperedge-side linear projection.
     """
 
-    def __init__(self, in_dim: int, edge_dim: int, out_dim: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        in_dim: int,
+        edge_dim: int,
+        out_dim: int,
+        dropout: float = 0.0,
+        residual: bool = False,
+        activate_output: bool = True,
+    ):
         super().__init__()
         self.W_E = nn.Linear(in_dim, edge_dim, bias=False)
         self.W_V = nn.Linear(edge_dim, out_dim, bias=False)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.residual = bool(residual)
+        self.activate_output = bool(activate_output)
+        self.W_skip = (
+            nn.Linear(in_dim, out_dim, bias=False) if self.residual else None
+        )
+        self.norm = nn.LayerNorm(out_dim) if self.residual else None
         # Kaiming init (linear w/ ReLU). nn.Linear already uses
         # kaiming_uniform_ by default; keep the standard init.
 
@@ -49,7 +63,13 @@ class HMPLayer(nn.Module):
         # hyperedge -> node: Z' = sigma(D_V^{-1} H (E W_V))
         msg_v = H @ self.W_V(E)                       # (N, out_dim)
         Z_new = apply_diag_inv(D_V_inv, msg_v)
-        Z_new = F.relu(Z_new)
+        if self.residual:
+            # V8: preserve client-specific content on the tiny N=7 graph while
+            # still admitting a bounded-depth hypergraph message.  Older modes
+            # keep the historical pure-message path byte-for-byte.
+            Z_new = self.norm(Z_new + self.W_skip(Z))
+        if self.activate_output:
+            Z_new = F.relu(Z_new)
         return Z_new, E
 
 
@@ -68,6 +88,8 @@ class HMPEncoder(nn.Module):
         latent_dim: int,
         num_layers: int = 2,
         dropout: float = 0.0,
+        residual: bool = False,
+        signed_output: bool = False,
     ):
         super().__init__()
         self.num_layers = int(num_layers)
@@ -82,6 +104,10 @@ class HMPEncoder(nn.Module):
                 edge_dim=max(dims[i], dims[i + 1]),
                 out_dim=dims[i + 1],
                 dropout=dropout,
+                residual=residual,
+                # A signed final latent lets V8's cosine decoder represent
+                # both attraction and repulsion.  Hidden layers stay ReLU.
+                activate_output=not (signed_output and i == self.num_layers - 1),
             )
             for i in range(self.num_layers)
         ])

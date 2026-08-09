@@ -40,17 +40,17 @@
 ├── evaluation_hallucination.py        # V2 M7: end-of-FL PPL (backbone transfer to CausalLM)
 ├── hmp_gae/                           # HMP-GAE defense sub-package (this paper)
 │   ├── node_features.py               #   eta_i = f_enc(Delta_i, stats, history)
-│   ├── hypergraph.py                  #   k-NN hypergraph H, D_V, D_E
-│   ├── encoder.py                     #   L-layer HMP encoder (node↔hyperedge)
-│   ├── decoder.py                     #   GAE decoder: A_hat, H_hat
-│   ├── losses.py                      #   BCE(H,H_hat) + smoothness + hist
+│   ├── hypergraph.py                  #   k-NN + V8 update/behavior consensus hypergraphs
+│   ├── encoder.py                     #   L-layer HMP encoder (V8 residual + signed output)
+│   ├── decoder.py                     #   GAE decoder: A_hat, H_hat (V8 cosine logits)
+│   ├── losses.py                      #   legacy smoothness + V8 fixed-topology reconstruction
 │   ├── trust_scorer.py                #   closed-form trust -> alpha_i
 │   └── runtime.py                     #   end-to-end HMPGAERuntime
 ├── data/                              # Local CSV caches (AG News + Yahoo Answers)
 │   ├── ag_news/                       # train.csv, test.csv (label,title,text — no header)
 │   └── yahoo_answers/                 # train.csv, test.csv (label,text — no header; 1-based labels)
 ├── tests/
-│   └── test_trust_robustness.py       # Trust-scoring CPU regression (V3–V7, legacy bit-for-bit)
+│   └── test_trust_robustness.py       # Trust-scoring CPU regression (V3–V8, legacy bit-for-bit)
 └── HMP_GAE_Colab.ipynb                # Colab: main experiment + full inline results; then disconnect GPU
 ```
 
@@ -153,9 +153,33 @@ values (they change per experiment arm; read the dict). The knob groups:
   `graph_min_distinct`, …).
 - **`trust_mode`** — the trust→weight mapping: V3 `'soft_reject_fedavg'` (sigmoid gate +
   FedAvg) and the CSE-reject family `'v4_cse_reject'` / `'v5_cse_reject'` /
-  `'v6_cse_reject_geo'` / `'v7_cse_reject_corrob'` (V7 may not run before
-  `replay_v7_calibration.py` passes). Pre-registered constants and design rationale:
+  `'v6_cse_reject_geo'` / `'v7_cse_reject_corrob'` /
+  `'v8_hmp_cse_propagation'`. V7 remains a frozen calibration-dependent arm;
+  V8 combines V5 CSE seeds with a fixed update/probe consensus hypergraph and
+  learned HMP propagation. Pre-registered constants and design rationale:
   [docs/DECISION.md](docs/DECISION.md).
+
+### V8: CSE-seeded dual-view hypergraph propagation
+
+V8 addresses the observed V7 degeneracy directly: a scalar isolation floor can
+remain inactive even though the hypergraph has useful relational structure.
+For each round V8 builds two independent centered k-NN hypergraphs: one from the
+fixed JL projection of client updates, and one from label-free softmax behavior
+on the shared probe set. A relation can carry risk only when it is mutual in
+both views. The HMP-GAE encoder trains against this round-fixed update topology,
+uses residual layers and a signed cosine decoder, and attenuates node→edge→node
+risk with its reconstructed affinity.
+
+The decision authority remains conservative. V5's full-test CSE flags are the
+only seeds and always have priority. A non-seed can use only unused
+`num_byzantine` rank-cap budget, and only when it receives propagated seed risk
+and its own pool-median CSE ratio is above 1. Its multiplier varies continuously
+with the product of those two signals. No seed, no cross-view path to a seed,
+no directionally elevated peer, or no remaining budget returns V5's weights
+exactly; weak learned affinity instead yields a proportionally mild penalty.
+This is the mechanism to test; it is not yet a claimed accuracy improvement.
+The per-round `v8_*` diagnostics make a null result identifiable rather than
+silently calling an inactive graph successful.
 
 **Robust trust scoring (2026-07).** Four config-gated fixes targeting the two
 failure modes that cost clean accuracy: (1) `semantic_reference='median'`

@@ -64,6 +64,13 @@
 # attackers in the Qwen AG cell, so any symmetric fusion would hand attackers
 # weight back and undo V4/V5's CSE gains. geo_floor = 1.0 reproduces
 # v5_cse_reject_weights element-for-element (the regression guard).
+#
+# V7 adds a windowed scalar-isolation corroboration tier on top of V6. V8 is
+# separate: it starts from V5, treats V5 flags as immutable CSE seeds, and
+# propagates seed risk through a fixed update/probe consensus hypergraph. A
+# non-seed also needs directionally elevated pool-median CSE and unused shared
+# rank-cap budget. The HMP-GAE affinity controls penalty strength/ranking, not
+# independent flag authority.
 
 from __future__ import annotations
 
@@ -261,6 +268,7 @@ def compute_trust_weights(
     semantic_reference: str = "pairwise",
     semantic_confidence_weight: bool = False,
     graph_min_distinct: int = 0,
+    recon_error_override: Optional[torch.Tensor] = None,
 ) -> TrustResult:
     """
     Compute closed-form trust weights for N clients.
@@ -294,6 +302,9 @@ def compute_trust_weights(
             and N=7 the channel takes only 4-5 discrete levels (multiples of
             1/6), so its within-round MAD is often exactly 0 and it degrades
             to quantization noise. 0 = off (legacy behavior, default).
+        recon_error_override: optional genuine per-node reconstruction error
+            against a detached fixed target (V8). When omitted, retain the
+            legacy ``1 - mean(A_hat_offdiag)`` isolation proxy exactly.
 
     Returns:
         TrustResult with alpha (N,) and diagnostic tensors.
@@ -327,8 +338,18 @@ def compute_trust_weights(
         graph_residual = torch.zeros(N, device=device, dtype=dtype)
 
     # ---- Signal 2: reconstructed adjacency residual ---- #
+    # V8 supplies a genuine per-node reconstruction error against a fixed,
+    # detached topology target.  Older modes preserve the historical
+    # 1-mean(A_hat) isolation proxy exactly.
     off_mask = 1.0 - torch.eye(N, device=device, dtype=dtype)
-    if N > 1:
+    if recon_error_override is not None:
+        recon_residual = recon_error_override.detach().to(device=device, dtype=dtype)
+        if recon_residual.shape != (N,):
+            raise ValueError(
+                "recon_error_override must have shape "
+                f"({N},), got {tuple(recon_residual.shape)}"
+            )
+    elif N > 1:
         recon_residual = 1.0 - (A_hat * off_mask).sum(dim=1) / (N - 1)
     else:
         recon_residual = torch.zeros(N, device=device, dtype=dtype)
@@ -1015,6 +1036,127 @@ def v7_cse_reject_corrob_weights(
     mult = torch.where(
         corrob, torch.full_like(x, float(corrob_mult)), diag["multiplier"]
     )
+    w = mult * ds
+    total = w.sum()
+    if float(total) <= 0.0:
+        w = mult.clone()
+        total = w.sum().clamp(min=1.0)
+    w = w / total
+    diag["multiplier"] = mult
+    return w, diag
+
+
+def v8_hmp_cse_propagation_weights(
+    local_cse: torch.Tensor,
+    data_sizes: torch.Tensor,
+    propagation_matrix: torch.Tensor,
+    tau_ratio: float = 1.85,
+    k_cap: int = 2,
+    m_floor: float = 0.10,
+    r_hard: float = 2.5,
+    keep_min: int = 1,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """V8: V5-safe CSE seeds plus conservative hypergraph risk propagation.
+
+    Stage A is :func:`v5_cse_reject_weights` byte-for-byte.  Its high-
+    confidence CSE flags become binary risk seeds.  ``propagation_matrix`` is
+    the sub-stochastic, off-diagonal node->hyperedge->node operator built only
+    from client pairs that are mutual neighbors in BOTH the raw-update and
+    probe-behavior views, then denoised by V8's learned adjacency.
+
+    A non-seed client can be additionally down-weighted only when all of the
+    following hold:
+
+      * at least one V5 CSE seed exists;
+      * cross-view HMP propagation gives it positive risk;
+      * its own pool-median CSE ratio is above 1 (directionally suspicious);
+      * the shared rank-cap has budget left after all V5 flags.
+
+    The strength has no new tuned threshold:
+
+        e_cse_i = clip((ratio_i - 1) / (tau_ratio - 1), 0, 1)
+        joint_i = propagated_risk_i * e_cse_i
+        m_prop_i = 1 - (1 - m_floor) * joint_i
+
+    Thus a weakly elevated CSE or a weak relation causes only a mild penalty;
+    both must be strong to approach ``m_floor``.  No seed, no reliable edge,
+    or no remaining rank budget returns V5's weight tensor unchanged, exactly.
+    This is deliberately NOT neighborhood-median CSE: the benign-controlled
+    pool median remains the only denominator and HMP propagates only detached,
+    already-confirmed anomaly evidence.
+    """
+    w5, diag = v5_cse_reject_weights(
+        local_cse=local_cse,
+        data_sizes=data_sizes,
+        tau_ratio=tau_ratio,
+        k_cap=k_cap,
+        m_floor=m_floor,
+        r_hard=r_hard,
+        keep_min=keep_min,
+        eps=eps,
+    )
+    x = local_cse.detach().to(dtype=torch.float32)
+    N = int(x.numel())
+    T = propagation_matrix.detach().to(device=x.device, dtype=torch.float32)
+    if T.shape != (N, N):
+        raise ValueError(
+            f"propagation_matrix shape {tuple(T.shape)} != expected ({N}, {N})"
+        )
+    T = torch.nan_to_num(T, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+    # Re-impose the runtime contract defensively: no self-propagation and at
+    # most unit outgoing mass.  Do NOT normalize a sub-unit row back to one:
+    # that mass is the learned GAE confidence, and restoring it would make the
+    # decoder irrelevant whenever a client has only one surviving relation.
+    T = T.clone()
+    T.fill_diagonal_(0.0)
+    row_sum = T.sum(dim=1, keepdim=True)
+    T = torch.where(
+        row_sum > 1.0,
+        T / row_sum.clamp(min=eps),
+        T,
+    )
+
+    flagged = diag["flagged"]
+    seeds = flagged.to(dtype=torch.float32)
+    propagated = (T @ seeds).clamp(min=0.0, max=1.0)
+    ratio = diag["ratio"]
+    cse_evidence = torch.clamp(
+        (ratio - 1.0) / max(float(tau_ratio) - 1.0, eps),
+        min=0.0,
+        max=1.0,
+    )
+    joint = (propagated * cse_evidence).clamp(min=0.0, max=1.0)
+    joint = torch.where(flagged, torch.zeros_like(joint), joint)
+
+    max_flags = min(max(0, int(k_cap)), max(0, N - max(1, int(keep_min))))
+    budget = max_flags - int(flagged.sum())
+    propagated_flagged = torch.zeros(N, dtype=torch.bool, device=x.device)
+    if budget > 0 and bool(joint.gt(0).any()):
+        # Deterministic order: joint evidence desc, CSE ratio desc, index asc.
+        order = sorted(
+            range(N),
+            key=lambda i: (-float(joint[i]), -float(ratio[i]), i),
+        )
+        chosen = [i for i in order if float(joint[i]) > 0.0][:budget]
+        if chosen:
+            propagated_flagged[chosen] = True
+
+    diag["seed"] = seeds
+    diag["propagated_risk"] = propagated
+    diag["cse_evidence"] = cse_evidence
+    diag["joint_evidence"] = joint
+    diag["propagated_flagged"] = propagated_flagged
+    prop_mult = 1.0 - (1.0 - float(m_floor)) * joint
+    diag["propagated_multiplier"] = prop_mult
+
+    if not bool(propagated_flagged.any()):
+        # Load-bearing regression invariant: V8 with no actionable propagated
+        # evidence is V5 element-for-element, not merely numerically close.
+        return w5, diag
+
+    mult = torch.where(propagated_flagged, prop_mult, diag["multiplier"])
+    ds = data_sizes.detach().to(device=x.device, dtype=torch.float32)
     w = mult * ds
     total = w.sum()
     if float(total) <= 0.0:

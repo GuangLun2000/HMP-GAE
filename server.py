@@ -93,14 +93,15 @@ class Server:
         self._probe_batches: Optional[List[Dict[str, torch.Tensor]]] = None
         # Whether the active defense actually consumes probe distributions.
         # HMP-GAE will use them when defense_config.semantic_weight > 0.
-        # NOTE (V4/V5/V6): the CSE-reject trust modes ('v4_cse_reject',
-        # 'v5_cse_reject', 'v6_cse_reject_geo') do NOT depend on this probe —
+        # NOTE (V4-V7): those CSE-reject modes do NOT depend on this probe —
         # their rejection signal is the full-test local CSE (_needs_local_cse
         # below), so a semantic_weight=0 ablation cannot silently disable that
         # signal; it only drops the sem_div/probe_cse diagnostics. It DOES
-        # change V6's geometry factor, though: with semantic_weight=0 the
+        # change V6/V7's geometry factor, though: with semantic_weight=0 the
         # sem_div channel drops out of `s` and hence out of the gate, so a V6
         # ablation on that axis moves v6_geo_mult as well as the diagnostics.
+        # V8 is different: its dual-view topology requires semantic_weight>0,
+        # validated by HMPGAERuntime, so _needs_probe is structurally true.
         sem_w = float((self.defense_config or {}).get('semantic_weight', 0.0))
         self._needs_probe = (
             self.defense_method in ('hmp_gae', 'hmpgae', 'hmp-gae')
@@ -120,7 +121,7 @@ class Server:
             self.defense_method in ('hmp_gae', 'hmpgae', 'hmp-gae')
             and trust_mode_cfg in (
                 'v4_cse_reject', 'v5_cse_reject', 'v6_cse_reject_geo',
-                'v7_cse_reject_corrob',
+                'v7_cse_reject_corrob', 'v8_hmp_cse_propagation',
             )
         )
 
@@ -438,11 +439,11 @@ class Server:
             )
             print(f"  🚪 gate:         {gate_summary}")
 
-        # V4/V5/V6 rejection-rule diagnostics (trust_mode 'v4_cse_reject',
-        # 'v5_cse_reject' or 'v6_cse_reject_geo'): per-client CSE/median ratio
-        # and which clients were flagged this round. V5/V6 have no scalar
-        # mult — show floor + r_hard (V6 additionally shows its geometry
-        # factor). Test V6 FIRST: it emits the v5_* ramp keys too, so a
+        # V4-V8 shared CSE diagnostics: per-client CSE/median ratio and which
+        # clients were high-confidence CSE-flagged this round. V5-V8 have no
+        # scalar mult — show floor + r_hard (V6/V7 additionally show geometry,
+        # while V8 prints propagated peers separately below). Test V6 FIRST:
+        # it emits the v5_* ramp keys too, so a
         # 'v5_m_floor' in stats test alone would mislabel a V6 round as V5.
         v4_ratio_list = defense_stats.get('v4_ratio')
         v4_flagged_list = defense_stats.get('v4_flagged')
@@ -487,6 +488,23 @@ class Server:
                 f"window=[{defense_stats.get('v7_round_min')},"
                 f"{defense_stats.get('v7_round_max')}], "
                 f"geo_resolved={defense_stats.get('v7_geo_resolved')})"
+            )
+        # V8 only: distinguish high-confidence CSE seeds from clients reached
+        # by the conservative dual-view hypergraph. A zero propagated set is
+        # the explicit "V8 degraded exactly to V5 this round" diagnostic.
+        v8_prop_list = defense_stats.get('v8_propagated_flagged')
+        if isinstance(v8_prop_list, list) and len(v8_prop_list) == len(client_ids):
+            propagated_ids = [
+                cid for cid, f in zip(client_ids, v8_prop_list) if f
+            ]
+            risk = defense_stats.get('v8_propagated_risk') or []
+            risk_summary = ", ".join(
+                f"c{cid}={v:.3f}" for cid, v in zip(client_ids, risk)
+            )
+            print(
+                f"  🕸️ V8 propagated: {propagated_ids if propagated_ids else 'none'} "
+                f"(consensus_edges={defense_stats.get('v8_consensus_edge_count')}; "
+                f"risk: {risk_summary if risk_summary else 'n/a'})"
             )
         # V6 only: the geometry factor. It is APPLIED only to flagged clients
         # (marked '*'); for everyone else the applied multiplier is a hard 1.0
@@ -550,7 +568,14 @@ class Server:
                   'v7_corrob_flagged', 'v7_iso', 'v7_geo_resolved',
                   'v7_tau_lo', 'v7_iso_min', 'v7_corrob_mult',
                   'v7_round_min', 'v7_round_max',
-                  'L_rec', 'L_smooth', 'L_hist',
+                  'v8_seed', 'v8_propagated_risk', 'v8_cse_evidence',
+                  'v8_joint_evidence', 'v8_propagated_flagged',
+                  'v8_propagated_multiplier', 'v8_propagation_matrix',
+                  'v8_update_mutual', 'v8_behavior_mutual',
+                  'v8_consensus_mutual', 'v8_update_edge_count',
+                  'v8_behavior_edge_count', 'v8_consensus_edge_count',
+                  'v8_recon_error',
+                  'L_rec', 'L_smooth', 'L_struct', 'L_hist',
                   'fallback_reason', 'defense_time_ms'):
             if k in defense_stats:
                 aggregation_log[k] = defense_stats[k]
@@ -1007,8 +1032,7 @@ class Server:
             probe_tensor = torch.stack(probe_rows, dim=0)  # (N, K, C)
 
         # Optional Phase 3.6: pre-aggregation per-client local metrics for the
-        # CSE-reject trust rules (trust_mode 'v4_cse_reject' / 'v5_cse_reject'
-        # / 'v6_cse_reject_geo').
+        # CSE-reject trust rules (V4-V8).
         # Client models are untouched by aggregation, so these values are
         # identical to the legacy post-aggregation evaluation — computed once
         # here and reused for the round log below (no duplicate eval cost).
@@ -1019,7 +1043,8 @@ class Server:
             if any(getattr(c, 'crafts_update', False) for c in self.clients):
                 raise RuntimeError(
                     "CSE-reject trust modes (v4_cse_reject / v5_cse_reject / "
-                    "v6_cse_reject_geo / v7_cse_reject_corrob) "
+                    "v6_cse_reject_geo / v7_cse_reject_corrob / "
+                    "v8_hmp_cse_propagation) "
                     "are not supported with update-forging attackers "
                     "(crafts_update): local CSE evaluates "
                     "client.model, which such attackers leave looking benign "
