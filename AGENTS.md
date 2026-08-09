@@ -1,97 +1,95 @@
 # AGENTS.md — HMP-GNN
 
-> 详细功能/配置/命令见 [README.md](README.md)；算法符号与数学推导见 [MATH_LOGIC.md](MATH_LOGIC.md)。本文件只补充无法从代码直接推导出来的上下文与约定。
+> 本文件只维护代码无法直接表达的协作约束和高风险陷阱。运行方式见
+> [README.md](README.md)，文档职责见 [docs/README.md](docs/README.md)，当前公式见
+> [MATH_LOGIC.md](MATH_LOGIC.md)，版本历史与实验契约见
+> [docs/DECISION.md](docs/DECISION.md)。
 
-## What this is
+## 项目上下文
 
-- **课题**：Hallucination Immunization for Multimodal Federated LLMs via Hypergraph Message Passing（工作中，未投稿）
-- **核心思路**：客户端发起 label-flip hallucination 攻击；服务器端用 HMP-GAE 给每个客户端打信任分（α），按 α 鲁棒聚合
-- **三信号防御**（trust_scorer 的 `s = -(graph + recon + semantic + hist)`）：
-  1. **graph_residual**：k-NN 超图孤立度（节点共享超边的 peer 少 → 高 residual；reach 计**所有** peer——含另一个 attacker——非仅 benign，两个 attacker 互选会抬高彼此的 reach）
-  2. **recon_residual**：GAE 解码出的 A_hat 上的孤立度（encoder 训练后变锐利）
-  3. **semantic_div**：固定 probe set 上 per-sample softmax 的 pairwise symmetric KL（行为指纹，几何 stealth 攻击也藏不住）
-  4. hist_dev：与 EMA 历史 latent 的距离（默认权重 0，因为 benign drift 反而比 attacker 大）
+- 课题：Hallucination Immunization for Multimodal Federated LLMs via
+  Hypergraph Message Passing（研究原型，未投稿）。
+- 攻击：Hallucination 客户端使用自己的本地数据，并在训练时翻转标签。
+- 当前主路径：V8 以 V5 的 full-test CSE 判定为高置信种子，利用 update/probe
+  双视图一致超图传播风险，再按数据量加权聚合。
+- 机制边界：超图没有独立 flag 权；无种子、无双视图路径或无剩余 rank cap
+  时，V8 必须逐元素退化为 V5。完整公式只在 `MATH_LOGIC.md` 维护。
 
-## Workflow: 本地不训练（critical）
+## 不可违反的工作流
 
-Mac 仅做代码编辑；训练在 Google Colab A100。**含义对 Codex 至关重要**：
+- Mac 只做编辑和秒级静态检查；完整 FL 训练在 Google Colab GPU 上进行。
+  不要要求本地运行 `python main.py` 来“试一下”。
+- 唯一 notebook 是 [HMP_GAE_Colab.ipynb](HMP_GAE_Colab.ipynb)。不要复制或新建
+  `*_Colab*.ipynb`；notebook 只调用裸 `main()`，不覆盖配置。
+- 用户自行提交代码；不要主动 `git add`、commit 或 push。
+- 保留工作区内与当前任务无关的未提交改动，不要回滚或覆盖。
+- macOS 上 `torch.cuda.is_available()` 为 False；新增 device 路径必须兼容 CPU。
 
-- 不要建议 "先在本地跑一下 `python main.py` 验证"——Mac 单轮都跑不动
-- 出 bug 优先靠静态分析 / trace 推理，不要要求 "先跑一下看看"
-- macOS 上 `torch.cuda.is_available()` 永远 False——涉及 device 的代码要兼容 CPU 路径
-- 用户自己 commit；改完代码不要主动 git add/commit
-- **唯一 Colab notebook 是 [HMP_GAE_Colab.ipynb](HMP_GAE_Colab.ipynb)**。不要复制/新建 `*_Colab*.ipynb` 变体——Colab 同时只能跑一个，维护多份只会漂移。notebook 只调用裸的 `main()`，**不做任何 config 覆写**；跑不同配置一律改 main.py 的 config
+## 验证矩阵（不训练）
 
-## Verify 一个改动（不训练）
+| 改动范围 | 必跑检查 | 说明 |
+|---|---|---|
+| 任意 `.md` | `python check_docs.py` | 链接、配置键、符号和 anti-drift 检查 |
+| 任意 `.py` | `python -m compileall -q .` | 只解析语法，不需要数据集或 GPU |
+| `hmp_gae/` 或 trust/runtime 路径 | `python tests/test_trust_robustness.py` | CPU 回归；需要 PyTorch |
 
-跑不了 FL，但改完有几关可过（秒级、无需 dataset/GPU）：
+测试全绿只证明静态契约和局部不变量，不能证明 FL 收敛或性能提升。
 
-- `python check_docs.py` —— 文档↔代码一致性守卫（stdlib，~0.1s）。**改任何 `.md` 后必跑**：校验 agent 文档里没有 `main.py:<行号>`、markdown 链接不死、docs 提到的 config key/符号在代码里真存在——是本文件 anti-drift 约定的可执行版本。**纯编辑 Mac 也能跑**。
-- `python -m compileall -q .` —— 全库语法面（只解析不 import，无需 torch）。**改任何 `.py` 后跑**。**纯编辑 Mac 也能跑**。
-- `python tests/test_trust_robustness.py` —— trust-scoring CPU 回归（含 legacy 路径 bit-for-bit），~1s。**碰 `hmp_gae/`（trust_scorer / runtime / hypergraph）后跑**。⚠️ **需要装了 torch 的环境**——纯编辑 Mac 通常没有 torch，这一关交给 CI 或 Colab。
+## 配置唯一来源
 
-三关全绿 ≠ 训练正确——收敛/精度验证仍在 Colab。
+[`main.py`](main.py) 的 `main()` 内 `config` 字典是唯一权威配置。没有 CLI、
+notebook 或环境变量覆盖入口。
 
-## Canonical config: [main.py](main.py) 的 `main()` config dict
+- 默认行为和所有 A/B 实验臂都只改该字典。
+- 每个实验臂必须使用唯一的 `experiment_name` 和 checkpoint 子目录；不要让
+  resume 误接另一条实验轨迹。
+- 不在文档中复制易变的模型、数据集、轮数、阈值或实验名；需要当前值时读
+  `config`，归档结果时保存完整 config。
+- 不引用 `main.py` 行号；只引用 `main()` 或配置键名。
+- 预注册常数、禁止事后调整的规则和历史版本差异只在
+  [docs/DECISION.md](docs/DECISION.md) 维护。
 
-`main()` 里的 `config` dict 是**唯一**权威 config 源，且自 2026-08-07 起是**唯一入口**——`main()` 不再接受 `config_overrides`，`run_suite()` 与 `COLAB_CONFIG_OVERRIDES` 已删除。**不标行号**——main.py 频繁改动，任何行号都会失效；一律用符号定位（`main()` / config key 名）。任何参数调整都在这里改：
+## 模块职责
 
-- 改默认行为 → 改 `main()` 的 `config`
-- 对照实验 / A-B 臂 → 同样改 `main()` 的 `config`，跑完改回来；每条臂**必须换 `experiment_name`**（[fed_resume.py](fed_resume.py) 的 fingerprint 不看 `defense_config`，同名会让上一臂的 checkpoint 被静默续跑）
-- notebook 里**不要**加任何覆写机制——多一个设值的地方，就多一次"归档 config.json 与实际跑的不一致"的机会
-
-**不变的实验骨架**（很少动，可依赖）：N=7（5 benign + 2 attackers），50 轮，LoRA(r=8)，per-round 随机化 label-flip（`hallu_flip_ratio_range`），`attack_method='Hallucination'` + `defense_method='hmp_gae'` 三信号防御。
-
-> **易变 knob（dataset / model_name / flip ratio 等）一律以 `config` dict 现值为准，本文件不复述具体值**——写死的数值随时会过时；需要当前值时读 `config`，不要引用本文件。（撰写本节时现值 2026-08-09，仅供参考：AG News non-IID(0.5) + Qwen2.5-0.5B，V4-remove ablation 臂。）
-
-## 模块速查（哪里改什么）
-
-| 文件 | 关心什么 |
+| 文件 | 修改边界 |
 |---|---|
-| [hmp_gae/runtime.py](hmp_gae/runtime.py) | HMP-GAE 端到端运行入口；`Z_hist` (EMA latent) 在此 |
-| [hmp_gae/trust_scorer.py](hmp_gae/trust_scorer.py) | 三信号融合 + soft/hard reject gating；`α_i` / `s` (combined logit) 在此 |
-| [hmp_gae/{node_features,hypergraph,encoder,decoder,losses}.py](hmp_gae/) | 论文算法符号一一对应（`η_i` / `H, D_V, D_E` / `A_hat, H_hat`），公式即文件名 |
-| [server.py](server.py) | 聚合编排、CSE 评估、per-round probe forward |
-| [client.py](client.py) | `BenignClient` (FedProx) 基类 |
-| [attack/hallucination.py](attack/hallucination.py) | 本论文攻击；per-round 随机化 flip 在此实现 |
-| [attack/{sign_flipping,gaussian,alie}.py](attack/) | 经典 Byzantine baseline——**不要改对外行为**（V2 横向对比锚点） |
-| [evaluation_hallucination.py](evaluation_hallucination.py) | 全局 PPL 评估（FL 结束后一次；encoder-only 优雅跳过） |
-| [decoder_adapters.py](decoder_adapters.py) | SeqCLS → CausalLM backbone 迁移（PPL 评估前置） |
-| [models.py](models.py) | `NewsClassifierModel`（SeqCLS + LoRA 装配；`lora_target_modules` 在此） |
-| [data_loader.py](data_loader.py) | `DataManager` / 4 数据集加载 / tokenizer（**IID/non-IID 分区实际在 [main.py](main.py)**） |
-| [fed_resume.py](fed_resume.py) | per-round 断点续跑（Colab 掉线恢复）；fingerprint 校验在此 |
-| [tests/test_trust_robustness.py](tests/test_trust_robustness.py) | trust-scoring CPU 回归（legacy 路径 bit-for-bit）；改 trust_scorer/runtime 后跑 |
+| [`main.py`](main.py) | 配置、数据分区、客户端装配、实验入口 |
+| [`server.py`](server.py) | 轮次编排、聚合前 local CSE、probe forward、评估 |
+| [`client.py`](client.py) | `BenignClient` 与 FedProx 本地训练 |
+| [`attack/hallucination.py`](attack/hallucination.py) | label-flip 攻击与逐轮随机化 |
+| [`defense/__init__.py`](defense/__init__.py) | 防御 facade、输入守卫与小 N fallback |
+| [`hmp_gae/runtime.py`](hmp_gae/runtime.py) | HMP-GAE 端到端执行和跨轮状态 |
+| [`hmp_gae/trust_scorer.py`](hmp_gae/trust_scorer.py) | 信号融合、V4–V8 决策、最终权重 |
+| [`hmp_gae/`](hmp_gae/) 其余模块 | 节点特征、超图、encoder、decoder、loss |
+| [`fed_resume.py`](fed_resume.py) | 逐轮断点和轨迹指纹 |
+| [`evaluation_hallucination.py`](evaluation_hallucination.py) | FL 结束后一次性 PPL |
+| [`tests/test_trust_robustness.py`](tests/test_trust_robustness.py) | trust 路径回归与安全退化不变量 |
 
-> **AugMP 已整体移除（2026-08-09）**：`attack/augmp.py`（~3900 行 learned VGAE+GSP stealth 攻击）连同其全部 config 键与 main.py dispatch 已删除，需要时从 git 历史找回。server.py 的 `crafts_update` 协议支路保留（防御式 `getattr`，无人触发即跳过），CSE-reject 系模式对 `crafts_update` 型攻击者的不兼容守卫仍在。
+## 高风险陷阱
 
-新算法沿用上表里的符号命名；新符号在对应文件顶部 docstring 简注即可。
+- `results/` 被 gitignore；结果、图和 checkpoint 都应留在该目录。
+- Hallucination attacker 会本地训练；SignFlipping、Gaussian、ALIE 是
+  dataset-free 的伪造 update。不要混写两类语义。
+- `num_clients <= 2` 时 HMP-GAE 才硬回退到 FedAvg；更大的小联邦只是信号可能
+  偏弱，不等于触发 fallback。
+- `defense_config.device='cpu'` 是有意设计：N 很小时，小型 HMP 子模型在 CPU
+  上避免频繁 GPU/CPU 搬运。
+- `semantic_weight > 0` 才触发逐客户端 probe forward；CSE-reject/V8 还要求
+  聚合前的 `local_cse`。缺少 V8 所需的 probe distributions 必须显式报错。
+- CSE-reject 使用服务器 full-test local eval，并强制逐轮计算。这是当前研究
+  假设，也与“本地模型仍 benign、只伪造 update”的攻击不兼容。
+- V8 是否实际使用超图只看 `v8_propagated_flagged`、`v8_joint_evidence`、
+  `v8_consensus_edge_count` 等诊断；全零必须报告为 V8 退化到 V5。
+- `hallu_flip_map` 从 JSON 读取后 key 可能变为字符串；入口负责转回整数。
+- LoRA `target_modules=None` 表示使用 PEFT 默认值；更换 backbone 时核对目标层。
+- PPL 只在 FL 结束后运行，且需要 checkpoint；不要移入逐轮循环。
+- requirements 受 Colab 镜像中的 `torchao`、PEFT、Transformers 兼容性约束。
 
-## Pitfalls（代码看不出但容易踩）
+## 默认不扩展的范围
 
-- **`results/` 是 gitignore**：所有 json/csv/png/checkpoint 都写到这里；不要 commit，不要让脚本默认写到别处
-- **Attacker 的数据语义因 attack 类型而异**：
-  - `Hallucination`：**使用**自己的本地数据但训练时翻转 label（dataset-USED with flips）
-  - `sign_flipping` / `gaussian` / `alie`：**dataset-free**，不读自己的数据，只伪造 update
-  - main.py 分区后的 `[Note]` 打印自 2026-08-09 起按 `attack_method` 区分表述（Hallucination 明确打印"使用本地数据+翻转 label"）；此前归档日志里的旧版 "attackers do NOT perform local training" 表述只对后三种成立，读旧日志时注意
-- **N ≤ 2 时 HMP-GAE 自动 fallback 到 FedAvg**（[defense/\_\_init\_\_.py](defense/__init__.py) 的 `HMPGAEDefense.aggregate`，原因写入 `fallback_reason`）：这是代码里**唯一**的硬阈值——早期文档/README 写 N≤4 不准确（小 N 下超图信号确实偏弱，但真正触发回退是 N≤2）；动这里要同步更新 README limitations
-- **`defense_config.device: 'cpu'` 故意的**：HMP-GAE 子模型很小（N=7），CPU 比反复 GPU↔CPU 搬数据快
-- **`semantic_weight > 0` 会触发 server 每轮 per-client probe forward**：从 test_loader 头部确定性取 `semantic_probe_size` 条样本；`semantic_weight=0` 时整条 probe path 跳过
-- **`gate_signal` 在 `semantic_weight > 0` 时自动从 `'graph'` 升级为 `'combined'`**（[hmp_gae/runtime.py](hmp_gae/runtime.py) 的 `HMPGAERuntime.__init__` 里 gate_signal auto-promotion 段），除非显式在 config 设；改信号融合权重时小心这条隐式 promotion
-- **`hallu_flip_map` 的 key 可能是 str**（从 JSON config 读时会变成字符串），[main.py](main.py) 的 Hallucination 分支有 `{int(k): int(v) ...}` normalize，不要破坏
-- **requirements.txt 受 Colab 镜像约束**：特别是 `torchao` / `peft` / `transformers` 版本兼容（见文件内注释 line 11-13）
-- **LoRA `target_modules=None` 含义是"用 PEFT 默认"**：默认对 DistilBERT 友好；换冷门 backbone 时可能需要显式列出 attn projection 名
-- **CSE 每轮免费**（共享 test forward），**PPL 是 FL 结束后一次性**（需要 checkpoint）——不要把 PPL 计算挪进每轮循环
-- **`trust_mode: 'v4_cse_reject'`（V4，2026-07-28）改变 server 的评估时序**：server 会在**聚合前**对每个 client 做 full-test local eval（`Server._needs_local_cse`），并强制每轮 local eval（覆盖 `eval_local_every_n_rounds`）；缺 `local_cse` 会 loud crash（defense 层在 FedAvg-fallback try 之前校验，不会静默回退）。rank cap **复用 `num_byzantine`**（要求 < N/2，runtime 构造时校验）；`v4_tau_ratio=1.85` 是预注册值，跑完实验**不许回调**。与伪造 update 的 `crafts_update` 型攻击者不兼容（local CSE 看不到伪造 update；此类攻击者已随 AugMP 移除，守卫保留）。V4 信号**绝不过 `_zscore`**——被否决的替代方案与理由记录在 [docs/DECISION.md](docs/DECISION.md)
-- **`trust_mode: 'v5_cse_reject'`（V5，2026-08-06）= V4 的 flag 判定 + 连续惩罚 ramp**：flag 规则与 V4 逐字节相同，只把被 flag 客户端的乘子从常数 `v4_reject_mult` 换成 CSE ratio 的线性 ramp（`trust_scorer.v5_cse_reject_weights`；τ 附近 ≈1.0，`v5_r_hard` 以上饱和到 `v5_m_floor`）。评估时序 / local_cse 硬要求 / crafts_update 不兼容 / rank cap 全部继承 V4。`v5_r_hard=2.5` 是预注册值（由归档 V4 run 的稳态 attacker ratio 最小值标定），`v5_m_floor` 禁 0（硬归零已被否决）——设计决策与标定依据见 [docs/DECISION.md](docs/DECISION.md)。V5 尚未跑过确证实验；诊断 CSV 复用 `v4_*` 通道族
-- **`trust_mode: 'v6_cse_reject_geo'`（V6，2026-08-07）= V5 的 ramp × 单向几何门**：Stage 1（flag）与 Stage 2（CSE ramp）与 V5 逐字节相同（直接复用 `v5_m_floor` / `v5_r_hard`），只在**被 flag 的客户端**上再乘一个几何因子（`trust_scorer.v6_cse_reject_geo_weights`）：`m = m_cse × (v6_geo_floor + (1-v6_geo_floor)·gate)`，`gate` 就是 V3 `soft_reject_fedavg` 用的那个 `sigmoid(-soft_reject_k·(sus-reject_z_threshold))`（EMA 平滑后的 sus）。因子落在 `[geo_floor, 1]`，所以**恒有 m_V6 ≤ m_V5**——几何只能加重惩罚、永不能减轻，CSE 在构造上不会回退；`v6_geo_floor=1.0` 与 V5 逐元素相同（首跑必须先用它做接线回归）。未被 flag 的客户端乘子恒为 `1.0`（**不是** gate），所以干净联邦仍精确等于 `n_k/Σn`。**副作用**：`graph_min_distinct` / `reject_z_threshold` / `soft_reject_k` / `semantic_weight` 在 V4/V5 下只是诊断，在 V6 下**重新变成真正影响 α 的旋钮**。`v6_geo_floor=0.5` 是预注册值，跑完不许回调；若 `v6_geo_mult` 每轮都 ≈1.0，说明几何没起作用——如实报告，不要调 floor 把效果调出来。设计依据见 [docs/DECISION.md](docs/DECISION.md)
-- **`trust_mode: 'v7_cse_reject_corrob'`（V7，2026-08-08）= V6 + 冷启动窗口内的超图佐证降阈**：Stage A 与 V6 逐字节相同；仅在 `v7_round_min..v7_round_max`（**1-indexed**，与归档日志 `round` 通道同单位）内新增 Tier-2 flag——未被 CSE flag 的客户端若同时满足 `r > v7_tau_lo`（低于 1.85 的降阈）**且** raw `graph_residual >= v7_iso_min`（**绝对阈值，绝不用 z-score 过的 gate 做 flag**），在共享 rank-cap 预算内（CSE flag 恒优先、不可被挤掉）乘常数 `v7_corrob_mult`。机制的诚实表述是"超图佐证的降阈"，不是"超图独立检测"：几何单独永不 flag（防 scapegoat）；R1-R2 由预注册窗口起点 `v7_round_min=3` 避开（实证依据是归档中 attacker r≈1 过不了 tau_lo——是约定+证据，非结构保证）。`v7_round_max=0` = 逐位等于 V6（接线回归臂）。⚠ **v7 knob 现值全部是占位符**：跑任何 V7 实验前必须先跑 [replay_v7_calibration.py](replay_v7_calibration.py)（stdlib，读归档 `*_results.json`）确认 zero-FP plateau 并按预注册选择规则定值；plateau 为空 = V7 负结果，**不许放宽网格**。`graph_min_distinct` gate 掉图通道的轮次 Tier-2 自动弃权。设计依据、被否决的替代方案（gate 做 flag / 邻域中位数 CSE / gate 调制惩罚）与威胁模型边界见 [docs/DECISION.md](docs/DECISION.md)
-- **`trust_mode: 'v8_hmp_cse_propagation'`（V8，2026-08-09）= V5 CSE 种子 + 双视图 HMP 风险传播**：V7 完全冻结；V8 的 Stage A 直接复用 V5，而非叠加 V6/V7。每轮先用固定 JL 投影更新构造 update view，再用 label-free probe softmax 的 Jensen-Shannon 相似度构造 behavior view；只有在两视图都为 mutual k-NN 的关系进入传播超图。V8 的 HMP 用固定当轮 topology、residual layer、signed latent、cosine decoder 和真实 adjacency BCE，避免旧路径的 learnable-η→H→reconstruct-H 自指以及 ReLU 内积恒非负。V5 flag 是不可改变的高置信种子；非种子还必须有传播风险且 pool-median CSE ratio > 1，且只能使用 CSE flag 后剩余的共享 rank cap。惩罚强度 `joint = propagated_risk × clip((ratio-1)/(tau-1),0,1)`，`m_prop = 1-(1-v5_m_floor)joint`。**无种子 / 无通向种子的双视图路径 / 无 ratio>1 的同伴 / 无剩余预算时逐元素等于 V5**；弱 affinity 只会产生同比例的轻惩罚。`semantic_weight > 0`、`local_cse`、`probe_distributions` 都是硬要求；facade 缺输入会在 FedAvg fallback 之前 loud crash。判断超图是否起作用看 `v8_propagated_flagged` / `v8_joint_evidence` / `v8_consensus_edge_count`，全零就如实报告 V8=V5，不许事后放宽规则。完整机制见 [docs/DECISION.md](docs/DECISION.md)
+- 真正的多模态 encoder。
+- 极端 non-IID 专项调参。
+- 改变经典 Byzantine baseline 的对外行为。
+- 新建第二份 Colab notebook 或第二套配置入口。
 
-## Out of Scope（V1 不主动做，除非明说）
-
-- 真正的多模态 encoder（V1 用 LoRA-only 模拟多模态）
-- `dirichlet_alpha < 0.3` 的极端 non-IID 调优
-- 改 byzantine baseline (`sign_flipping`/`gaussian`/`alie`) 的对外行为
-- 复制/新建 `*_Colab*.ipynb` 变体
-
-**已在路线图上**（不算 OOS，但需明示再动）：Krum / Median / FLTrust baseline 防御；stealth attacker（cosine + norm projection 隐蔽变种）；多 seed 报告 mean±std。
+路线图中的多 seed、stealth attacker 和更多 baseline 只有在用户明确要求时再动。

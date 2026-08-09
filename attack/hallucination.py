@@ -22,6 +22,35 @@ from client import BenignClient
 from data_loader import NewsDataset
 
 
+def deterministic_round_flip_ratio(
+    flip_seed: int,
+    round_num: int,
+    flip_ratio_range: Tuple[float, float],
+) -> float:
+    """Return the historical sequential RNG draw for one round, statelessly.
+
+    Reconstructing the generator from ``flip_seed`` and selecting draw
+    ``round_num`` preserves the exact sequence produced by the old private
+    ``_round_rng`` during uninterrupted runs, while making a resumed round
+    independent of how many earlier ``prepare_for_round`` calls happened in
+    the current Python process.
+    """
+    r = int(round_num)
+    if r < 0:
+        raise ValueError(f"round_num must be >= 0, got {round_num}")
+    lo, hi = (float(flip_ratio_range[0]), float(flip_ratio_range[1]))
+    if not (0.0 <= lo <= hi <= 1.0):
+        raise ValueError(
+            "flip_ratio_range must satisfy 0 <= lo <= hi <= 1; "
+            f"got {flip_ratio_range!r}"
+        )
+    rng = np.random.default_rng(int(flip_seed))
+    # FL runs are short (canonical: 50 rounds), so replaying r+1 scalar draws
+    # is clearer and less version-sensitive than manipulating bit-generator
+    # offsets directly.
+    return float(rng.uniform(lo, hi, size=r + 1)[-1])
+
+
 # --------------------------------------------------------------------------- #
 # Flipped-label dataset                                                       #
 # --------------------------------------------------------------------------- #
@@ -211,9 +240,10 @@ class HallucinationAttackerClient(BenignClient):
             )
         else:
             self.flip_ratio_range = None
-        # Dedicated RNG so the per-round flip_ratio sequence is reproducible
-        # given (client_id, flip_seed) and independent of any global RNG state.
-        self._round_rng = np.random.default_rng(self._flip_seed)
+        # The per-round scalar ratio is derived statelessly from
+        # (flip_seed, round_num) in prepare_for_round(). This preserves the old
+        # uninterrupted RNG sequence exactly and also makes checkpoint resume
+        # exact; no client-private generator state needs to be serialized.
 
         # Keep a reference to the honest loader for pre-attack rounds.
         self._honest_loader: DataLoader = data_loader
@@ -271,8 +301,9 @@ class HallucinationAttackerClient(BenignClient):
             return
         # Sample (or keep) flip_ratio for this round.
         if self.flip_ratio_range is not None:
-            lo, hi = self.flip_ratio_range
-            ratio = float(self._round_rng.uniform(lo, hi))
+            ratio = deterministic_round_flip_ratio(
+                self._flip_seed, round_num, self.flip_ratio_range
+            )
         else:
             ratio = None  # keep current self.flip_ratio
         # Round/client-distinct seed (large prime avoids low-bit collisions

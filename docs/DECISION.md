@@ -1,10 +1,30 @@
 # DECISION.md — settled design decisions (do not re-litigate without new evidence)
 
-> Created in-repo 2026-07-28 during the V4 change-set. The V4 coding brief
-> ([HMP-GAE-V4-coding-brief.md](../HMP-GAE-V4-coding-brief.md)) references an
-> earlier DECISION.md kept alongside the results archive (outside this repo);
-> the entries below are the ones that constrain the code in this repo. Add new
-> entries here when an alternative is tested and rejected, so it is not retried.
+> This is the dated, append-oriented design record. It owns rationale,
+> preregistered constants, rejected alternatives, and falsification criteria;
+> it does not own current config values or user instructions. See the
+> [documentation map](README.md), [current mathematics](../MATH_LOGIC.md), and
+> [run guide](../README.md). Later outcomes should be added as new evidence,
+> never back-written into an earlier decision as if they were known in advance.
+
+Created in-repo 2026-07-28 during the V4 change-set. The V4 coding brief
+([HMP-GAE-V4-coding-brief.md](../HMP-GAE-V4-coding-brief.md)) references an
+earlier DECISION.md kept alongside the results archive (outside this repo).
+The entries below are the decisions that constrain the current code.
+
+## Decision index
+
+| Version | Role | Status |
+|---|---|---|
+| V4 | Absolute CSE-ratio rejection with a rank cap | Historical baseline |
+| V5 | V4 flags with a graded rejection ramp | Direct safety baseline for V8 |
+| V6 | One-way geometric multiplier on V5 flags | Historical experiment arm |
+| V7 | Windowed hypergraph-corroborated lower threshold | Frozen calibration-dependent arm |
+| V8 | CSE-seeded dual-view HMP propagation | Current mechanism |
+
+Current formulas belong in `MATH_LOGIC.md`; this file explains why each path
+was adopted or rejected. Exact run values belong in `main()` and archived
+result configs.
 
 ## V4 rejection signal (2026-07-28)
 

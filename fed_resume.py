@@ -40,11 +40,10 @@
 #
 # Reproducibility note
 # --------------------
-# We restore the global torch / numpy / python RNG, but client-owned private
-# RNGs (e.g. HallucinationAttackerClient._round_rng) are not snapshotted.
-# Their *seeds* are derived from (client_id, round_num) so the flip pattern
-# per round is identical to a non-resumed run; only the scalar flip_ratio
-# drawn from hallu_flip_ratio_range can differ slightly post-resume.
+# We restore the global torch / numpy / python RNG. Hallucination label masks
+# and scalar flip ratios are both deterministic functions of
+# (client flip_seed, round_num), so no client-private RNG state is required and
+# a resumed round is identical to the corresponding uninterrupted round.
 
 from __future__ import annotations
 
@@ -58,28 +57,85 @@ import torch
 
 
 CHECKPOINT_FILE = "checkpoint_last.pt"
+FINGERPRINT_SCHEMA = 2
 
-# Config fields that must match exactly between the saved checkpoint and the
-# currently-running config for resume to be safe.  In particular, the complete
-# defense_config is included so switching V4/V5/V6/V7 cannot reuse an older
-# round checkpoint just because experiment_name was accidentally reused.
+# Config fields that can change the FL trajectory and therefore must match
+# exactly between the saved checkpoint and the current run. Output-only and
+# post-FL evaluation keys are intentionally excluded. The experiment name still
+# must be unique per arm so result artifacts remain unambiguous.
 _FINGERPRINT_KEYS = (
     "experiment_name",
+    "seed",
     "num_clients",
     "num_rounds",
     "num_attackers",
+    "client_lr",
+    "server_lr",
+    "batch_size",
+    "test_batch_size",
+    "local_epochs",
+    "grad_clip_norm",
+    "alpha",
+    "dataset",
+    "num_labels",
+    "max_length",
+    "data_distribution",
+    "dirichlet_alpha",
+    "dataset_size_limit",
     "model_name",
-    "defense_method",
     "use_lora",
     "lora_r",
-    "seed",
-    "dataset",
+    "lora_alpha",
+    "lora_dropout",
+    "lora_target_modules",
+    "attack_method",
+    "attack_start_round",
+    "hallu_flip_ratio",
+    "hallu_flip_mode",
+    "hallu_flip_map",
+    "hallu_target_class",
+    "hallu_attack_start_round",
+    "hallu_per_round_reseed",
+    "hallu_flip_ratio_range",
+    "sign_flip_scale",
+    "sign_flip_attack_start_round",
+    "gaussian_std_scale",
+    "gaussian_attack_start_round",
+    "alie_z_max",
+    "alie_attack_start_round",
+    "defense_method",
     "defense_config",
+    "semantic_probe_size",
 )
 
 
 def _fingerprint(config: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: config.get(k) for k in _FINGERPRINT_KEYS}
+    return {
+        "_schema": FINGERPRINT_SCHEMA,
+        **{k: config.get(k) for k in _FINGERPRINT_KEYS},
+    }
+
+
+def _fingerprint_mismatches(
+    saved_fp: Dict[str, Any], config: Dict[str, Any]
+) -> list[str]:
+    """Compare a checkpoint fingerprint without stranding legacy snapshots.
+
+    Schema-2 checkpoints require every trajectory key. Older checkpoints are
+    compared on the keys they actually recorded (which already included the
+    experiment, seed, model, dataset and complete defense config); new saves
+    immediately gain the stricter contract.
+    """
+    cur_fp = _fingerprint(config)
+    if int(saved_fp.get("_schema", 1)) >= FINGERPRINT_SCHEMA:
+        keys = _FINGERPRINT_KEYS
+    else:
+        keys = tuple(k for k in saved_fp if k != "_schema")
+    return [
+        f"{k}: ckpt={saved_fp.get(k)!r} vs cfg={cur_fp.get(k)!r}"
+        for k in keys
+        if saved_fp.get(k) != cur_fp.get(k)
+    ]
 
 
 def checkpoint_path(results_dir: Path, subdir: str = "round_checkpoint") -> Path:
@@ -181,12 +237,7 @@ def load_round_checkpoint(
 
     # Fingerprint check — refuse to resume if the run identity changed.
     saved_fp = payload.get("fingerprint") or {}
-    cur_fp = _fingerprint(config)
-    mismatches = [
-        f"{k}: ckpt={saved_fp.get(k)!r} vs cfg={cur_fp.get(k)!r}"
-        for k in _FINGERPRINT_KEYS
-        if saved_fp.get(k) != cur_fp.get(k)
-    ]
+    mismatches = _fingerprint_mismatches(saved_fp, config)
     if mismatches:
         return None, "fingerprint mismatch (" + "; ".join(mismatches) + ")"
 

@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
 
+from attack.hallucination import deterministic_round_flip_ratio
+from fed_resume import _fingerprint, _fingerprint_mismatches
 from hmp_gae.trust_scorer import (
     _semantic_divergence_signal,
     _zscore,
@@ -945,6 +947,64 @@ def test_v7_monotone_vs_v6():
 # 5) V8: CSE-seeded dual-view HMP propagation                                 #
 # --------------------------------------------------------------------------- #
 
+def test_hallucination_round_ratio_resume_exact():
+    """Stateless round lookup must reproduce the old sequential RNG stream."""
+    bounds = (0.3, 0.8)
+    for seed in (5, 6):
+        sequential = np.random.default_rng(seed).uniform(*bounds, size=50)
+        replayed = np.asarray([
+            deterministic_round_flip_ratio(seed, rnd, bounds)
+            for rnd in range(50)
+        ])
+        assert np.array_equal(replayed, sequential)
+        # Directly asking for a late resumed round cannot depend on prior calls.
+        assert deterministic_round_flip_ratio(seed, 43, bounds) == sequential[43]
+    try:
+        deterministic_round_flip_ratio(5, -1, bounds)
+        raise AssertionError("negative round_num must fail")
+    except ValueError:
+        pass
+    try:
+        deterministic_round_flip_ratio(5, 0, (0.8, 0.3))
+        raise AssertionError("invalid flip-ratio bounds must fail")
+    except ValueError:
+        pass
+    print("PASS  hallucination flip-ratio schedule is checkpoint-resume exact")
+
+
+def test_resume_fingerprint_covers_trajectory_and_legacy():
+    """New snapshots guard attack knobs; old snapshots retain subset safety."""
+    cfg = {
+        "experiment_name": "arm-a",
+        "seed": 42,
+        "dataset": "ag_news",
+        "model_name": "model",
+        "hallu_flip_ratio_range": [0.3, 0.8],
+        "defense_config": {"trust_mode": "v8_hmp_cse_propagation"},
+    }
+    current = _fingerprint(cfg)
+    changed = dict(cfg, hallu_flip_ratio_range=[0.6, 1.0])
+    assert any(
+        "hallu_flip_ratio_range" in m
+        for m in _fingerprint_mismatches(current, changed)
+    )
+
+    # Schema-1 snapshots are checked on their recorded safety subset instead
+    # of being rejected merely because newer keys did not exist yet.
+    legacy = {
+        "experiment_name": cfg["experiment_name"],
+        "seed": cfg["seed"],
+        "dataset": cfg["dataset"],
+        "model_name": cfg["model_name"],
+        "defense_config": cfg["defense_config"],
+    }
+    assert _fingerprint_mismatches(legacy, cfg) == []
+    assert any(
+        "dataset" in m
+        for m in _fingerprint_mismatches(legacy, dict(cfg, dataset="yahoo_answers"))
+    )
+    print("PASS  resume fingerprint covers trajectory keys and legacy snapshots")
+
 def test_v8_safe_degradation_to_v5():
     """No seed, no edge, or exhausted cap must return V5 exactly."""
     ds = torch.tensor([100., 120., 90., 110., 105., 95., 80.])
@@ -1547,6 +1607,8 @@ if __name__ == "__main__":
     test_v7_corroborated_flag_rule()
     test_v7_clean_federation_identity()
     test_v7_monotone_vs_v6()
+    test_hallucination_round_ratio_resume_exact()
+    test_resume_fingerprint_covers_trajectory_and_legacy()
     test_v8_safe_degradation_to_v5()
     test_v8_propagates_only_joint_evidence()
     test_v8_dual_view_consensus_and_affinity_mass()
