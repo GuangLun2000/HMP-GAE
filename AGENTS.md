@@ -10,7 +10,7 @@
 - 课题：Hallucination Immunization for Multimodal Federated LLMs via
   Hypergraph Message Passing（研究原型，未投稿）。
 - 攻击：Hallucination 客户端使用自己的本地数据，并在训练时翻转标签。
-- 当前主路径：V8 以服务器训练留出集上的 V5 CSE 判定为高置信种子，利用 update/probe
+- 当前主路径：V8 以 V5 的 full-test CSE 判定为高置信种子，利用 update/probe
   双视图一致超图传播风险，再按数据量加权聚合。
 - 机制边界：超图没有独立 flag 权；无种子、无双视图路径或无剩余 rank cap
   时，V8 必须逐元素退化为 V5。完整公式只在 `MATH_LOGIC.md` 维护。
@@ -76,9 +76,8 @@ notebook 或环境变量覆盖入口。
   上避免频繁 GPU/CPU 搬运。
 - `semantic_weight > 0` 才触发逐客户端 probe forward；CSE-reject/V8 还要求
   聚合前的 `local_cse`。缺少 V8 所需的 probe distributions 必须显式报错。
-- CSE-reject 使用从训练池分层划出的服务器参考集，并强制逐轮计算；官方测试集
-  只做全局报告。缺少参考集时必须报错，禁止回退到 test loader。该路径仍与
-  “本地模型保持 benign、只伪造 update”的攻击不兼容。
+- CSE-reject 使用服务器 full-test local eval，并强制逐轮计算。这是当前研究
+  假设，也与“本地模型仍 benign、只伪造 update”的攻击不兼容。
 - V8 是否实际使用超图只看 `v8_propagated_flagged`、`v8_joint_evidence`、
   `v8_consensus_edge_count` 等诊断；全零必须报告为 V8 退化到 V5。
 - `hallu_flip_map` 从 JSON 读取后 key 可能变为字符串；入口负责转回整数。

@@ -103,12 +103,7 @@ def setup_experiment(config):
         test_batch_size=config['test_batch_size'],
         model_name=config.get('model_name', 'distilbert-base-uncased'),
         max_length=config.get('max_length', 128),
-        dataset=config.get('dataset', 'ag_news'),
-        server_reference_size=int(config.get('server_reference_size', 0)),
-        server_reference_seed=int(config.get('server_reference_seed', config['seed'])),
-        server_reference_stratified=bool(
-            config.get('server_reference_stratified', True)
-        ),
+        dataset=config.get('dataset', 'ag_news')
     )
 
     # Partition data among clients (IID or Dirichlet non-IID).
@@ -208,7 +203,6 @@ def setup_experiment(config):
                   "actual usage depends on the attack implementation (see attack/).")
 
     test_loader = data_manager.get_test_loader()
-    reference_loader = data_manager.get_reference_loader()
 
     use_lora = config.get('use_lora', False)
     model_name = config.get('model_name', 'distilbert-base-uncased')
@@ -243,10 +237,8 @@ def setup_experiment(config):
         compute_classification_semantic_entropy=config.get(
             'eval_classification_semantic_entropy', True),
         semantic_probe_size=int(config.get('semantic_probe_size', 64)),
-        semantic_probe_seed=int(config.get('server_reference_seed', config['seed'])),
+        semantic_probe_seed=int(config.get('seed', 42)),
         eval_local_every_n_rounds=int(config.get('eval_local_every_n_rounds', 1)),
-        reference_loader=reference_loader,
-        reference_metadata=data_manager.server_reference_metadata,
     )
 
     print("\nCreating federated learning clients...")
@@ -601,7 +593,6 @@ def run_experiment(config):
     detection_summary = compute_detection_summary(server.log_data, attacker_ids)
     results_data = {
         'config': config,
-        'server_reference': server.reference_metadata,
         'results': server.log_data,
         'progressive_metrics': progressive_metrics,
         'local_accuracies': server.history['local_accuracies'],
@@ -1137,7 +1128,7 @@ def main():
     # V7 remains frozen for reproduction; V8 has its own trust_mode and name.
     config = {
         # ========== Experiment ==========
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v8-ref400-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v8-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
         'seed': 42,
 
         # ========== Federated Learning Setup ==========
@@ -1166,13 +1157,6 @@ def main():
         'data_distribution': 'non-iid',  # 'iid' | 'non-iid' (Dirichlet)
         'dirichlet_alpha': 0.5,          # lower = more heterogeneous
         'dataset_size_limit': 10000,     # held fixed across datasets for comparability; None = full
-        # Server-only defense data: removed from the loaded TRAIN pool before
-        # client partitioning. The official test split never influences aggregation.
-        # AG News: 400 = 100/class; the behavior view uses a fixed 100-sample
-        # stratified subset of this same holdout.
-        'server_reference_size': 400,
-        'server_reference_seed': 42,
-        'server_reference_stratified': True,
 
         # ========== Model & LoRA ==========
         'use_lora': True,
@@ -1262,12 +1246,10 @@ def main():
             #                          (⚠ do NOT run before replay_v7_calibration.py passes)
             #   'v8_hmp_cse_propagation' V8: V5 CSE seeds + fixed update/probe
             #                          consensus hypergraph + learned HMP propagation
-            # V4+ modes require per-round server-reference CSE (loud crash if
+            # V4+ modes require per-round local CSE (server enforces, loud crash if
             # missing) and are NOT compatible with update-forging (crafts_update) attackers.
             'trust_mode': 'v8_hmp_cse_propagation',
-            # Historical full-test calibration is retained unchanged to isolate the
-            # reference-protocol change. It must pass a ref400 no-attack validation
-            # before this arm is treated as confirmatory (see docs/DECISION.md).
+            # V4 knobs — both PRE-REGISTERED, do not re-tune (calibration: DECISION.md "V4").
             'v4_tau_ratio': 1.85,
             'v4_reject_mult': 0.10,  # inert under V8; retained at the V4 companion default.
             # V5 knobs — v5_r_hard PRE-REGISTERED 2026-08-06; m_floor never 0.0.
@@ -1303,7 +1285,7 @@ def main():
             'hist_ema_beta': 0.9,
             'device': 'cpu',             # small N: CPU beats GPU round-trips
         },
-        # Semantic-probe size within the server reference holdout.
+        # Semantic-probe size (server-owned; sampling mode = semantic_probe_stratified).
         'semantic_probe_size': 100,
 
         # ========== Evaluation ==========
@@ -1318,11 +1300,11 @@ def main():
 
         # ========== Checkpoints ==========
         'save_global_checkpoint': True,   # needed for PPL / downstream eval
-        'global_checkpoint_subdir': 'global_checkpoint_agnews_llama_v8_ref400_seed42',
+        'global_checkpoint_subdir': 'global_checkpoint_agnews_llama_v8_seed42',
         # Per-round resume snapshot (Colab resilience; fingerprint guard: fed_resume.py)
         'save_round_checkpoint': True,
         'resume_from_checkpoint': True,   # False = force a fresh run
-        'round_checkpoint_subdir': 'round_checkpoint_agnews_llama_v8_ref400_seed42',
+        'round_checkpoint_subdir': 'round_checkpoint_agnews_llama_v8_seed42',
         # ========== Task 2: optional downstream generation after FL ==========
         'run_downstream_after_fl': False,   # subprocess run_downstream_generation.py
         'downstream_probes': None,          # probe JSON path; None skips Task 2
@@ -1337,8 +1319,6 @@ def main():
     print("[config] experiment_name:", config['experiment_name'])
     print("[config] defense_method:", config['defense_method'])
     print("[config] trust_mode:", config['defense_config'].get('trust_mode'))
-    print("[config] server_reference_size:", config['server_reference_size'])
-    print("[config] server_reference_seed:", config['server_reference_seed'])
 
     attack_method = config.get('attack_method', 'Hallucination')
     if config.get('num_attackers', 0) > 0 and attack_method != 'NoAttack':

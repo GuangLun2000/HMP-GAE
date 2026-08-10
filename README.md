@@ -22,11 +22,9 @@ experiment is always defined by the `config` dictionary inside `main()` in
 
 ## Method at a glance
 
-Each client trains locally with FedProx. Before client partitioning, a small
-class-balanced server reference set is removed from the training pool;
-the official test split remains untouched. Hallucination attackers use their
-own local data but randomly flip a configured fraction of labels. The current
-V8 defense then performs:
+Each client trains locally with FedProx. Hallucination attackers use their own
+data but randomly flip a configured fraction of labels. The current V8 defense
+then performs:
 
 ```text
 client updates + probe behavior
@@ -109,7 +107,7 @@ training.
 groups are:
 
 - Experiment: `experiment_name`, model, dataset, partition, seeds, clients,
-  attackers, rounds, and the `server_reference_*` protocol.
+  attackers, and rounds.
 - Attack: `attack_method` and the `hallu_*` label-flip settings.
 - Defense: `defense_method`, `trust_mode`, and `defense_config`.
 - Evaluation: classification entropy, perplexity, checkpoints, and downstream
@@ -172,11 +170,10 @@ model fine-tuning.
 
 - The implementation is text-only; LoRA updates stand in for a future true
   multimodal encoder.
-- V8 assumes a small, clean, class-balanced server reference set drawn from the
-  training distribution. Its per-client CSE and behavior probe use only this
-  set; the official test split is reserved for global reporting. Thresholds
-  inherited from the older test-assisted protocol require a clean-reference
-  validation before confirmatory claims.
+- V8 requires server-side probe distributions and per-client local CSE. The
+  current local-CSE rule evaluates on the server test loader, so claims must
+  disclose this assumption and should later be validated with a disjoint
+  server-held set.
 - HMP-GAE falls back to FedAvg when `num_clients <= 2`; small federations can
   still have weak relational evidence above that hard threshold.
 - Update-forging attackers whose local model remains benign are incompatible

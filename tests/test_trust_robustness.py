@@ -979,9 +979,6 @@ def test_resume_fingerprint_covers_trajectory_and_legacy():
         "seed": 42,
         "dataset": "ag_news",
         "model_name": "model",
-        "server_reference_size": 400,
-        "server_reference_seed": 42,
-        "server_reference_stratified": True,
         "hallu_flip_ratio_range": [0.3, 0.8],
         "defense_config": {"trust_mode": "v8_hmp_cse_propagation"},
     }
@@ -990,11 +987,6 @@ def test_resume_fingerprint_covers_trajectory_and_legacy():
     assert any(
         "hallu_flip_ratio_range" in m
         for m in _fingerprint_mismatches(current, changed)
-    )
-    changed_reference = dict(cfg, server_reference_size=200)
-    assert any(
-        "server_reference_size" in m
-        for m in _fingerprint_mismatches(current, changed_reference)
     )
 
     # Schema-1 snapshots are checked on their recorded safety subset instead
@@ -1006,12 +998,7 @@ def test_resume_fingerprint_covers_trajectory_and_legacy():
         "model_name": cfg["model_name"],
         "defense_config": cfg["defense_config"],
     }
-    assert any(
-        "predates server-reference isolation" in m
-        for m in _fingerprint_mismatches(legacy, cfg)
-    )
-    legacy_without_reference = dict(cfg, server_reference_size=0)
-    assert _fingerprint_mismatches(legacy, legacy_without_reference) == []
+    assert _fingerprint_mismatches(legacy, cfg) == []
     assert any(
         "dataset" in m
         for m in _fingerprint_mismatches(legacy, dict(cfg, dataset="yahoo_answers"))

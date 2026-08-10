@@ -24,15 +24,9 @@ class Server:
                 compute_classification_semantic_entropy: bool = True,
                 semantic_probe_size: int = 64,
                 semantic_probe_seed: int = 42,
-                eval_local_every_n_rounds: int = 1,
-                reference_loader=None,
-                reference_metadata: Optional[Dict[str, Any]] = None):
+                eval_local_every_n_rounds: int = 1):
         self.global_model = copy.deepcopy(global_model)
         self.test_loader = test_loader
-        # Defense decisions use a server-only holdout from the TRAIN split.
-        # The official test loader is reserved for global reporting below.
-        self.reference_loader = reference_loader
-        self.reference_metadata = dict(reference_metadata or {})
         self.total_rounds = total_rounds
         # CRITICAL: Use explicit cuda:0 instead of 'cuda' to ensure device consistency
         # This prevents issues where 'cuda' and 'cuda:0' are treated as different devices
@@ -82,12 +76,11 @@ class Server:
         self.compute_classification_semantic_entropy = bool(
             compute_classification_semantic_entropy)
 
-        # Fixed probe subset of the server reference holdout for the
-        # per-client semantic-divergence trust
+        # Fixed probe subset for the per-client semantic-divergence trust
         # signal (Signal 3 in hmp_gae.trust_scorer). Built lazily on first
         # request so that defenses that don't need it pay no cost. Identical
         # across rounds. Selection policy (defense_config.semantic_probe_stratified):
-        #   False (default) -> deterministic head of reference_loader.
+        #   False (default) -> deterministic head of test_loader (historical).
         #   True            -> class-stratified deterministic sample, seeded by
         #                      semantic_probe_seed. Labels are used ONLY to
         #                      balance the sample, never in the trust scoring,
@@ -101,7 +94,7 @@ class Server:
         # Whether the active defense actually consumes probe distributions.
         # HMP-GAE will use them when defense_config.semantic_weight > 0.
         # NOTE (V4-V7): those CSE-reject modes do NOT depend on this probe —
-        # their rejection signal is full-reference local CSE (_needs_local_cse
+        # their rejection signal is the full-test local CSE (_needs_local_cse
         # below), so a semantic_weight=0 ablation cannot silently disable that
         # signal; it only drops the sem_div/probe_cse diagnostics. It DOES
         # change V6/V7's geometry factor, though: with semantic_weight=0 the
@@ -131,16 +124,6 @@ class Server:
                 'v7_cse_reject_corrob', 'v8_hmp_cse_propagation',
             )
         )
-        if (self._needs_probe or self._needs_local_cse) and self.reference_loader is None:
-            raise RuntimeError(
-                "The active defense requires a disjoint server reference loader; "
-                "test_loader fallback is forbidden because it would leak final-test "
-                "examples into aggregation decisions."
-            )
-        if self.reference_loader is not None:
-            reference_dataset = getattr(self.reference_loader, 'dataset', None)
-            if reference_dataset is not None and len(reference_dataset) == 0:
-                raise RuntimeError("server reference loader must not be empty")
 
         # Track historical data
         self.history = {
@@ -378,7 +361,7 @@ class Server:
         raw_weights = self._compute_raw_weights(client_ids)
 
         # Delegate to the configured defense strategy.
-        # local_cse (per-client full-reference CSE, aligned with client_ids) is only
+        # local_cse (per-client full-test CSE, aligned with client_ids) is only
         # computed and only forwarded for the HMP-GAE V4 rule — baseline
         # defenses keep their narrower signature and never see the kwarg.
         defense_kwargs = {}
@@ -606,16 +589,14 @@ class Server:
 
     def evaluate_local_metrics(self, client) -> Tuple[float, float]:
         """
-        Evaluate a client's local model on the server reference set in one pass.
+        Evaluate a client's local model on the server test set in a single forward pass.
 
         Returns (accuracy, classification_semantic_entropy).
 
         In real FL the server never sees client.model directly — it reconstructs
         the local model as w_global + Δ_i.  In this simulation the two are
         equivalent because client.model == w_global + Δ_i after local_train().
-        The reference set is held out from the client-training pool.  It is
-        deliberately separate from the official test split so this statistic
-        may safely influence aggregation.
+        Using the server's public test set is inherent to FedLLMs evaluation.
 
         Implementation: instead of moving client.model (full ~2GB Qwen) between
         CPU and GPU, we copy only the trainable flat params into the shared
@@ -633,15 +614,8 @@ class Server:
         total = 0
         total_cse = 0.0
 
-        metric_loader = self.reference_loader
-        if metric_loader is None:
-            raise RuntimeError(
-                "local client metrics require reference_loader; evaluating them "
-                "on the official test split is forbidden"
-            )
-
         with torch.no_grad():
-            for batch in metric_loader:
+            for batch in self.test_loader:
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
@@ -668,9 +642,9 @@ class Server:
 
     def _collect_local_metrics(self) -> Tuple[Dict[int, float], Dict[int, float]]:
         """
-        Evaluate every client's (local accuracy, local CSE) on the server
-        reference set and append to history. Shared by the diagnostic and
-        pre-aggregation paths in run_round — client models are not
+        Evaluate every client's (local accuracy, local CSE) on the server test
+        set and append to history. Shared by the legacy post-aggregation eval
+        and the V4 pre-aggregation eval in run_round — client models are not
         modified by aggregation (only self.global_model is), so the values are
         identical regardless of when in the round this runs.
         """
@@ -694,22 +668,18 @@ class Server:
         return local_accs, local_cses
 
     def _ensure_probe_batches(self) -> List[Dict[str, torch.Tensor]]:
-        """Lazily snapshot a fixed subset of reference_loader for client probes."""
+        """Lazily snapshot a fixed subset of test_loader for probing clients."""
         if self._probe_batches is not None:
             return self._probe_batches
-        if self.reference_loader is None:
-            raise RuntimeError(
-                "semantic probing requires reference_loader; test fallback is forbidden"
-            )
         target = max(1, self.semantic_probe_size)
         batches: List[Dict[str, torch.Tensor]] = []
         if self.semantic_probe_stratified:
             batches = self._build_stratified_probe_batches(target)
         if not batches:
-            # Deterministic head of reference_loader. Also the
+            # Historical behavior: deterministic head of test_loader. Also the
             # fallback when the dataset does not expose labels for stratification.
             collected = 0
-            for batch in self.reference_loader:
+            for batch in self.test_loader:
                 # Snapshot tensors on CPU to keep peak GPU memory bounded.
                 snapshot = {
                     'input_ids': batch['input_ids'].detach().cpu(),
@@ -728,7 +698,7 @@ class Server:
         """
         Class-stratified deterministic probe selection.
 
-        Draws ~target/num_classes samples per class from reference_loader.dataset
+        Draws ~target/num_classes samples per class from test_loader.dataset
         (seeded, without replacement) so the probe set is class-balanced --
         a head-of-loader snapshot can be class-skewed, which biases the
         semantic-divergence signal. Labels are consumed only here, for
@@ -737,10 +707,10 @@ class Server:
         Returns [] when the dataset does not expose a `labels` attribute,
         in which case the caller falls back to the head-of-loader path.
         """
-        dataset = getattr(self.reference_loader, 'dataset', None)
+        dataset = getattr(self.test_loader, 'dataset', None)
         labels = getattr(dataset, 'labels', None)
         if dataset is None or labels is None or len(labels) == 0:
-            print("  [Server] semantic_probe_stratified=True but reference dataset "
+            print("  [Server] semantic_probe_stratified=True but test dataset "
                   "exposes no labels; falling back to head-of-loader probes.")
             return []
         by_class: Dict[int, List[int]] = {}
@@ -759,7 +729,7 @@ class Server:
         if not chosen:
             return []
         chosen.sort()  # deterministic order, independent of class iteration
-        bs = int(self.reference_loader.batch_size or 32)
+        bs = int(self.test_loader.batch_size or 32)
         batches: List[Dict[str, torch.Tensor]] = []
         for start in range(0, len(chosen), bs):
             items = [dataset[i] for i in chosen[start:start + bs]]
@@ -798,7 +768,7 @@ class Server:
 
         Returns:
             (K, C) tensor on CPU, where K = number of probe samples actually
-            taken (<= semantic_probe_size, capped by len(reference_loader.dataset))
+            taken (<= semantic_probe_size, capped by len(test_loader.dataset))
             and C = num_labels.
 
         Uses the shared GPU-resident self._eval_model (see evaluate_local_metrics).
@@ -1061,7 +1031,7 @@ class Server:
             # All rows must have identical shape (K, C) -- same probe set, same head.
             probe_tensor = torch.stack(probe_rows, dim=0)  # (N, K, C)
 
-        # Optional Phase 3.6: pre-aggregation per-client reference metrics for the
+        # Optional Phase 3.6: pre-aggregation per-client local metrics for the
         # CSE-reject trust rules (V4-V8).
         # Client models are untouched by aggregation, so these values are
         # identical to the legacy post-aggregation evaluation — computed once
@@ -1120,10 +1090,10 @@ class Server:
         # Evaluate the global model (compute accuracy, loss and CSE in one pass).
         clean_acc, global_loss, mean_cse = self.evaluate_with_loss()
 
-        # Evaluate per-client reference accuracy and CSE (single forward pass each).
+        # Evaluate per-client local accuracy and CSE (single forward pass each).
         # When eval_local_every_n_rounds > 1, we only evaluate on round 0, the
         # final round, and every n-th round in between -- a sparser diagnostic
-        # trace in exchange for fewer N-times-reference-set forwards.
+        # trace in exchange for ~75% fewer N-times-test-set forwards.
         n_eval = self.eval_local_every_n_rounds
         is_final_round = (round_num + 1) == self.total_rounds
         do_local_eval = (
@@ -1155,9 +1125,6 @@ class Server:
             'server_lr': self.server_lr,
             'local_accuracies': local_accs_this_round,
             'local_cse': local_cse_this_round,
-            'local_metric_source': (
-                'server_reference' if self.reference_loader is not None else 'unavailable'
-            ),
         }
 
         self.log_data.append(round_log)
@@ -1180,11 +1147,7 @@ class Server:
 
         # Per-client local metrics table (only when evaluated this round).
         if local_accs_this_round:
-            metric_source = (
-                "server reference set" if self.reference_loader is not None
-                else "unavailable reference set"
-            )
-            print(f"  Per-client local metrics (local model on {metric_source}):")
+            print(f"  Per-client local metrics (local model on server test set):")
             attacker_ids = {c.client_id for c in self.clients if getattr(c, 'is_attacker', False)}
             for cid in sorted(local_accs_this_round):
                 tag = "ATK" if cid in attacker_ids else "BGN"

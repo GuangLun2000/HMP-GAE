@@ -18,11 +18,10 @@ $t$ = 联邦轮次（0-indexed）。
 1. **广播**:全局参数 $w_t$ 下发所有客户端;
 2. **本地训练**:每个客户端 $i$ 做 FedProx 本地训练,上传更新 $\Delta_i^t = w_i^{local} - w_t \in \mathbb{R}^d$;
 3. **攻击伪装**(Hallucination 攻击为恒等映射,见 §2);
-4. **服务器参考评估**:在客户端分区前从训练池分层留出的固定参考集上，计算逐客户端 local CSE；该统计可参与聚合；
-5. **(可选)语义探针前向**:当 `semantic_weight > 0`,服务器在同一参考集的固定 probe 子集上前向每个客户端的本地模型,得到 $P \in \mathbb{R}^{N \times K \times C}$;
-6. **HMP-GAE 防御聚合**:计算信任权重 $\alpha \in \Delta^{N-1}$(单纯形),聚合 $\Delta_g = \sum_i \alpha_i \Delta_i$;
-7. **全局更新**:$w_{t+1} = w_t + \eta_{server} \cdot \Delta_g$($\eta_{server} = 1.0$);
-8. **测试评估**:官方测试集仅计算全局 Clean Accuracy、Global Loss 与报告用 CSE，不进入聚合决策。
+4. **(可选)语义探针前向**:当 `semantic_weight > 0`,服务器在固定 probe 集上前向每个客户端的本地模型,得到 $P \in \mathbb{R}^{N \times K \times C}$;
+5. **HMP-GAE 防御聚合**:计算信任权重 $\alpha \in \Delta^{N-1}$(单纯形),聚合 $\Delta_g = \sum_i \alpha_i \Delta_i$;
+6. **全局更新**:$w_{t+1} = w_t + \eta_{server} \cdot \Delta_g$($\eta_{server} = 1.0$);
+7. **评估**:全局 Clean Accuracy、Global Loss、CSE;每客户端 local acc / local CSE。
 
 FL 全部结束后一次性计算 PPL(§7.3)。
 
@@ -274,9 +273,8 @@ $$
 
 `trust_scorer.py: _semantic_divergence_signal`
 
-**探针来源**:服务器从训练池分层留出固定参考集，并在其中确定 probe 子集
-（大小和是否分层由 config 决定；标签只可用于平衡采样，绝不进入打分，因此
-信号保持 label-free）。每轮把每个客户端
+**探针来源**:服务器持有固定 probe 集（大小和是否分层由 config 决定；标签
+只可用于平衡采样，绝不进入打分，因此信号保持 label-free）。每轮把每个客户端
 的本地模型($w_t + \Delta_i$)在 probe 集上前向,得 per-sample softmax
 $P_i^k \in \Delta^{C-1}$。
 
@@ -548,8 +546,8 @@ $$
 `v8_consensus_edge_count` 与 `v8_propagation_matrix` 判断；若全程无传播，
 实验结论就是 V8 退化为 V5，不能把 CSE 的收益归因于超图。反过来，若两个
 攻击者都未形成 CSE 种子，V8 也不会自行检测；这是防止几何 scapegoat 的
-保守边界。该模式依赖服务器训练留出集上的 local CSE，且与只伪造 update、
-不改变 `client.model` 的 `crafts_update` 攻击不兼容；官方测试集不参与该决策。
+保守边界。该模式仍依赖服务器 full-test local CSE，且与只伪造 update、
+不改变 `client.model` 的 `crafts_update` 攻击不兼容。
 
 ---
 
@@ -569,8 +567,7 @@ $$
 
 - 低 CSE = 预测更自信;hallucination 攻击下模型置信度下降 → CSE 上升;
 - 定位:Farquhar 式 semantic entropy 的**无生成代理**(no-generation surrogate),以 $C$ 个类标签充当 "semantic clusters";
-- 全局报告 CSE 与 accuracy/loss 共享同一次官方测试集前向；用于防御的逐客户端
-  local acc / local CSE 则在服务器训练留出集上计算，两者数据源严格分离。
+- 与 accuracy/loss 共享同一次测试集前向(每轮免费);同时逐客户端计算 local acc / local CSE(本地模型 $w_t + \Delta_i$ 在服务器测试集上)。
 
 ### 7.3 PPL — 困惑度(FL 结束后一次性)
 

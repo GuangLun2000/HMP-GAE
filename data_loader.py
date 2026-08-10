@@ -9,9 +9,7 @@ from transformers import AutoTokenizer
 import pandas as pd
 import urllib.request
 import os
-from typing import List, Dict, Optional
-
-from data_protocol import reference_content_sha256, reference_holdout_indices
+from typing import List, Dict
 
 class NewsDataset(Dataset):
     """Custom Dataset for text classification (AG News, IMDB, DBpedia, Yahoo Answers, etc.).
@@ -80,9 +78,7 @@ class DataManager:
     def __init__(self, num_clients, num_attackers, test_seed,
                  dataset_size_limit=None, batch_size=None, test_batch_size=None,
                  model_name: str = "distilbert-base-uncased", max_length: int = 128,
-                 dataset: str = "ag_news", server_reference_size: int = 0,
-                 server_reference_seed: Optional[int] = None,
-                 server_reference_stratified: bool = True):
+                 dataset: str = "ag_news"):
         
         """
         Initialize DataManager.
@@ -99,10 +95,6 @@ class DataManager:
             max_length: Max token length (AG News: 128, IMDB: 256-512, DBpedia: 512, Yahoo Answers: 256)
             dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers'. For ``ag_news`` / ``yahoo_answers``,
                      CSVs are read from ``data/ag_news/`` and ``data/yahoo_answers/`` (see ``data_loader.py``).
-            server_reference_size: Number of examples reserved from the loaded
-                                   training pool before client partitioning.
-            server_reference_seed: Dedicated deterministic holdout seed.
-            server_reference_stratified: Balance the holdout across labels.
         """
 
         if batch_size is None or test_batch_size is None:
@@ -117,13 +109,6 @@ class DataManager:
         self.max_length = max_length
         self.model_name = model_name
         self.dataset = dataset.lower()
-        self.server_reference_size = int(server_reference_size)
-        if self.server_reference_size < 0:
-            raise ValueError("server_reference_size must be non-negative")
-        self.server_reference_seed = int(
-            test_seed if server_reference_seed is None else server_reference_seed
-        )
-        self.server_reference_stratified = bool(server_reference_stratified)
         
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -146,72 +131,6 @@ class DataManager:
         else:
             print("Loading AG News dataset...")
         self._load_data()
-        self._reserve_server_reference()
-
-    def _reserve_server_reference(self) -> None:
-        """Remove a deterministic server reference set from client training.
-
-        The official test split is never touched.  This makes the data used by
-        pre-aggregation CSE and probe behavior disjoint from both client
-        training data and final test reporting by construction.
-        """
-        self.reference_texts: List[str] = []
-        self.reference_labels: List[int] = []
-        self.reference_source_indices: List[int] = []
-        self.server_reference_metadata: Dict[str, object] = {
-            "source": "disabled",
-            "size": 0,
-            "seed": self.server_reference_seed,
-            "stratified": self.server_reference_stratified,
-            "per_class_counts": {},
-            "content_sha256": None,
-        }
-        if self.server_reference_size <= 0:
-            return
-
-        chosen = reference_holdout_indices(
-            self.train_labels,
-            self.server_reference_size,
-            self.server_reference_seed,
-            stratified=self.server_reference_stratified,
-        )
-        chosen_set = set(int(i) for i in chosen.tolist())
-        loaded_train_size = len(self.train_texts)
-        self.reference_source_indices = chosen.tolist()
-        self.reference_texts = [self.train_texts[i] for i in chosen]
-        self.reference_labels = [int(self.train_labels[i]) for i in chosen]
-        self.train_texts = [
-            text for i, text in enumerate(self.train_texts) if i not in chosen_set
-        ]
-        self.train_labels = [
-            int(label) for i, label in enumerate(self.train_labels)
-            if i not in chosen_set
-        ]
-
-        per_class: Dict[str, int] = {}
-        for label in self.reference_labels:
-            key = str(int(label))
-            per_class[key] = per_class.get(key, 0) + 1
-        self.server_reference_metadata = {
-            "source": "training_holdout",
-            "size": len(self.reference_labels),
-            "seed": self.server_reference_seed,
-            "stratified": self.server_reference_stratified,
-            "per_class_counts": per_class,
-            "source_indices": self.reference_source_indices,
-            "loaded_train_size": loaded_train_size,
-            "client_train_size": len(self.train_texts),
-            "official_test_size": len(self.test_texts),
-            "content_sha256": reference_content_sha256(
-                self.reference_texts, self.reference_labels
-            ),
-        }
-        print(
-            "  🛡️  Server reference holdout: "
-            f"{len(self.reference_labels)} samples from training, "
-            f"per-class={per_class}, seed={self.server_reference_seed}; "
-            f"client pool remaining={len(self.train_texts)}"
-        )
 
     def _load_data(self):
         """Dispatch to dataset-specific loader."""
@@ -528,20 +447,3 @@ class DataManager:
         test_dataset = NewsDataset(self.test_texts, self.test_labels, self.tokenizer, max_length=self.max_length)
         return DataLoader(test_dataset, batch_size=self.test_batch_size, shuffle=False)
 
-    def get_reference_loader(self) -> DataLoader:
-        """Get the server-only training holdout used by defense decisions."""
-        if not self.reference_texts:
-            raise RuntimeError(
-                "server reference set is empty; set server_reference_size > 0"
-            )
-        reference_dataset = NewsDataset(
-            self.reference_texts,
-            self.reference_labels,
-            self.tokenizer,
-            max_length=self.max_length,
-        )
-        return DataLoader(
-            reference_dataset,
-            batch_size=self.test_batch_size,
-            shuffle=False,
-        )
