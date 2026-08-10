@@ -57,7 +57,7 @@ import torch
 
 
 CHECKPOINT_FILE = "checkpoint_last.pt"
-FINGERPRINT_SCHEMA = 2
+FINGERPRINT_SCHEMA = 3
 
 # Config fields that can change the FL trajectory and therefore must match
 # exactly between the saved checkpoint and the current run. Output-only and
@@ -82,6 +82,9 @@ _FINGERPRINT_KEYS = (
     "data_distribution",
     "dirichlet_alpha",
     "dataset_size_limit",
+    "server_reference_size",
+    "server_reference_seed",
+    "server_reference_stratified",
     "model_name",
     "use_lora",
     "lora_r",
@@ -121,21 +124,33 @@ def _fingerprint_mismatches(
 ) -> list[str]:
     """Compare a checkpoint fingerprint without stranding legacy snapshots.
 
-    Schema-2 checkpoints require every trajectory key. Older checkpoints are
+    Schema-3 checkpoints require every trajectory key. Older checkpoints are
     compared on the keys they actually recorded (which already included the
     experiment, seed, model, dataset and complete defense config); new saves
     immediately gain the stricter contract.
     """
     cur_fp = _fingerprint(config)
-    if int(saved_fp.get("_schema", 1)) >= FINGERPRINT_SCHEMA:
+    saved_schema = int(saved_fp.get("_schema", 1))
+    if saved_schema >= FINGERPRINT_SCHEMA:
         keys = _FINGERPRINT_KEYS
     else:
         keys = tuple(k for k in saved_fp if k != "_schema")
-    return [
+    mismatches = [
         f"{k}: ckpt={saved_fp.get(k)!r} vs cfg={cur_fp.get(k)!r}"
         for k in keys
         if saved_fp.get(k) != cur_fp.get(k)
     ]
+    # Schema 1/2 checkpoints predate the disjoint server-reference protocol.
+    # They may have used the official test loader inside aggregation, so a run
+    # that now requests a reference holdout must never resume from them even
+    # when all of their older keys happen to match.
+    if saved_schema < FINGERPRINT_SCHEMA and int(
+        config.get("server_reference_size") or 0
+    ) > 0:
+        mismatches.append(
+            "fingerprint schema: checkpoint predates server-reference isolation"
+        )
+    return mismatches
 
 
 def checkpoint_path(results_dir: Path, subdir: str = "round_checkpoint") -> Path:

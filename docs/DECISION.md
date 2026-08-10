@@ -21,6 +21,7 @@ The entries below are the decisions that constrain the current code.
 | V6 | One-way geometric multiplier on V5 flags | Historical experiment arm |
 | V7 | Windowed hypergraph-corroborated lower threshold | Frozen calibration-dependent arm |
 | V8 | CSE-seeded dual-view HMP propagation | Current mechanism |
+| Protocol | Disjoint server-reference data path | Current evaluation contract |
 
 Current formulas belong in `MATH_LOGIC.md`; this file explains why each path
 was adopted or rejected. Exact run values belong in `main()` and archived
@@ -605,11 +606,10 @@ The hypergraph propagates detached seed evidence; it does not redefine CSE.
   client whose ratio is above the pool median. The cross-view mutual relation,
   continuous multiplier, and shared rank cap contain but do not eliminate this
   risk. It must be measured, not claimed away.
-- The current implementation uses full-test local CSE. It therefore assumes a
-  server evaluation set and remains incompatible with `crafts_update` attackers
-  whose poison exists only in a forged update while `client.model` stays benign.
-  A paper must call this server-data assumption out; a future clean protocol
-  should use a held-out validation set rather than the reported test split.
+- At adoption time this implementation used full-test local CSE. That historical
+  protocol and its results are test-assisted. It was superseded by the disjoint
+  server-reference protocol recorded below. The incompatibility with
+  `crafts_update` attackers remains because their `client.model` stays benign.
 
 The defensible paper statement is: **CSE supplies high-precision seeds;
 cross-view hypergraph relations expand recall within a bounded budget; the GAE
@@ -643,3 +643,41 @@ Tested by `test_v8_safe_degradation_to_v5`,
 `test_v8_dual_view_consensus_and_affinity_mass`, and
 `test_runtime_v8_hmp_cse_propagation`, plus the expanded facade guard. These
 tests prove wiring and invariants, not FL convergence or performance.
+
+## Disjoint server-reference protocol (2026-08-10)
+
+**Adopted:** pre-aggregation local CSE and the behavior-view probe now use a
+server-only, class-stratified holdout removed from the loaded training pool
+before client partitioning. The official test split is used only after
+aggregation for global accuracy, loss, report CSE, and end-of-run evaluation.
+There is deliberately no `reference_loader or test_loader` fallback: V4-V8 or
+an active semantic probe without a reference loader raises immediately.
+
+For the current AG News protocol, 400 examples (100 per class) are held out.
+The CSE seed statistic averages all 400; the behavior view keeps its existing
+100-example stratified subset. With a 10,000-example loaded training arm, this
+reserves 4% and leaves 9,600 examples for the matched client partition. The
+choice trades a substantially more stable mean-entropy estimate than 25
+examples per class against a small training-data reduction. In the current
+limited-data arm, where the historical local metric used a 1,500-example test
+subset, it cuts that per-client forward by about 3.75x. Dataset/size sensitivity
+remains an empirical requirement, not a conclusion proved here.
+
+Reproducibility is part of the protocol: result JSON records the reference
+source, seed, per-class counts, source indices, pool sizes, and a SHA-256
+content digest without raw text. The checkpoint fingerprint includes all
+`server_reference_*` keys, and schema-1/2 checkpoints are rejected when the
+new reference protocol is active, so a test-assisted partial run cannot be
+silently resumed.
+
+**Calibration consequence:** `v4_tau_ratio=1.85` and `v5_r_hard=2.5` were
+estimated under the historical full-test statistic. They are retained in the
+first reference-set arm to isolate the data-protocol change, not declared
+validated on the new statistic. Before a confirmatory attacked run is used as
+paper evidence, run a matched no-attack reference arm and verify benign flag
+rate; then freeze any independently justified calibration before inspecting
+the final test outcomes. All V5/V8 comparisons must use the identical reference
+indices and seed.
+
+Tested by `tests/test_reference_protocol.py` (balanced deterministic holdout
+and reference/test routing) plus the schema-3 resume-fingerprint regression.
