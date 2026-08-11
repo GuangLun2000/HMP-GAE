@@ -1,10 +1,10 @@
-# HMP-GNN
+# HMP-GAE
 
 Hallucination Immunization for Multimodal Federated LLMs via Hypergraph Message Passing.
 
 [Hanlin Cai](https://caihanlin.com/) · Research prototype, work in progress, not submitted.
 
-HMP-GNN studies label-flip hallucination attacks in federated language-model
+HMP-GAE studies label-flip hallucination attacks in federated language-model
 classification. The server combines conservative CSE decisions with
 hypergraph message passing to assign client aggregation weights. The active
 experiment is always defined by the `config` dictionary inside `main()` in
@@ -92,8 +92,8 @@ configuration paths.
 The repository can be cloned directly in a cloud runtime:
 
 ```bash
-git clone https://github.com/GuangLun2000/HMP-GNN.git
-cd HMP-GNN
+git clone https://github.com/GuangLun2000/HMP-GAE.git
+cd HMP-GAE
 pip install -r requirements.txt
 python main.py
 ```

@@ -1,4 +1,4 @@
-# HMP-GNN 数学逻辑规范(Math Logic Specification)
+# HMP-GAE 数学逻辑规范(Math Logic Specification)
 
 > 本文档只维护**当前实现**的数学机制、符号和代码映射。运行方式见
 > [README.md](README.md)，文档分工见 [docs/README.md](docs/README.md)，版本选择、

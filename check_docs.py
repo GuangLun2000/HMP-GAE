@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Doc/code consistency guard for HMP-GNN.
+"""Doc/code consistency guard for HMP-GAE.
 
 Cheap (~0.1s, stdlib-only, CPU) static check that the context docs
 (AGENTS.md / CLAUDE.md / MATH_LOGIC.md / README.md) stay honest against the
@@ -119,7 +119,7 @@ def check_symbols() -> tuple[list[str], int]:
 
 
 def main() -> int:
-    print("HMP-GNN doc/code consistency check")
+    print("HMP-GAE doc/code consistency check")
     print("=" * 42)
     checks = [
         ("No stale main.py line-refs in agent docs", lambda: (check_no_mainpy_linerefs(), None)),

@@ -1,6 +1,6 @@
 # Documentation map
 
-HMP-GNN uses one owner for each kind of information. Link to that owner instead
+HMP-GAE uses one owner for each kind of information. Link to that owner instead
 of copying its content into another document.
 
 | Source of truth | Owns | Does not own |

@@ -1,4 +1,4 @@
-# AGENTS.md — HMP-GNN
+# AGENTS.md — HMP-GAE
 
 > 本文件只维护代码无法直接表达的协作约束和高风险陷阱。运行方式见
 > [README.md](README.md)，文档职责见 [docs/README.md](docs/README.md)，当前公式见
