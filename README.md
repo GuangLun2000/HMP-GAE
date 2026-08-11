@@ -4,11 +4,15 @@ Hallucination Immunization for Multimodal Federated LLMs via Hypergraph Message 
 
 [Hanlin Cai](https://caihanlin.com/) · Research prototype, work in progress, not submitted.
 
-A federated-learning testbed for label-flip hallucination attacks on LLM text
-classification. Clients fine-tune a shared backbone locally; the server scores
-each client before aggregation and reports clean accuracy, Classification
-Semantic Entropy (CSE), and end-of-FL perplexity. A single run is fully
-described by the `config` dictionary inside `main()` in [`main.py`](main.py).
+In federated LLM training, a compromised client can learn confident but wrong
+associations and push them into the shared model, where every other participant
+inherits them. This repository is a testbed for that threat — the
+**hallucination attack** — and for immunizing the federation against it: clients
+fine-tune a shared backbone locally, and before aggregation the server measures
+how much hallucination each client's model carries, then weights the clients
+accordingly. Runs report clean accuracy, Classification Semantic Entropy (CSE),
+and end-of-FL perplexity. A single run is fully described by the `config`
+dictionary inside `main()` in [`main.py`](main.py).
 
 ## Repository map
 
@@ -19,7 +23,7 @@ described by the `config` dictionary inside `main()` in [`main.py`](main.py).
 | [`client.py`](client.py) | Benign client and FedProx local training |
 | [`models.py`](models.py) | Backbone loading and LoRA wiring |
 | [`data_loader.py`](data_loader.py) | Dataset download, tokenization, IID/Dirichlet partitioning, local caches |
-| [`attack/`](attack/) | Hallucination label-flip attack plus SignFlipping, Gaussian, and ALIE baselines |
+| [`attack/`](attack/) | The hallucination attack, plus the SignFlipping, Gaussian, and ALIE baselines |
 | [`defense/`](defense/) | Defense facade and the FedAvg, Krum, median, FLTrust, FoolsGold baselines |
 | [`hmp_gae/`](hmp_gae/) | Node features, hypergraph construction, HMP encoder/decoder, losses, trust scoring |
 | [`fed_resume.py`](fed_resume.py) | Per-round resume snapshots and trajectory fingerprints |

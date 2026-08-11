@@ -466,7 +466,7 @@ the wiring-regression arm (V6 bit-identical; the geo_floor=1.0 / W=0
 degeneracy family) and must be Run 0 of any V7 experiment plan.
 
 **Threat-model scope, stated up front:** fixed attack-from-round-1,
-non-adaptive label-flip. Known counterplay recorded now, not after review:
+non-adaptive hallucination attack. Known counterplay recorded now, not after review:
 (a) delayed-onset attackers re-open the cold hole past the window (the
 archive cannot test this — all archived attacks start at R1); (b) the
 roadmapped cosine+norm stealth attacker nulls the iso channel; (c)
@@ -477,7 +477,7 @@ each other with DISTINCT benign second picks reach 3 peers (residual 1/2)
 `reach` counts ALL co-members (including the other attacker), so "isolated
 from the benign majority" is an interpretation, not the statistic; Phase 3
 of the replay reports the recovered attackers' in-window residual levels,
-so which regime the archived label-flip attackers actually occupy is
+so which regime the archived hallucination attackers actually occupy is
 measured, not assumed. Two upstream channel edge cases are recorded but
 deliberately left unfixed mid-campaign (changing the hypergraph
 construction now would desynchronize live runs from the archived channel

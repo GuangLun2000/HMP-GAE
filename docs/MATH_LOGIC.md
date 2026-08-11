@@ -53,58 +53,67 @@ $$
 
 ---
 
-## 2. 威胁模型:Hallucination 攻击(label-flip)
+## 2. 威胁模型:Hallucination 攻击
 
 `attack/hallucination.py`
 
 ### 2.1 攻击定义
 
-攻击者**不伪造更新**,而是在本地训练时对标签做翻转,然后执行与 benign 完全相同的 FedProx 训练:
+Hallucination 攻击者**不伪造更新**。它污染的是本地的**监督信号**:一部分样本
+的真实语义 $y_j$ 被替换成幻觉语义 $\tilde{y}_j$,攻击者随后执行与 benign 完全
+相同的 FedProx 训练,把"自信但错误"的类别关联真实地学进本地模型,再让联邦
+聚合把它扩散到全局模型:
 
 $$
 \Delta_a^t = \text{FedProxTrain}\big(w_t;\ \{(x_j, \tilde{y}_j)\}_{j \in \mathcal{D}_a}\big)
 $$
 
-其中翻转标签
+其中幻觉语义按 per-sample Bernoulli mask 注入:
 
 $$
 \tilde{y}_j = \begin{cases}
-\text{flip}(y_j) & \text{以概率 } \rho^t \text{ (per-sample Bernoulli mask)} \\
+h(y_j) & \text{以概率 } \rho^t \\
 y_j & \text{否则}
 \end{cases}
 $$
 
-三种 flip 模式(`attack/hallucination.py: FlippedLabelDataset._apply_flip`):
+三种幻觉注入模式(`attack/hallucination.py: FlippedLabelDataset._apply_flip`):
 
-| 模式 | $\text{flip}(y)$ |
-|---|---|
-| `pairwise` | 固定双射 $\pi(y)$(如 $0{\leftrightarrow}1, 2{\leftrightarrow}3, \dots$) |
-| `targeted` | 恒定目标类 $c^\*$ |
-| `random` | 均匀采样自 $\{0,\dots,C-1\}\setminus\{y\}$ |
+| 模式 | $h(y)$ | 语义 |
+|---|---|---|
+| `pairwise` | 固定双射 $\pi(y)$(如 $0{\leftrightarrow}1, 2{\leftrightarrow}3, \dots$) | 成对混淆的系统性幻觉 |
+| `targeted` | 恒定目标类 $c^\*$ | 全部坍缩到同一个幻觉类别 |
+| `random` | 均匀采样自 $\{0,\dots,C-1\}\setminus\{y\}$ | 无方向的弥散性幻觉(当前实验臂) |
 
 ### 2.2 Per-round 随机化
 
 `attack/hallucination.py: prepare_for_round`:每轮重采样
 
-- 翻转比例 $\rho^t \sim \mathcal{U}[\rho_{min},\rho_{max}]$,区间由
+- 幻觉注入强度 $\rho^t \sim \mathcal{U}[\rho_{min},\rho_{max}]$,区间由
   `hallu_flip_ratio_range` 指定;
-- 翻转掩码与随机目标类,种子 $\text{seed}^t = s_a \cdot 100003 + t$($s_a$ 为攻击者专属种子,大素数避免多攻击者碰撞)。
+- 注入掩码与随机目标语义,种子 $\text{seed}^t = s_a \cdot 100003 + t$($s_a$ 为攻击者专属种子,大素数避免多攻击者碰撞)。
 
-效果:攻击梯度方向逐轮非平稳(CSE / local acc 震荡),比冻结的错误标签流形更接近现实攻击者。
+效果:攻击梯度方向逐轮非平稳(CSE / local acc 震荡),比一个固定不变的幻觉
+流形更接近现实中"幻觉内容随轮次漂移"的攻击者。
 
 ### 2.3 隐蔽性(stealth)论证
 
-由于攻击者跑的是**真实的本地 SGD**(只是标签被污染),更新的几何统计量(norm、cosine)自然落在 benign 分布附近,即约束
+攻击者跑的是**真实的本地 SGD**,只是学习目标被幻觉污染,所以更新的几何统计量
+(norm、cosine)自然落在 benign 分布附近,即约束
 
 $$
 \lVert \omega_a - \omega'_a \rVert \le \epsilon
 $$
 
 **天然满足**,不需要显式投影。`attack/hallucination.py: camouflage_update`
-是恒等映射。这正是纯几何防御(Krum/norm-clipping 等)难以检测该攻击的原因,
-也是同时引入行为信号(CSE 与 probe 行为视图)的动机。
+是恒等映射。这正是纯几何防御(Krum/norm-clipping 等)难以检测该攻击的原因:
+幻觉写在**模型学到的语义**里,不写在更新的形状里。防御因此必须去看行为信号
+(CSE 与 probe 行为视图),而不是只看几何。
 
-**与经典 Byzantine baseline 的关键区别**:`sign_flipping`/`gaussian`/`alie` 是 dataset-free 的(不读本地数据、直接伪造更新);Hallucination 攻击者**使用**自己的本地数据。
+**与经典 Byzantine baseline 的关键区别**:`sign_flipping`/`gaussian`/`alie` 是
+dataset-free 的(不读本地数据、直接伪造更新),因此它们的本地模型仍是干净的;
+Hallucination 攻击者**使用**自己的本地数据并真的把幻觉学进模型——这正是 CSE
+能看见它、却看不见前三者的原因。
 
 ---
 
@@ -298,6 +307,10 @@ $Z^{hist}$ 进入:①节点特征的 $h_i^{t-1}$ 输入;②$\mathcal{L}_{hist}$�
 
 `hmp_gae/trust_scorer.py`(三个模式共用)
 
+检测的立足点(§2.3):幻觉写在**模型学到的语义**里,而不是更新的形状里。一个
+被幻觉污染的本地模型在干净测试分布上的预测会明显更混乱,因此 CSE 升高——这
+是几何防御看不到、而行为信号能看到的那一层。
+
 服务器聚合前在 full-test 集上评估每个本地模型的 CSE(§7.2 定义),得
 
 $$
@@ -474,6 +487,7 @@ V1–V3/V6/V7 臂需 checkout 2026-08-11 之前的 commit。
 
 ## 9. 论文写作要点(叙事逻辑备忘)
 
+0. **故事主线**:Hallucination 攻击者把幻觉真实地学进本地模型,而更新的几何形状仍然正常(§2.3),所以纯几何 Byzantine 防御结构性失明;免疫的前提是在聚合前去度量"这个客户端的模型有多幻觉"(CSE),再用关系结构把漏检的同伴一起收回来(V8 超图传播)。
 1. **V8 的互补分工**是核心论点:CSE 提供高精度种子,update/probe 双视图超图保留关系并提升漏检同伴的 recall,GAE affinity 只做连续衰减;任何单通道都不能独立扩权。
 2. **detection、传播与 weighting 解耦**:CSE 决定不可替换的 seed,HMP 只使用剩余 rank cap,最后仍回归数据量 FedAvg——避免权重集中破坏协作学习。
 3. **绝对尺度 vs 相对打分**:检测统计量是绝对的 pool-median CSE 比值;pool-relative 打分(z-score 族)没有绝对下限,干净联邦必产生替罪羊——这是被否决的 V1–V3 路线留下的核心教训(历史见 DECISION)。

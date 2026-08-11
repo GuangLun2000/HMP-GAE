@@ -12,7 +12,8 @@
 
 - 课题：Hallucination Immunization for Multimodal Federated LLMs via
   Hypergraph Message Passing（研究原型，未投稿）。
-- 攻击：Hallucination 客户端使用自己的本地数据，并在训练时翻转标签。
+- 攻击：Hallucination 攻击者用自己的本地数据做真实训练，但监督信号被注入
+  幻觉语义，因此幻觉被真的学进本地模型，而更新的几何形状仍然正常。
 - 当前主路径：V8 以 V5 的 full-test CSE 判定为高置信种子，利用 update/probe
   双视图一致超图传播风险，再按数据量加权聚合。
 - 机制边界：超图没有独立 flag 权；无种子、无双视图路径或无剩余 rank cap
@@ -62,7 +63,7 @@ notebook 或环境变量覆盖入口。
 | [`main.py`](main.py) | 配置、数据分区、客户端装配、实验入口 |
 | [`server.py`](server.py) | 轮次编排、聚合前 local CSE、probe forward、评估 |
 | [`client.py`](client.py) | `BenignClient` 与 FedProx 本地训练 |
-| [`attack/hallucination.py`](attack/hallucination.py) | label-flip 攻击与逐轮随机化 |
+| [`attack/hallucination.py`](attack/hallucination.py) | Hallucination 攻击的幻觉注入与逐轮随机化 |
 | [`defense/__init__.py`](defense/__init__.py) | 防御 facade、输入守卫与小 N fallback |
 | [`hmp_gae/runtime.py`](hmp_gae/runtime.py) | HMP-GAE 端到端执行和跨轮状态 |
 | [`hmp_gae/trust_scorer.py`](hmp_gae/trust_scorer.py) | V4/V5/V8 CSE 决策规则与加权聚合 |
