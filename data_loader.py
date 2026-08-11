@@ -88,13 +88,20 @@ class DataManager:
             num_attackers: Number of attacker clients (required)
             test_seed: Random seed for test sampling (required)
             dataset_size_limit: Limit dataset size (None = full dataset). For paper reproduction, use None.
-                               When set, only limits training set; test set remains full for fair evaluation.
+                               When set it caps BOTH splits: train to the limit, test to 15% of it
+                               (fixed random_state=42, independent of config['seed']). The test split
+                               is what the server's full-test CSE — every trust mode's detection
+                               statistic — is measured on, so shrinking it makes CSE noisier.
             batch_size: Batch size for training data loaders (required)
             test_batch_size: Batch size for test/validation data loaders (required)
             model_name: Hugging Face model name for tokenizer initialization
-            max_length: Max token length (AG News: 128, IMDB: 256-512, DBpedia: 512, Yahoo Answers: 256)
-            dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers'. For ``ag_news`` / ``yahoo_answers``,
-                     CSVs are read from ``data/ag_news/`` and ``data/yahoo_answers/`` (see ``data_loader.py``).
+            max_length: Max token length. The values main() ships are AG News 128, IMDB 512,
+                       DBpedia 512, Yahoo Answers 128 (Yahoo is held at 128 for cross-run
+                       comparability even though 256 fits the text better; 256 is an ablation).
+            dataset: 'ag_news' | 'imdb' | 'dbpedia' | 'yahoo_answers'. Only the last three are
+                     matched by name — every other string, including a typo, loads AG News.
+                     For ``ag_news`` / ``yahoo_answers``, CSVs are read from ``data/ag_news/``
+                     and ``data/yahoo_answers/`` (see ``data_loader.py``).
         """
 
         if batch_size is None or test_batch_size is None:

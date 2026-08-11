@@ -66,7 +66,8 @@ class Defense(ABC):
             aggregated_update: 1-D tensor, same shape as each element of `updates`.
             stats: dict with at minimum key 'alpha' (list of length N, floats
                    summing to ~1.0) and 'defense_name'. May include extra fields
-                   like 'residual', 'hist_dev', 'L_rec', 'Z' for HMP-GAE.
+                   like 'v4_ratio', 'v8_propagated_flagged', 'L_rec', 'Z' for
+                   HMP-GAE.
         """
 
 
@@ -135,18 +136,22 @@ class HMPGAEDefense(Defense):
     """
     Hypergraph Message-Passing Graph AutoEncoder immunization (this paper).
 
-    Per round:
-      1. Extract node features eta_i from each client's flat update (+ history).
-      2. Build a k-NN hypergraph H over eta (M = N, one hyperedge per node).
-      3. Run an L-layer HMP encoder (node -> hyperedge -> node) to obtain Z.
-      4. Decode pairwise adjacency A_hat and hyperedge incidence H_hat.
-      5. Self-supervised training for a handful of Adam steps:
-             L = lambda_H * BCE(H, H_hat_logits)
-               + lambda_A * smoothness(Z, A_hat)
-               + lambda_hist * || Z - Z_hist ||^2
-      6. Closed-form trust score s_i from graph residual + historical deviation.
-      7. alpha_i = softmax(s_i / tau), aggregate Delta = sum alpha_i * Delta_i.
-      8. Update EMA historical embedding cache z_hist.
+    All trust modes reject on the ABSOLUTE per-client full-test CSE
+    (server-evaluated BEFORE aggregation, passed via local_cse). Per round
+    under the current V8 mechanism:
+
+      1. Build the fixed update-view hypergraph from JL-projected updates and
+         the label-free behavior-view hypergraph from probe distributions.
+      2. Train the HMP-GAE (node features -> HMP encoder -> decoders) for a
+         few Adam steps on the FIXED update topology.
+      3. V5 CSE decision layer flags high-confidence seeds; the dual-view
+         consensus hypergraph, denoised by the learned affinity, may spend
+         only the unused rank-cap budget on elevated-CSE peers.
+      4. alpha = normalize(m_i * n_i); aggregate Delta = sum alpha_i Delta_i.
+      5. Update the EMA historical embedding cache z_hist.
+
+    trust_mode='v4_cse_reject' / 'v5_cse_reject' skip steps 1-2 and 5 and
+    apply the corresponding pure CSE rule (stateless; no GAE).
 
     Degenerate cases (N <= 2 or numerical issue) fall back to FedAvg weights.
     """
@@ -209,8 +214,8 @@ class HMPGAEDefense(Defense):
             stats["fallback_reason"] = f"N={len(updates)} <= 2"
             return agg, stats
 
-        # V4-V8 hard-require the per-client CSE vector. V8 additionally needs
-        # the label-free probe tensor for its independent behavior graph.
+        # V4/V5/V8 hard-require the per-client CSE vector. V8 additionally
+        # needs the label-free probe tensor for its independent behavior graph.
         # Validate BEFORE the runtime try/except below: a missing vector is a
         # server-plumbing bug and must crash the run loudly, not silently
         # degrade to FedAvg for 50 rounds.
@@ -220,8 +225,7 @@ class HMPGAEDefense(Defense):
         # which strips too) — defeating the loud-crash contract.
         _tm = str(self.cfg.get("trust_mode", "")).strip().lower()
         if _tm in (
-            "v4_cse_reject", "v5_cse_reject", "v6_cse_reject_geo",
-            "v7_cse_reject_corrob", "v8_hmp_cse_propagation",
+            "v4_cse_reject", "v5_cse_reject", "v8_hmp_cse_propagation",
         ) and local_cse is None:
             raise RuntimeError(
                 f"HMPGAEDefense: trust_mode='{_tm}' but no local_cse "

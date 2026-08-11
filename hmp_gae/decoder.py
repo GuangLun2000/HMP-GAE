@@ -1,13 +1,15 @@
 # hmp_gae/decoder.py
-# GAE decoder for HMP-GAE.
+# GAE decoder for the V8 HMP-GAE.
 #
-# Two outputs per the paper:
-#   - A_hat_ij = sigmoid(z_i^T z_j)                 (eq. 17, pairwise)
-#   - H_hat    = sigmoid(Z W_dec^T) in [0,1]^{N,M}  (eq. 18, hyperedge incidence)
+# Two outputs:
+#   - A_hat_ij = sigmoid(gamma * cos(z_i, z_j))     (pairwise, signed cosine)
+#   - H_hat    = sigmoid(Z W_dec^T) in [0,1]^{N,M}  (hyperedge incidence)
 #
 # We expose logits and probabilities separately so that the BCE reconstruction
 # loss can be computed with numerically stable
-# binary_cross_entropy_with_logits.
+# binary_cross_entropy_with_logits. The pre-V8 inner-product decoder
+# (sigmoid(Z Z^T) after a final ReLU) was removed with the legacy modes on
+# 2026-08-11 — it could never emit a negative logit.
 
 from __future__ import annotations
 
@@ -16,22 +18,6 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-def inner_product_decoder(Z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute A_hat logits and probabilities.
-
-    Args:
-        Z: (N, latent_dim)
-
-    Returns:
-        A_hat_logits: (N, N), Z Z^T (un-sigmoid)
-        A_hat_probs:  (N, N), sigmoid(Z Z^T)
-    """
-    logits = Z @ Z.t()
-    probs = torch.sigmoid(logits)
-    return logits, probs
 
 
 def normalized_cosine_decoder(

@@ -93,15 +93,12 @@ class Server:
         self._probe_batches: Optional[List[Dict[str, torch.Tensor]]] = None
         # Whether the active defense actually consumes probe distributions.
         # HMP-GAE will use them when defense_config.semantic_weight > 0.
-        # NOTE (V4-V7): those CSE-reject modes do NOT depend on this probe —
+        # NOTE (V4/V5): those CSE-reject modes do NOT depend on this probe —
         # their rejection signal is the full-test local CSE (_needs_local_cse
         # below), so a semantic_weight=0 ablation cannot silently disable that
-        # signal; it only drops the sem_div/probe_cse diagnostics. It DOES
-        # change V6/V7's geometry factor, though: with semantic_weight=0 the
-        # sem_div channel drops out of `s` and hence out of the gate, so a V6
-        # ablation on that axis moves v6_geo_mult as well as the diagnostics.
-        # V8 is different: its dual-view topology requires semantic_weight>0,
-        # validated by HMPGAERuntime, so _needs_probe is structurally true.
+        # signal; it only drops the probe_cse diagnostic. V8 is different:
+        # its dual-view topology requires semantic_weight>0, validated by
+        # HMPGAERuntime, so _needs_probe is structurally true.
         sem_w = float((self.defense_config or {}).get('semantic_weight', 0.0))
         self._needs_probe = (
             self.defense_method in ('hmp_gae', 'hmpgae', 'hmp-gae')
@@ -120,8 +117,7 @@ class Server:
         self._needs_local_cse = (
             self.defense_method in ('hmp_gae', 'hmpgae', 'hmp-gae')
             and trust_mode_cfg in (
-                'v4_cse_reject', 'v5_cse_reject', 'v6_cse_reject_geo',
-                'v7_cse_reject_corrob', 'v8_hmp_cse_propagation',
+                'v4_cse_reject', 'v5_cse_reject', 'v8_hmp_cse_propagation',
             )
         )
 
@@ -396,55 +392,10 @@ class Server:
             )
             print(f"  ⚖️  Trust weights: {alpha_summary}")
 
-        # Per-client historical-deviation signal: ||z_i - z_hist_i||_2.
-        # Logged every round regardless of hist_weight_beta so we can study
-        # signal direction (attacker high vs benign low) before deciding
-        # whether to give it nonzero weight in the trust score.
-        hist_dev_list = defense_stats.get('hist_dev')
-        if isinstance(hist_dev_list, list) and len(hist_dev_list) == len(client_ids):
-            hist_dev_summary = ", ".join(
-                f"c{cid}={h:.4f}" for cid, h in zip(client_ids, hist_dev_list)
-            )
-            print(f"  🕰️  hist_dev:      {hist_dev_summary}")
-
-        # Phase-gating diagnostics (NEW 2026-05-23): show whether hist signal
-        # was actually applied this round.  Helps cross-check that
-        # hist_warmup_rounds is gating as expected.  Only prints when the
-        # runtime exposes these fields (HMP-GAE defense; FedAvg silently skips).
-        beta_cfg = defense_stats.get('hist_weight_beta_configured')
-        beta_eff = defense_stats.get('hist_weight_beta_effective')
-        hwr = defense_stats.get('hist_warmup_rounds')
-        if beta_cfg is not None and beta_eff is not None:
-            status = "ON" if beta_eff > 0 else "OFF"
-            hwr_str = "None" if hwr is None else str(hwr)
-            print(
-                f"  ⏱️  hist gate:     β_cfg={beta_cfg:.2f}, "
-                f"β_eff={beta_eff:.2f}, warmup_rounds={hwr_str}, status={status}"
-            )
-
-        # Combined-gate diagnostics (NEW 2026-05-23, Issue 1): the suspicion
-        # z-score that actually drives the sigmoid gate, and the resulting gate.
-        # High sus_z = suspicious (gate -> 0); compare attacker vs benign to see
-        # whether the trust mechanism points the right direction.
-        sus_z_list = defense_stats.get('sus_z')
-        gate_list = defense_stats.get('gate')
-        if isinstance(sus_z_list, list) and len(sus_z_list) == len(client_ids):
-            sus_z_summary = ", ".join(
-                f"c{cid}={v:.3f}" for cid, v in zip(client_ids, sus_z_list)
-            )
-            print(f"  🎯 sus_z:        {sus_z_summary}")
-        if isinstance(gate_list, list) and len(gate_list) == len(client_ids):
-            gate_summary = ", ".join(
-                f"c{cid}={v:.3f}" for cid, v in zip(client_ids, gate_list)
-            )
-            print(f"  🚪 gate:         {gate_summary}")
-
-        # V4-V8 shared CSE diagnostics: per-client CSE/median ratio and which
-        # clients were high-confidence CSE-flagged this round. V5-V8 have no
-        # scalar mult — show floor + r_hard (V6/V7 additionally show geometry,
-        # while V8 prints propagated peers separately below). Test V6 FIRST:
-        # it emits the v5_* ramp keys too, so a
-        # 'v5_m_floor' in stats test alone would mislabel a V6 round as V5.
+        # V4/V5/V8 shared CSE diagnostics: per-client CSE/median ratio and
+        # which clients were high-confidence CSE-flagged this round. V5/V8
+        # have no scalar mult — show floor + r_hard (V8 prints propagated
+        # peers separately below).
         v4_ratio_list = defense_stats.get('v4_ratio')
         v4_flagged_list = defense_stats.get('v4_flagged')
         if isinstance(v4_ratio_list, list) and len(v4_ratio_list) == len(client_ids):
@@ -454,13 +405,7 @@ class Server:
             print(f"  🧪 cse/med:      {ratio_summary}")
         if isinstance(v4_flagged_list, list) and len(v4_flagged_list) == len(client_ids):
             flagged_ids = [cid for cid, f in zip(client_ids, v4_flagged_list) if f]
-            if 'v6_geo_floor' in defense_stats:
-                mult_desc = (
-                    f"ramp floor={defense_stats.get('v5_m_floor')}, "
-                    f"r_hard={defense_stats.get('v5_r_hard')}, "
-                    f"geo_floor={defense_stats.get('v6_geo_floor')}"
-                )
-            elif 'v5_m_floor' in defense_stats:
+            if 'v5_m_floor' in defense_stats:
                 mult_desc = (
                     f"ramp floor={defense_stats.get('v5_m_floor')}, "
                     f"r_hard={defense_stats.get('v5_r_hard')}"
@@ -472,22 +417,6 @@ class Server:
                 f"(tau={defense_stats.get('v4_tau_ratio')}, "
                 f"k_cap={defense_stats.get('v4_k_cap')}, "
                 f"{mult_desc})"
-            )
-        # V7 only: Tier-2 corroborated flags (cold-window, iso-corroborated
-        # sub-1.85 rejections). Printed separately from the CSE flags above so
-        # the log shows WHICH tier acted; 'none' inside the window is the
-        # honest "geometry did not act this round" datum.
-        v7_corrob_list = defense_stats.get('v7_corrob_flagged')
-        if isinstance(v7_corrob_list, list) and len(v7_corrob_list) == len(client_ids):
-            corrob_ids = [cid for cid, f in zip(client_ids, v7_corrob_list) if f]
-            print(
-                f"  🕸️ corrob:       {corrob_ids if corrob_ids else 'none'} "
-                f"(tau_lo={defense_stats.get('v7_tau_lo')}, "
-                f"iso_min={defense_stats.get('v7_iso_min')}, "
-                f"mult={defense_stats.get('v7_corrob_mult')}, "
-                f"window=[{defense_stats.get('v7_round_min')},"
-                f"{defense_stats.get('v7_round_max')}], "
-                f"geo_resolved={defense_stats.get('v7_geo_resolved')})"
             )
         # V8 only: distinguish high-confidence CSE seeds from clients reached
         # by the conservative dual-view hypergraph. A zero propagated set is
@@ -506,21 +435,6 @@ class Server:
                 f"(consensus_edges={defense_stats.get('v8_consensus_edge_count')}; "
                 f"risk: {risk_summary if risk_summary else 'n/a'})"
             )
-        # V6 only: the geometry factor. It is APPLIED only to flagged clients
-        # (marked '*'); for everyone else the applied multiplier is a hard 1.0
-        # and the number below is counterfactual — what the geometry WOULD have
-        # said. Judge "did the hypergraph act" from the starred values only:
-        # if those sit at ≈1.0 every round, V6 reduced to V5, which is a result
-        # to report, not to tune away by lowering v6_geo_floor.
-        v6_geo_mult_list = defense_stats.get('v6_geo_mult')
-        if isinstance(v6_geo_mult_list, list) and len(v6_geo_mult_list) == len(client_ids):
-            flags = defense_stats.get('v4_flagged') or []
-            geo_summary = ", ".join(
-                f"c{cid}{'*' if i < len(flags) and flags[i] else ''}={v:.3f}"
-                for i, (cid, v) in enumerate(zip(client_ids, v6_geo_mult_list))
-            )
-            print(f"  📐 geo_mult:     {geo_summary}   (* = applied; "
-                  f"unstarred are counterfactual)")
 
         # Compute similarity and distance metrics for visualization (unchanged).
         mode = getattr(self, 'similarity_mode', 'local_vs_global')
@@ -552,22 +466,10 @@ class Server:
         # Persist extra defense stats (skip bulky numpy blobs like 'Z' from the
         # main JSON log to keep result files lean; HMP runtime writes its own
         # stats file if enabled).
-        for k in ('residual', 'recon_residual', 'sem_div',
-                  'graph_residual_z', 'recon_residual_z', 'sem_div_z', 'hist_dev_z',
-                  'hist_dev', 's', 'sus_z', 'sus_raw', 'gate',
-                  'graph_weight', 'residual_weight_alpha',
-                  'semantic_weight', 'hist_weight_beta_effective',
-                  'zscore_mode', 'gate_rezscore', 'sus_ema_beta',
-                  'semantic_reference',
-                  'trust_mode_used', 'graph_channel_gated', 'graph_min_distinct',
-                  'probe_cse',
+        for k in ('trust_mode_used', 'probe_cse',
                   'v4_cse', 'v4_ratio', 'v4_flagged', 'v4_multiplier',
                   'v4_median_cse', 'v4_tau_ratio', 'v4_k_cap', 'v4_reject_mult',
                   'v5_m_floor', 'v5_r_hard', 'v5_ramp_t',
-                  'v6_geo_floor', 'v6_geo_gate', 'v6_geo_mult', 'v6_m_cse',
-                  'v7_corrob_flagged', 'v7_iso', 'v7_geo_resolved',
-                  'v7_tau_lo', 'v7_iso_min', 'v7_corrob_mult',
-                  'v7_round_min', 'v7_round_max',
                   'v8_seed', 'v8_propagated_risk', 'v8_cse_evidence',
                   'v8_joint_evidence', 'v8_propagated_flagged',
                   'v8_propagated_multiplier', 'v8_propagation_matrix',
@@ -575,7 +477,7 @@ class Server:
                   'v8_consensus_mutual', 'v8_update_edge_count',
                   'v8_behavior_edge_count', 'v8_consensus_edge_count',
                   'v8_recon_error',
-                  'L_rec', 'L_smooth', 'L_struct', 'L_hist',
+                  'L_rec', 'L_struct', 'L_hist',
                   'fallback_reason', 'defense_time_ms'):
             if k in defense_stats:
                 aggregation_log[k] = defense_stats[k]
@@ -1032,7 +934,7 @@ class Server:
             probe_tensor = torch.stack(probe_rows, dim=0)  # (N, K, C)
 
         # Optional Phase 3.6: pre-aggregation per-client local metrics for the
-        # CSE-reject trust rules (V4-V8).
+        # CSE-reject trust rules (V4/V5/V8).
         # Client models are untouched by aggregation, so these values are
         # identical to the legacy post-aggregation evaluation — computed once
         # here and reused for the round log below (no duplicate eval cost).
@@ -1043,7 +945,6 @@ class Server:
             if any(getattr(c, 'crafts_update', False) for c in self.clients):
                 raise RuntimeError(
                     "CSE-reject trust modes (v4_cse_reject / v5_cse_reject / "
-                    "v6_cse_reject_geo / v7_cse_reject_corrob / "
                     "v8_hmp_cse_propagation) "
                     "are not supported with update-forging attackers "
                     "(crafts_update): local CSE evaluates "
@@ -1103,7 +1004,7 @@ class Server:
             or ((round_num + 1) % n_eval == 0)
         )
         if self._needs_local_cse:
-            # V4/V5/V6 path: local metrics were already evaluated pre-aggregation
+            # V4/V5/V8 path: local metrics were already evaluated pre-aggregation
             # this round (every round — the trust rule needs them even when
             # eval_local_every_n_rounds would skip); reuse those values here.
             pass

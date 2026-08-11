@@ -6,7 +6,7 @@ of copying its content into another document.
 | Source of truth | Owns | Does not own |
 |---|---|---|
 | [`../main.py`](../main.py) → `main()` | Active experiment values | Explanations or historical results |
-| [`../README.md`](../README.md) | Setup, execution, outputs, short method overview | Full equations or version history |
+| [`../README.md`](../README.md) | File inventory, setup, execution, Colab, outputs | Method details, equations, or version comparisons |
 | [`MATH_LOGIC.md`](MATH_LOGIC.md) | Current mathematical mechanism and code-symbol mapping | Active config values or experiment outcomes |
 | [`DECISION.md`](DECISION.md) | Dated design decisions, rejected alternatives, preregistration, falsification rules | Quick-start instructions |
 | [`../AGENTS.md`](../AGENTS.md) | Non-obvious workflow constraints and operational pitfalls | Repeated algorithm derivations |

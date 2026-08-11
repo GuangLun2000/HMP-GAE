@@ -17,6 +17,9 @@
   双视图一致超图传播风险，再按数据量加权聚合。
 - 机制边界：超图没有独立 flag 权；无种子、无双视图路径或无剩余 rank cap
   时，V8 必须逐元素退化为 V5。完整公式只在 `docs/MATH_LOGIC.md` 维护。
+- 代码只保留三个 trust 模式：V4（消融臂）、V5（V8 的决策层 + matched-run
+  基线）、V8。V1–V3 几何信任栈与 V6/V7 已于 2026-08-11 移除；历史与复现
+  路径见 docs/DECISION.md，不要在当前树里重新实现它们。
 
 ## 不可违反的工作流
 
@@ -62,7 +65,7 @@ notebook 或环境变量覆盖入口。
 | [`attack/hallucination.py`](attack/hallucination.py) | label-flip 攻击与逐轮随机化 |
 | [`defense/__init__.py`](defense/__init__.py) | 防御 facade、输入守卫与小 N fallback |
 | [`hmp_gae/runtime.py`](hmp_gae/runtime.py) | HMP-GAE 端到端执行和跨轮状态 |
-| [`hmp_gae/trust_scorer.py`](hmp_gae/trust_scorer.py) | 信号融合、V4–V8 决策、最终权重 |
+| [`hmp_gae/trust_scorer.py`](hmp_gae/trust_scorer.py) | V4/V5/V8 CSE 决策规则与加权聚合 |
 | [`hmp_gae/`](hmp_gae/) 其余模块 | 节点特征、超图、encoder、decoder、loss |
 | [`fed_resume.py`](fed_resume.py) | 逐轮断点和轨迹指纹 |
 | [`evaluation_hallucination.py`](evaluation_hallucination.py) | FL 结束后一次性 PPL |
@@ -77,8 +80,11 @@ notebook 或环境变量覆盖入口。
   偏弱，不等于触发 fallback。
 - `defense_config.device='cpu'` 是有意设计：N 很小时，小型 HMP 子模型在 CPU
   上避免频繁 GPU/CPU 搬运。
-- `semantic_weight > 0` 才触发逐客户端 probe forward；CSE-reject/V8 还要求
-  聚合前的 `local_cse`。缺少 V8 所需的 probe distributions 必须显式报错。
+- `semantic_weight > 0` 才触发逐客户端 probe forward；三个 CSE-reject 模式都
+  要求聚合前的 `local_cse`。缺少 V8 所需的 probe distributions 必须显式报错。
+- `trust_mode` 没有默认值；旧 config 里的 legacy 模式（V1–V3/V6/V7）会在
+  runtime 构造时报错，这是有意的 loud-crash，不要加静默兼容分支。V4/V5 是
+  无状态纯规则（不训练 GAE、defense checkpoint 为空），只有 V8 有跨轮状态。
 - CSE-reject 使用服务器 full-test local eval，并强制逐轮计算。这是当前研究
   假设，也与“本地模型仍 benign、只伪造 update”的攻击不兼容。
 - V8 是否实际使用超图只看 `v8_propagated_flagged`、`v8_joint_evidence`、

@@ -16,10 +16,11 @@ The entries below are the decisions that constrain the current code.
 
 | Version | Role | Status |
 |---|---|---|
-| V4 | Absolute CSE-ratio rejection with a rank cap | Historical baseline |
-| V5 | V4 flags with a graded rejection ramp | Direct safety baseline for V8 |
-| V6 | One-way geometric multiplier on V5 flags | Historical experiment arm |
-| V7 | Windowed hypergraph-corroborated lower threshold | Frozen calibration-dependent arm |
+| V1–V3 | Geometry trust stack (4-signal fusion, z-scores, sigmoid gate) | Removed from code 2026-08-11 (git history only) |
+| V4 | Absolute CSE-ratio rejection with a rank cap | Active ablation arm (detect-then-suppress) |
+| V5 | V4 flags with a graded rejection ramp | Active; V8's Stage A and matched-run safety baseline |
+| V6 | One-way geometric multiplier on V5 flags | Removed from code 2026-08-11 (entry below is the record) |
+| V7 | Windowed hypergraph-corroborated lower threshold | Removed from code 2026-08-11 (entry below is the record) |
 | V8 | CSE-seeded dual-view HMP propagation | Current mechanism |
 
 Current formulas belong in `docs/MATH_LOGIC.md`; this file explains why each path
@@ -447,6 +448,16 @@ without widening the grids, and record the outcome here. Re-deriving the script
 from this text is permitted; re-deriving the *constants* by any other procedure
 is not.
 
+**2026-08-11 (later the same day) — the V7 runtime rule itself was removed
+from the code** together with V6 and the V1–V3 geometry stack (see the
+"2026-08-11 code pruning" entry below). Two consequences for any future
+revival: (a) `v7_cse_reject_corrob_weights`, its runtime branch, knobs, and
+tests must be restored from git history or re-implemented from this entry;
+(b) archives produced after 2026-08-11 no longer log the raw `residual`
+(graph isolation) channel at all — the replay can only certify on pre-pruning
+archives, and a revived V7 must also restore that logging before generating
+new calibration data.
+
 **Current knob values in `main()` (`v7_tau_lo=1.40`, `v7_iso_min≈7/12`,
 `v7_corrob_mult=0.5`, `v7_round_min=3`, `v7_round_max=10`) are PROVISIONAL
 placeholders — no V7 training run may launch before the calibration above
@@ -659,3 +670,65 @@ Tested by `test_v8_safe_degradation_to_v5`,
 `test_v8_dual_view_consensus_and_affinity_mass`, and
 `test_runtime_v8_hmp_cse_propagation`, plus the expanded facade guard. These
 tests prove wiring and invariants, not FL convergence or performance.
+
+## 2026-08-11 code pruning: only V4 / V5 / V8 remain in the code
+
+**Adopted (user-requested repository cleanup):** the reader-facing story is
+V8 plus its ablations, so every trust path not on that chain was deleted from
+the code. This entry is the record; the deleted mechanisms' own entries above
+remain untouched as history.
+
+Removed:
+
+- **Trust modes `soft_reject_fedavg`, `reject_then_fedavg`, `softmax`
+  (V1–V3)** and the entire geometry trust stack that only they consumed:
+  4-signal fusion (`compute_trust_weights`), robust z-scores (`_zscore`),
+  semantic-divergence signal, suspicion EMA, sigmoid gate
+  (`gate_diagnostics` / `reject_soft_weighted` / `reject_then_weighted`),
+  and their config knobs (`graph_weight`, `residual_weight_alpha`,
+  `hist_weight_beta`, `hist_warmup_rounds`, `softmax_tau`, `gate_signal`,
+  `reject_z_threshold`, `soft_reject_k`, `zscore_mode`, `zscore_clip`,
+  `gate_rezscore`, `sus_ema_beta`, `semantic_reference`,
+  `semantic_confidence_weight`, `graph_min_distinct`,
+  `cold_start_fallback`, `min_history_for_trust`). Since V4 (2026-07-28)
+  these signals were computed every round purely as diagnostics; the C1/C2
+  entries above record why pool-relative scoring lost flag authority.
+- **V6 (`v6_cse_reject_geo_weights`)** — could only tighten clients CSE had
+  already flagged; superseded by V8's relational question.
+- **V7 (`v7_cse_reject_corrob_weights`)** — frozen, never calibrated; its
+  preregistration contract survives in the V7 entry above (with the
+  2026-08-11 amendments).
+- **The pre-V8 GAE path**: per-step hypergraph rebuild from learned eta,
+  `inner_product_decoder`, `total_loss` / `smoothness_loss` (the
+  self-smoothness objective). The GAE now exists only in its V8 form
+  (fixed dual-view topology, residual/LN encoder, signed cosine decoder,
+  fixed-topology BCE) and only runs under V8.
+
+Consequences, stated up front:
+
+- **V4/V5 are now stateless pure CSE rules** — no GAE training, no z_hist,
+  empty defense checkpoint state. Their *decisions* are bit-identical to the
+  pre-pruning code (the archived cross-backbone bit-identity of V4/V5 alpha
+  is exactly why the GAE could be dropped from those modes), but their
+  archived-log schema shrinks: geometry diagnostic channels (`residual`,
+  `recon_residual`, `sem_div*`, `s`, `sus_z`, `sus_raw`, `gate`,
+  `hist_dev*`, `alpha_hmp`, `graph_channel_gated`) are no longer logged in
+  ANY mode. Post-pruning archives are therefore not row-compatible with
+  pre-pruning archives on those channels; pre-pruning results remain valid
+  history.
+- **A legacy `trust_mode` in an old config now fails loudly at
+  construction** (`HMPGAERuntime` raises; `trust_mode` no longer has a
+  default). Stale legacy knobs in archived configs are ignored, not fatal.
+- **Reproducing a removed arm requires checking out a pre-2026-08-11
+  commit**; do not re-implement legacy modes inside the current tree.
+- Resume checkpoints written by removed modes do not fingerprint-match the
+  pruned code (defense_config keys changed); every new arm gets a fresh
+  `experiment_name` anyway.
+
+Tested: `test_removed_modes_raise` pins the loud-failure contract and
+stale-knob inertness; `test_runtime_v4_cse_reject` /
+`test_runtime_v5_cse_reject` pin the slimmer stats schema (legacy channels
+must NOT reappear); `test_runtime_v8_state_roundtrip` replaces the old
+suspicion-EMA roundtrip as the Adam-aliasing regression guard. V4/V5/V8
+rule tests are unchanged from before the pruning — the decision math did
+not move.

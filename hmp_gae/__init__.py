@@ -2,10 +2,13 @@
 # Hypergraph Message-Passing Graph AutoEncoder for FedLLM immunization.
 #
 # Sub-modules:
-#   - node_features : eta_i = f_enc(Delta_i, stats, history)
-#   - hypergraph    : k-NN hypergraph construction H, D_V, D_E
+#   - node_features : eta_i = f_enc(JL(Delta_i), stats, history)
+#   - hypergraph    : k-NN hypergraphs (update + probe-behavior views),
+#                     mutual/consensus relations, propagation operator
 #   - encoder       : L-layer HMP encoder (node <-> hyperedge <-> node)
-#   - decoder       : inner-product adjacency decoder + hyperedge decoder
-#   - losses        : BCE(H, H_hat) + smoothness(Z, A_hat) + hist(Z, Z_hist)
-#   - trust_scorer  : closed-form s_i -> alpha_i = softmax(s_i / tau)
-#   - runtime       : HMPGAERuntime wiring everything together (used by defense package)
+#   - decoder       : normalized-cosine adjacency decoder + hyperedge decoder
+#   - losses        : V8 objective (incidence BCE + fixed-topology adjacency
+#                     BCE + historical consistency)
+#   - trust_scorer  : CSE-reject decision rules V4 / V5 / V8
+#   - runtime       : HMPGAERuntime wiring everything together (used by the
+#                     defense package)

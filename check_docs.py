@@ -40,9 +40,9 @@ CONFIG_KEYS = [
     "model_name", "dataset", "data_distribution", "dirichlet_alpha",
     "attack_method", "defense_method", "defense_config",
     "hallu_flip_ratio_range", "hallu_flip_mode", "hallu_flip_map",
-    "semantic_weight", "gate_signal", "trust_mode", "reject_z_threshold",
-    "zscore_mode", "gate_rezscore", "sus_ema_beta", "semantic_reference",
-    "v4_tau_ratio", "v5_m_floor", "v5_r_hard", "graph_min_distinct",
+    "semantic_weight", "trust_mode", "num_byzantine",
+    "v4_tau_ratio", "v4_reject_mult", "v5_m_floor", "v5_r_hard",
+    "knn_k", "semantic_probe_stratified",
 ]
 
 # Symbols the docs name, keyed by the file that must define them (def/class).
@@ -52,12 +52,11 @@ SYMBOLS = {
     "server.py": ["Server", "run_round"],
     "defense/__init__.py": ["HMPGAEDefense", "FedAvgDefense", "build_defense"],
     "attack/hallucination.py": ["HallucinationAttackerClient", "FlippedLabelDataset"],
-    "hmp_gae/runtime.py": ["HMPGAERuntime", "aggregate", "_update_history", "_smooth_suspicion"],
+    "hmp_gae/runtime.py": ["HMPGAERuntime", "aggregate", "_update_history"],
     "hmp_gae/trust_scorer.py": [
-        "compute_trust_weights", "_zscore", "_semantic_divergence_signal",
-        "reject_soft_weighted", "gate_diagnostics", "weighted_aggregate", "_suspicion_signal",
-        "v4_cse_reject_weights", "v5_cse_reject_weights", "v6_cse_reject_geo_weights",
-        "v7_cse_reject_corrob_weights", "v8_hmp_cse_propagation_weights",
+        "weighted_aggregate",
+        "v4_cse_reject_weights", "v5_cse_reject_weights",
+        "v8_hmp_cse_propagation_weights",
     ],
     "hmp_gae/hypergraph.py": [
         "knn_hypergraph", "semantic_js_similarity",
@@ -66,7 +65,7 @@ SYMBOLS = {
     "hmp_gae/node_features.py": ["compute_node_features"],
     "hmp_gae/encoder.py": ["HMPEncoder", "HMPLayer"],
     "hmp_gae/decoder.py": ["HyperedgeDecoder", "normalized_cosine_decoder"],
-    "hmp_gae/losses.py": ["total_loss", "total_loss_v8"],
+    "hmp_gae/losses.py": ["total_loss_v8", "adjacency_recon_loss", "hist_loss"],
 }
 
 MAIN_PY_LINEREF = re.compile(r"main\.py(?::\d+|#L\d+)")

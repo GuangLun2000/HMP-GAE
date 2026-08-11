@@ -1,16 +1,15 @@
 # hmp_gae/losses.py
-# Self-supervised reconstruction and regularization losses for HMP-GAE.
+# Self-supervised reconstruction and regularization losses for the V8 HMP-GAE:
 #
-# Corresponds to the paper's reconstruction loss (eq. 21):
+#     L_V8 = lambda_H * BCE(H, H_hat)                       (incidence recon)
+#          + lambda_A * BCE_offdiag(A_update, A_hat_logits) (fixed-topology recon)
+#          + lambda_hist * ||Z - Z_hist||^2 / (N * d_z)     (historical consistency)
+#          + weight_decay * ||theta||^2
 #
-#     L_rec = lambda_H * BCE(H, H_hat)  +  lambda_A * sum_ij A_hat_ij ||z_i - z_j||^2
-#
-# plus the historical-consistency regularizer introduced in the algorithm:
-#
-#     L_hist = sum_i || z_i - z_hist_i ||^2
-#
-# We rename the original L_B(Z) term to "smoothness" because the paper's
-# definition is actually a Laplacian-style smoothness term (not a BCE).
+# The adjacency target is the detached mutual-kNN update-view adjacency built
+# once per round — NOT the decoder's own smoothed output (the pre-V8
+# self-smoothness objective was removed with the legacy modes on 2026-08-11;
+# see docs/DECISION.md).
 
 from __future__ import annotations
 
@@ -23,10 +22,15 @@ import torch.nn.functional as F
 
 @dataclass
 class LossBundle:
-    """Structured return from total_loss for logging clarity."""
+    """Structured return from total_loss_v8 for logging clarity.
+
+    ``L_smooth`` is a legacy field name kept for archive-side tooling; under
+    V8 it carries the structural adjacency-reconstruction BCE (logged as
+    ``L_struct``).
+    """
     total: torch.Tensor
     L_rec_H: torch.Tensor        # BCE(H, H_hat_logits)
-    L_smooth: torch.Tensor       # sum_ij A_hat_ij ||z_i - z_j||^2 (mean over N^2)
+    L_smooth: torch.Tensor       # V8: adjacency_recon_loss (a.k.a. L_struct)
     L_hist: torch.Tensor         # mean squared distance to Z_hist
     L_reg: torch.Tensor          # L2 on trainable params (optional)
 
@@ -49,23 +53,6 @@ def recon_loss_H(H: torch.Tensor, H_hat_logits: torch.Tensor, pos_weight_cap: fl
     )
 
 
-def smoothness_loss(A_hat: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
-    """
-    Laplacian-style smoothness: sum_ij A_hat_ij ||z_i - z_j||^2 / N^2.
-
-    Computed via the identity
-        sum_ij A_hat_ij ||z_i - z_j||^2 = 2 * tr(Z^T L Z)
-    where L = D - A_hat is the graph Laplacian of A_hat. We compute it
-    directly for clarity with N small.
-    """
-    N = Z.shape[0]
-    if N == 0:
-        return torch.zeros((), device=Z.device, dtype=Z.dtype)
-    # Pairwise squared distances (N, N)
-    diff_sq = torch.cdist(Z, Z, p=2.0) ** 2
-    return (A_hat * diff_sq).sum() / (N * N)
-
-
 def adjacency_recon_loss(
     target: torch.Tensor,
     logits: torch.Tensor,
@@ -73,7 +60,8 @@ def adjacency_recon_loss(
 ) -> torch.Tensor:
     """Off-diagonal BCE for V8's fixed direct-neighbor target.
 
-    Unlike :func:`smoothness_loss`, the target is constructed once from the
+    Unlike the removed pre-V8 self-smoothness objective, the target is
+    constructed once from the
     detached raw-update topology and is independent of the decoder output.
     The diagonal is excluded because every node is trivially identical to
     itself and would otherwise dominate the tiny N=7 loss.
@@ -140,29 +128,6 @@ def param_l2(params) -> torch.Tensor:
         # Return a 0-dim tensor on a reasonable device.
         return torch.zeros(())
     return total
-
-
-def total_loss(
-    H: torch.Tensor,
-    H_hat_logits: torch.Tensor,
-    A_hat: torch.Tensor,
-    Z: torch.Tensor,
-    Z_hist: Optional[torch.Tensor],
-    lambda_H: float = 1.0,
-    lambda_A: float = 1.0,
-    lambda_hist: float = 0.5,
-    weight_decay: float = 0.0,
-    params=None,
-) -> LossBundle:
-    L_H = recon_loss_H(H, H_hat_logits)
-    L_S = smoothness_loss(A_hat, Z)
-    L_Hi = hist_loss(Z, Z_hist)
-    if weight_decay > 0 and params is not None:
-        L_reg = weight_decay * param_l2(params).to(L_H.device)
-    else:
-        L_reg = torch.zeros((), device=L_H.device, dtype=L_H.dtype)
-    total = lambda_H * L_H + lambda_A * L_S + lambda_hist * L_Hi + L_reg
-    return LossBundle(total=total, L_rec_H=L_H, L_smooth=L_S, L_hist=L_Hi, L_reg=L_reg)
 
 
 def total_loss_v8(

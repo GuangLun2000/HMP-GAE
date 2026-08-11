@@ -65,8 +65,9 @@ class HMPLayer(nn.Module):
         Z_new = apply_diag_inv(D_V_inv, msg_v)
         if self.residual:
             # V8: preserve client-specific content on the tiny N=7 graph while
-            # still admitting a bounded-depth hypergraph message.  Older modes
-            # keep the historical pure-message path byte-for-byte.
+            # still admitting a bounded-depth hypergraph message. (The
+            # pre-V8 pure-message path — residual=False — is retained as an
+            # option but no live mode uses it since 2026-08-11.)
             Z_new = self.norm(Z_new + self.W_skip(Z))
         if self.activate_output:
             Z_new = F.relu(Z_new)
