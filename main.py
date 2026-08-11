@@ -1208,7 +1208,7 @@ def main():
             'anchor': 'median',    # fltrust
             'num_byzantine': 2,    # krum/multi-krum; ALSO the V4+ rank cap
 
-            # HMP-GAE geometry (symbols match hmp_gae/*.py and MATH_LOGIC.md)
+            # HMP-GAE geometry (symbols match hmp_gae/*.py and docs/MATH_LOGIC.md)
             'proj_dim': 64,
             'eta_dim': 64,
             'random_proj_seed': 42,
@@ -1243,7 +1243,8 @@ def main():
             #   'v5_cse_reject'        V5: V4 flag + linear CSE ramp
             #   'v6_cse_reject_geo'    V6: V5 × one-sided geometry factor (flagged only)
             #   'v7_cse_reject_corrob' V7: V6 + Tier-2 corroborated flag in cold window
-            #                          (⚠ do NOT run before replay_v7_calibration.py passes)
+            #                          (⚠ frozen; do NOT run before the pre-registered
+            #                           offline calibration in docs/DECISION.md "V7" passes)
             #   'v8_hmp_cse_propagation' V8: V5 CSE seeds + fixed update/probe
             #                          consensus hypergraph + learned HMP propagation
             # V4+ modes require per-round local CSE (server enforces, loud crash if
@@ -1258,8 +1259,9 @@ def main():
             # V6 knob — PRE-REGISTERED 2026-08-07; 1.0 disables geometry (= V5-identical
             # wiring-regression arm).
             'v6_geo_floor': 0.5,
-            # V7 knobs — ⚠ ALL FOUR PROVISIONAL (2026-08-08): run replay_v7_calibration.py
-            # and pick from the pre-committed grids (DECISION.md "V7") before any V7 run.
+            # V7 knobs — ⚠ ALL FOUR PROVISIONAL (2026-08-08): run the pre-registered
+            # offline calibration and pick from the pre-committed grids
+            # (docs/DECISION.md "V7") before any V7 run.
             # Window is 1-indexed; v7_round_max=0 = V6-identical wiring-regression arm.
             'v7_tau_lo': 1.40,
             'v7_iso_min': 7.0 / 12.0,   # inter-level midpoint: only reach<=2 flags at N=7, knn_k=2

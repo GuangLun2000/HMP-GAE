@@ -3,13 +3,13 @@
 > This is the dated, append-oriented design record. It owns rationale,
 > preregistered constants, rejected alternatives, and falsification criteria;
 > it does not own current config values or user instructions. See the
-> [documentation map](README.md), [current mathematics](../MATH_LOGIC.md), and
+> [documentation map](README.md), [current mathematics](MATH_LOGIC.md), and
 > [run guide](../README.md). Later outcomes should be added as new evidence,
 > never back-written into an earlier decision as if they were known in advance.
 
 Created in-repo 2026-07-28 during the V4 change-set. The V4 coding brief
-([HMP-GAE-V4-coding-brief.md](../HMP-GAE-V4-coding-brief.md)) references an
-earlier DECISION.md kept alongside the results archive (outside this repo).
+(`HMP-GAE-V4-coding-brief.md`, never in this repo) references an earlier
+DECISION.md kept alongside the results archive (outside this repo).
 The entries below are the decisions that constrain the current code.
 
 ## Decision index
@@ -22,7 +22,7 @@ The entries below are the decisions that constrain the current code.
 | V7 | Windowed hypergraph-corroborated lower threshold | Frozen calibration-dependent arm |
 | V8 | CSE-seeded dual-view HMP propagation | Current mechanism |
 
-Current formulas belong in `MATH_LOGIC.md`; this file explains why each path
+Current formulas belong in `docs/MATH_LOGIC.md`; this file explains why each path
 was adopted or rejected. Exact run values belong in `main()` and archived
 result configs.
 
@@ -369,8 +369,10 @@ Design choices and their reasons:
   not raw update geometry — its cross-seed/backbone/round stability is a
   replay PASS criterion (round-stratified histograms), not an assumption.
 
-**Pre-committed calibration ([replay_v7_calibration.py](../replay_v7_calibration.py),
-stdlib-only, runs on the archived `*_results.json`):** grids `tau_lo` ∈
+**Pre-committed calibration (originally `replay_v7_calibration.py`, a
+stdlib-only offline replay over the archived `*_results.json`; the script was
+deleted 2026-08-11 — see the amendment at the end of this entry, which leaves
+the grids and rules below as the binding contract):** grids `tau_lo` ∈
 {1.30..1.80 step 0.05}, `iso_min` ∈ {5/12, 7/12}, `round_max` ∈ {5, 8, 10},
 `round_min` = 3. PASS = a ≥ 2-point contiguous zero-FP `tau_lo` plateau
 (cap-free AND budgeted counts both 0 over all admitted benign client-round
@@ -431,10 +433,24 @@ contract, they do not react to results):**
   round-stratified benign iso medians per cell that back the stability
   kill criterion (previously stated here but not computed anywhere).
 
+**2026-08-11 amendment — the calibration script was deleted, the calibration
+contract was not.** `replay_v7_calibration.py` was removed from the repository
+root: V7 has been frozen since V8 was adopted (2026-08-09), the script had
+never been run to a conclusion, and a never-executed replay harness sitting
+beside the run entry points was a standing source of reader confusion. Deleting
+it changes NOTHING about V7's status. The grids, the PASS criterion, the
+deterministic selection rules, the kill criteria, and the exit-code semantics
+recorded above remain the pre-registered contract, and they were written before
+any replay result — that is what makes them a preregistration, not the file.
+Anyone reviving V7 must re-implement the replay from this entry, verbatim and
+without widening the grids, and record the outcome here. Re-deriving the script
+from this text is permitted; re-deriving the *constants* by any other procedure
+is not.
+
 **Current knob values in `main()` (`v7_tau_lo=1.40`, `v7_iso_min≈7/12`,
 `v7_corrob_mult=0.5`, `v7_round_min=3`, `v7_round_max=10`) are PROVISIONAL
-placeholders — no V7 training run may launch before the replay passes and
-this entry is amended with the selected constants.** `v7_round_max=0` is
+placeholders — no V7 training run may launch before the calibration above
+passes and this entry is amended with the selected constants.** `v7_round_max=0` is
 the wiring-regression arm (V6 bit-identical; the geo_floor=1.0 / W=0
 degeneracy family) and must be Run 0 of any V7 experiment plan.
 

@@ -1,8 +1,8 @@
 # HMP-GAE 数学逻辑规范(Math Logic Specification)
 
 > 本文档只维护**当前实现**的数学机制、符号和代码映射。运行方式见
-> [README.md](README.md)，文档分工见 [docs/README.md](docs/README.md)，版本选择、
-> 被否决方案和实验契约见 [docs/DECISION.md](docs/DECISION.md)。实验参数现值只读
+> [README.md](../README.md)，文档分工见 [docs/README.md](README.md)，版本选择、
+> 被否决方案和实验契约见 [docs/DECISION.md](DECISION.md)。实验参数现值只读
 > `main()` 的 `config`，不要从本文档推断默认值。
 
 每个公式均标注实现位置（以文件和行为为准），与常见论文写法不同处会显式
@@ -585,12 +585,12 @@ $\text{NLL}_j$ = 第 $j$ 条样本的 shifted-label 平均 token 负对数似然
 
 ## 8. 配置与复现边界
 
-[`main.py`](main.py) 的 `main()` 内 `config` 字典是唯一权威配置源。本文档定义
+[`main.py`](../main.py) 的 `main()` 内 `config` 字典是唯一权威配置源。本文档定义
 参数的数学含义，但不保存当前模型、数据集、轮数、阈值或实验名快照，因为这些
 值会随实验臂变化。
 
 复现某次运行应使用结果文件中归档的完整 config 和对应 commit。跨版本比较还需
-遵守 [docs/DECISION.md](docs/DECISION.md) 中预注册常数、matched-run 与
+遵守 [docs/DECISION.md](DECISION.md) 中预注册常数、matched-run 与
 falsification 契约，不能从当前 `main()` 反推旧实验配置。
 
 ---

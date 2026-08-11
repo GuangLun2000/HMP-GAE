@@ -879,8 +879,9 @@ def test_v7_clean_federation_identity():
     caveat this fixture encodes: a clean benign client with BOTH r > tau_lo
     AND iso >= iso_min inside the window WOULD be mis-flagged — V7's clean
     exactness is conditional on the replay-verified premise that this joint
-    event never occurs in the clean archives (replay_v7_calibration.py PASS
-    criterion), unlike V4/V5/V6 whose exactness is structural. This test
+    event never occurs in the clean archives (the PASS criterion of the
+    offline calibration in docs/DECISION.md "V7"), unlike V4/V5/V6 whose
+    exactness is structural. This test
     pins the mechanics, not that premise."""
     cse0 = torch.tensor([0.60, 0.55, 0.98, 0.58, 0.62, 0.70, 0.66])
     # r_2 = 0.98/0.62 = 1.58 > tau_lo, but iso_2 = 1/6: below iso_min.

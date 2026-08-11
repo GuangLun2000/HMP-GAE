@@ -178,8 +178,10 @@ class HMPGAERuntime:
         #     flags alone and never displaces a CSE flag
         #     (trust_scorer.v7_cse_reject_corrob_weights). v7_round_max=0
         #     reproduces V6 exactly. ⚠ Constants provisional until the
-        #     replay calibration (replay_v7_calibration.py) passes — do NOT
-        #     launch a V7 training run before that (docs/DECISION.md "V7").
+        #     pre-registered offline calibration in docs/DECISION.md "V7"
+        #     passes — do NOT launch a V7 training run before that. (The
+        #     replay script was deleted 2026-08-11; DECISION.md "V7" still
+        #     holds the binding grids and selection rules.)
         #   'v8_hmp_cse_propagation' (V8, 2026-08-09): V5 remains the
         #     high-confidence CSE decision layer.  Its flags seed risk on a
         #     fixed dual-view hypergraph: raw-update and label-free probe
@@ -252,9 +254,10 @@ class HMPGAERuntime:
         #               V6 reuses v5_m_floor / v5_r_hard for Stage 2 unchanged.
         self.v6_geo_floor = float(self.cfg.get("v6_geo_floor", 0.5))
         # --- V7 knobs (inert unless trust_mode == 'v7_cse_reject_corrob') ---
-        # ALL PROVISIONAL until replay_v7_calibration.py picks them from the
-        # pre-committed grids on the archived logs (docs/DECISION.md "V7");
-        # after that they are pre-registered and never re-tuned post hoc.
+        # ALL PROVISIONAL until the pre-registered offline calibration picks
+        # them from the pre-committed grids on the archived logs
+        # (docs/DECISION.md "V7"); after that they are pre-registered and
+        # never re-tuned post hoc.
         #   v7_tau_lo     : Tier-2 CSE floor, 1 < tau_lo < v4_tau_ratio.
         #                   Candidates {1.30..1.80 step 0.05}; provisional 1.40.
         #                   NOTE tau_lo < 1.7833 (archived clean benign max

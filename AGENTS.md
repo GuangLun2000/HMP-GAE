@@ -2,8 +2,11 @@
 
 > 本文件只维护代码无法直接表达的协作约束和高风险陷阱。运行方式见
 > [README.md](README.md)，文档职责见 [docs/README.md](docs/README.md)，当前公式见
-> [MATH_LOGIC.md](MATH_LOGIC.md)，版本历史与实验契约见
+> [docs/MATH_LOGIC.md](docs/MATH_LOGIC.md)，版本历史与实验契约见
 > [docs/DECISION.md](docs/DECISION.md)。
+>
+> 所有散文类文档都在 `docs/` 下；根目录只保留代码、运行入口，以及
+> `AGENTS.md` / `CLAUDE.md` 这两个必须待在根目录才能被 agent 工具自动读取的配置。
 
 ## 项目上下文
 
@@ -13,7 +16,7 @@
 - 当前主路径：V8 以 V5 的 full-test CSE 判定为高置信种子，利用 update/probe
   双视图一致超图传播风险，再按数据量加权聚合。
 - 机制边界：超图没有独立 flag 权；无种子、无双视图路径或无剩余 rank cap
-  时，V8 必须逐元素退化为 V5。完整公式只在 `MATH_LOGIC.md` 维护。
+  时，V8 必须逐元素退化为 V5。完整公式只在 `docs/MATH_LOGIC.md` 维护。
 
 ## 不可违反的工作流
 

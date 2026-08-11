@@ -906,8 +906,9 @@ def v7_cse_reject_corrob_weights(
         clean exactness is no longer purely structural as in V4-V6; it rests
         on the replay-verified premise that no clean benign client-round
         jointly crosses (tau_lo, iso_min) inside the window. That premise is
-        a pre-registered PASS criterion of replay_v7_calibration.py, with a
-        stated margin — if it fails, V7 is reported dead, not re-tuned.
+        a pre-registered PASS criterion of the offline calibration recorded
+        in docs/DECISION.md "V7", with a stated margin — if it fails, V7 is
+        reported dead, not re-tuned.
       * Abstention — iso=None (runtime passes None when the graph channel is
         resolution-gated via graph_min_distinct, i.e. quantization noise)
         empties Tier 2 for the round: a degenerate channel must degrade to

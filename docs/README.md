@@ -7,13 +7,25 @@ of copying its content into another document.
 |---|---|---|
 | [`../main.py`](../main.py) → `main()` | Active experiment values | Explanations or historical results |
 | [`../README.md`](../README.md) | Setup, execution, outputs, short method overview | Full equations or version history |
-| [`../MATH_LOGIC.md`](../MATH_LOGIC.md) | Current mathematical mechanism and code-symbol mapping | Active config values or experiment outcomes |
+| [`MATH_LOGIC.md`](MATH_LOGIC.md) | Current mathematical mechanism and code-symbol mapping | Active config values or experiment outcomes |
 | [`DECISION.md`](DECISION.md) | Dated design decisions, rejected alternatives, preregistration, falsification rules | Quick-start instructions |
 | [`../AGENTS.md`](../AGENTS.md) | Non-obvious workflow constraints and operational pitfalls | Repeated algorithm derivations |
 | Code docstrings and tests | Local contracts and executable invariants | Paper narrative |
 
-`CLAUDE.md` is intentionally only an import shim for `AGENTS.md`; never maintain
-a second copy of agent guidance there.
+## Where files live
+
+Prose belongs in this `docs/` directory. The repository root keeps only code,
+the run entry points, `README.md` (GitHub's landing page), `LICENSE`, and the
+two agent-tool configs that must sit at the root to be discovered:
+
+- `AGENTS.md` — read directly by Codex; the actual convention text.
+- `CLAUDE.md` — intentionally only an `@import` shim for `AGENTS.md`; never
+  maintain a second copy of agent guidance there.
+
+`MATH_LOGIC.md` moved from the root into `docs/` on 2026-08-11. Links inside
+`docs/*.md` are relative to `docs/`, so refer to root files as `../<file>`;
+`check_docs.py` resolves every link against its own file's directory and will
+fail on a stale path.
 
 ## Maintenance rules
 

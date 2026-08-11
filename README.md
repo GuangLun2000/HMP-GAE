@@ -15,10 +15,14 @@ experiment is always defined by the `config` dictionary inside `main()` in
 | Document | Purpose |
 |---|---|
 | This README | Installation, execution, outputs, and a short method overview |
-| [Documentation map](docs/README.md) | Source-of-truth rules and maintenance checklist |
-| [MATH_LOGIC.md](MATH_LOGIC.md) | Current equations, symbols, and code mapping |
+| [docs/README.md](docs/README.md) | Documentation map: source-of-truth rules and maintenance checklist |
+| [docs/MATH_LOGIC.md](docs/MATH_LOGIC.md) | Current equations, symbols, and code mapping |
 | [docs/DECISION.md](docs/DECISION.md) | Design history, rejected alternatives, and experiment contracts |
 | [AGENTS.md](AGENTS.md) | Repository-specific working and verification rules for coding agents |
+
+Prose lives under [`docs/`](docs/); the repository root keeps only code, the
+run entry points, and the agent-tool configs (`AGENTS.md`, `CLAUDE.md`) that
+their tooling requires to sit there.
 
 ## Method at a glance
 

@@ -2,13 +2,16 @@
 """Doc/code consistency guard for HMP-GAE.
 
 Cheap (~0.1s, stdlib-only, CPU) static check that the context docs
-(AGENTS.md / CLAUDE.md / MATH_LOGIC.md / README.md) stay honest against the
-code. Encodes the anti-drift rule established 2026-07-08:
+(AGENTS.md / CLAUDE.md at the root, everything under docs/, README.md) stay
+honest against the code. Encodes the anti-drift rule established 2026-07-08:
 
   * NO `main.py:<line>` / `main.py#L<line>` refs in the agent docs — main.py
     churns constantly, so line numbers rot. Refer to it by symbol instead
     (`main()` / config-key name).
-  * Every relative markdown link target must exist on disk.
+  * Every relative markdown link target must exist on disk. Links are
+    resolved relative to the linking file's own directory, so docs/*.md
+    `../` links are checked correctly (2026-08-11, when MATH_LOGIC.md moved
+    into docs/ and only code + agent-tool configs stayed at the root).
   * Every config key the docs treat as authoritative must exist in main.py.
   * Every code symbol the docs name (in STABLE files) must exist there.
 
@@ -26,9 +29,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 
 # Docs whose main.py line-refs we forbid (the agent-facing convention docs).
-AGENT_DOCS = ["AGENTS.md", "CLAUDE.md", "MATH_LOGIC.md"]
-# Docs whose markdown links we resolve.
-LINK_DOCS = ["README.md", "AGENTS.md", "CLAUDE.md", "MATH_LOGIC.md"]
+AGENT_DOCS = ["AGENTS.md", "CLAUDE.md", "docs/MATH_LOGIC.md"]
+# Docs whose markdown links we resolve (every prose doc in the repo).
+LINK_DOCS = ["README.md", "AGENTS.md", "CLAUDE.md",
+             "docs/README.md", "docs/MATH_LOGIC.md", "docs/DECISION.md"]
 
 # Config keys the docs rely on as authoritative knobs — must exist in main.py.
 CONFIG_KEYS = [
@@ -85,6 +89,9 @@ def check_no_mainpy_linerefs() -> list[str]:
 def check_links_resolve() -> tuple[list[str], int]:
     fails, n = [], 0
     for doc in LINK_DOCS:
+        # Markdown resolves relative links against the LINKING file's own
+        # directory, not the repo root — docs/*.md must be able to say ../.
+        base = (ROOT / doc).parent
         for target in MD_LINK.findall(_read(doc)):
             t = target.strip()
             if t.startswith(("http://", "https://", "mailto:", "#")):
@@ -93,7 +100,7 @@ def check_links_resolve() -> tuple[list[str], int]:
             if not path_part:
                 continue
             n += 1
-            if not (ROOT / path_part).exists():
+            if not (base / path_part).exists():
                 fails.append(f"{doc}: dead link -> {t}")
     return fails, n
 
