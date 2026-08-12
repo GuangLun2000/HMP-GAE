@@ -9,3 +9,11 @@ results/*
 !results/.gitkeep
 /.vscode
 .DS_Store
+
+# Author-side material kept out of the public repo (files stay on local disk;
+# untracked via `git rm -r --cached`, see commit history): design docs,
+# regression tests, agent config, CI workflows.
+/docs/
+/tests/
+/.claude/
+/.github/workflows/
