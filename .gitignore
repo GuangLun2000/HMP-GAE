@@ -12,8 +12,11 @@ results/*
 
 # Author-side material kept out of the public repo (files stay on local disk;
 # untracked via `git rm -r --cached`, see commit history): design docs,
-# regression tests, agent config, CI workflows.
+# regression tests, agent config/instructions, CI workflows.
 /docs/
 /tests/
 /.claude/
 /.github/workflows/
+/AGENTS.md
+/CLAUDE.md
+/check_docs.py

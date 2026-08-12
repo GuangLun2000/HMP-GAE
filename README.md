@@ -32,10 +32,7 @@ dictionary inside `main()` in [`main.py`](main.py).
 | [`evaluation_hallucination.py`](evaluation_hallucination.py) | End-of-FL perplexity evaluation |
 | [`run_downstream_generation.py`](run_downstream_generation.py) | Optional checkpoint-to-generation analysis |
 | [`visualization.py`](visualization.py) | Result figures |
-| [`tests/`](tests/) | CPU regression tests (no GPU or dataset needed) |
-| [`check_docs.py`](check_docs.py) | Documentation/code consistency guard |
 | [`HMP_GAE_Colab.ipynb`](HMP_GAE_Colab.ipynb) | The only maintained Colab notebook |
-| [`docs/`](docs/) | Method equations, design history, and the documentation map |
 | [`data/`](data/) | CSV caches for AG News and Yahoo Answers (downloaded on demand) |
 
 `results/` is created at runtime and is gitignored.
@@ -49,8 +46,7 @@ python main.py
 
 `python main.py` runs the experiment exactly as configured; there are no
 command-line flags, environment overrides, or notebook override hooks. A local
-macOS machine is fine for editing and for the checks in
-[Verification](#verification), but full runs need a GPU.
+machine is fine for editing, but full runs need a GPU.
 
 To change the experiment, edit the `config` dictionary inside `main()` in
 [`main.py`](main.py). Each key is commented in place with its accepted values.
@@ -96,23 +92,3 @@ Written to `results/`, named after `experiment_name`:
 
 Per-round resume snapshots are stored separately so an interrupted Colab session
 can continue from the last completed round.
-
-## Verification
-
-No training required; these are the checks CI also runs
-([`.github/workflows/verify.yml`](.github/workflows/verify.yml)):
-
-```bash
-python check_docs.py            # after editing any Markdown
-python -m compileall -q .       # after editing any Python
-python tests/test_trust_robustness.py   # after editing hmp_gae/ (needs PyTorch)
-```
-
-## Documentation
-
-| Document | Purpose |
-|---|---|
-| [docs/README.md](docs/README.md) | Documentation map and maintenance rules |
-| [docs/MATH_LOGIC.md](docs/MATH_LOGIC.md) | Equations, symbols, and their code locations |
-| [docs/DECISION.md](docs/DECISION.md) | Design history, rejected alternatives, experiment contracts |
-| [AGENTS.md](AGENTS.md) | Working and verification rules for coding agents |
