@@ -1122,13 +1122,18 @@ def main():
     # prints "[resume] Starting fresh" and restarts at round 0 instead of
     # silently mixing trajectories. Mid-run edits are not resumable by design.
     #
-    # CURRENT ARM (user-requested): V8 dual-view HMP + CSE-seeded propagation.
-    # Ablation arms: 'v4_cse_reject' (detect-then-suppress, constant multiplier)
-    # and 'v5_cse_reject' (V8 minus the hypergraph — THE matched-run baseline
-    # for any hypergraph-attributable claim, docs/DECISION.md).
+    # CURRENT ARM (user-requested): V4-remove — the pre-registered hard-removal
+    # ablation (trust_mode='v4_cse_reject' with v4_reject_mult=0.0, so a flagged
+    # client contributes NOTHING to that round's aggregate; docs/DECISION.md
+    # "V4-remove", 2026-08-07). Everything outside trust_mode / v4_reject_mult /
+    # the three trajectory-identity strings is byte-identical to the V8 arm, so
+    # this run is matched against it.
+    # Other arms: 'v8_hmp_cse_propagation' (dual-view HMP + CSE-seeded
+    # propagation) and 'v5_cse_reject' (V8 minus the hypergraph — THE
+    # matched-run baseline for any hypergraph-attributable claim).
     config = {
         # ========== Experiment ==========
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v8-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
+        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v4remove-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
         'seed': 42,
 
         # ========== Federated Learning Setup ==========
@@ -1300,14 +1305,16 @@ def main():
             #                            requires semantic_weight > 0.
             #                            Extra knobs: v5_*, plus the whole
             #                            hypergraph/GAE block below.
-            'trust_mode': 'v8_hmp_cse_propagation',
+            'trust_mode': 'v4_cse_reject',
             'keep_min': 1,               # defensive floor on unflagged clients
 
             # -- CSE-decision constants — PRE-REGISTERED, do not re-tune
             # (calibration: docs/DECISION.md "V4" / "V5"). v4_tau_ratio applies
             # to all three modes; the other three are per-version, as marked.
             'v4_tau_ratio': 1.85,
-            'v4_reject_mult': 0.10,  # V4 only; 0.0 = pre-registered hard-removal arm
+            'v4_reject_mult': 0.0,   # ACTIVE: 0.0 = pre-registered hard-removal arm
+                                     # (flagged client dropped from the round).
+                                     # 0.10 is the soft-suppression default.
             'v5_m_floor': 0.10,      # V5/V8 ramp floor; never 0.0
             'v5_r_hard': 2.5,        # V5/V8 ramp saturation ratio
 
@@ -1361,11 +1368,11 @@ def main():
 
         # ========== Checkpoints ==========
         'save_global_checkpoint': True,   # needed for PPL / downstream eval
-        'global_checkpoint_subdir': 'global_checkpoint_agnews_llama_v8_seed42',
+        'global_checkpoint_subdir': 'global_checkpoint_agnews_llama_v4remove_seed42',
         # Per-round resume snapshot (Colab resilience; fingerprint guard: fed_resume.py)
         'save_round_checkpoint': True,
         'resume_from_checkpoint': True,   # False = force a fresh run
-        'round_checkpoint_subdir': 'round_checkpoint_agnews_llama_v8_seed42',
+        'round_checkpoint_subdir': 'round_checkpoint_agnews_llama_v4remove_seed42',
         # ========== Task 2: optional downstream generation after FL ==========
         'run_downstream_after_fl': False,   # subprocess run_downstream_generation.py
         'downstream_probes': None,          # probe JSON path; None skips Task 2
