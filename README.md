@@ -1,18 +1,8 @@
 # HMP-GAE
 
-Hallucination Immunization for Multimodal Federated LLMs via Hypergraph Message Passing.
+Paper: Hallucination Immunization for Multimodal Federated LLMs via Hypergraph Message Passing.
 
-[Hanlin Cai](https://caihanlin.com/) · Research prototype, work in progress, not submitted.
-
-In federated LLM training, a compromised client can learn confident but wrong
-associations and push them into the shared model, where every other participant
-inherits them. This repository is a testbed for that threat — the
-**hallucination attack** — and for immunizing the federation against it: clients
-fine-tune a shared backbone locally, and before aggregation the server measures
-how much hallucination each client's model carries, then weights the clients
-accordingly. Runs report clean accuracy, Classification Semantic Entropy (CSE),
-and end-of-FL perplexity. A single run is fully described by the `config`
-dictionary inside `main()` in [`main.py`](main.py).
+Code Author: Hanlin Cai, Zihao Liu, Kai Li
 
 ## Repository map
 
