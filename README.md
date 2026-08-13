@@ -25,8 +25,6 @@ Code Author: Hanlin Cai, Zihao Liu, Kai Li
 | [`HMP_GAE_Colab.ipynb`](HMP_GAE_Colab.ipynb) | The only maintained Colab notebook |
 | [`data/`](data/) | CSV caches for AG News and Yahoo Answers (downloaded on demand) |
 
-`results/` is created at runtime and is gitignored.
-
 ## Install and run
 
 ```bash
