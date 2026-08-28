@@ -1,5 +1,9 @@
 # HMP-GAE
 
+Paper: Hallucination Immunization for Multimodal Federated LLMs via Hypergraph Message Passing.
+
+Code Author: Hanlin Cai, Zihao Liu, Kai Li
+
 ## Repository map
 
 | Path | Contents |
@@ -20,3 +24,59 @@
 | [`visualization.py`](visualization.py) | Result figures |
 | [`HMP_GAE_Colab.ipynb`](HMP_GAE_Colab.ipynb) | The only maintained Colab notebook |
 | [`data/`](data/) | CSV caches for AG News and Yahoo Answers (downloaded on demand) |
+
+## Install and run
+
+```bash
+pip install -r requirements.txt
+python main.py
+```
+
+`python main.py` runs the experiment exactly as configured; there are no
+command-line flags, environment overrides, or notebook override hooks. A local
+machine is fine for editing, but full runs need a GPU.
+
+To change the experiment, edit the `config` dictionary inside `main()` in
+[`main.py`](main.py). Each key is commented in place with its accepted values.
+Give every run its own `experiment_name` and checkpoint subdirectories so that
+resume never picks up another run's state.
+
+## Run on Colab
+
+Open [`HMP_GAE_Colab.ipynb`](HMP_GAE_Colab.ipynb), select a GPU runtime, and run
+all cells. Its steps are: fetch the repository, install `requirements.txt`,
+check the GPU and Hugging Face login, call `main()` without overriding anything,
+render the metrics and per-client figures inline, print the numeric tables, zip
+the `results/` artifacts for download, and release the runtime. Run the last
+cell when you are done so the GPU is not held.
+
+To use a plain Colab or any other cloud shell instead:
+
+```bash
+git clone https://github.com/GuangLun2000/HMP-GAE.git
+cd HMP-GAE
+pip install -r requirements.txt
+python main.py
+```
+
+Gated backbones such as Llama 3.2 require accepting the model license on Hugging
+Face and providing `HF_TOKEN` (in Colab, add it under the sidebar's Secrets tab;
+the notebook logs in automatically). GPU memory depends on the selected backbone,
+precision, sequence length, and batch size; larger fp32 decoder runs need an
+A100-class GPU.
+
+## Outputs
+
+Written to `results/`, named after `experiment_name`:
+
+- `<experiment>_results.json` — the full config, per-round metrics, and defense
+  diagnostics.
+- `<experiment>_eval_ppl.json` — perplexity, when the backbone supports causal
+  language modeling.
+- `<experiment>_figure1.png` … `_figure5.png` — generated plots.
+- A global checkpoint directory, plus a `peft_adapter/` when LoRA is enabled, if
+  checkpoint saving is on. This checkpoint is what perplexity and
+  `run_downstream_generation.py` consume.
+
+Per-round resume snapshots are stored separately so an interrupted Colab session
+can continue from the last completed round.
