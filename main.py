@@ -1128,7 +1128,7 @@ def main():
     # for any hypergraph-attributable claim, docs/DECISION.md).
     config = {
         # ========== Experiment ==========
-        'experiment_name': 'agnews-(non-iid0.5)-hmpgae-v8-hallu(localround=1,seed=42,r50,len128,flip0.3-0.8)-llama3.2-1b',
+        'experiment_name': 'agnews-qwen-v8-seed42-ablation-fill',
         'seed': 42,
 
         # ========== Federated Learning Setup ==========
@@ -1205,7 +1205,7 @@ def main():
         # 'EleutherAI/pythia-160m' | 'EleutherAI/pythia-1b' | 'facebook/opt-125m' |
         # 'Qwen/Qwen2.5-0.5B' (ungated, fits T4 15GB) | 'meta-llama/Llama-3.2-1B'
         # (GATED: HF license + HF_TOKEN; fp32 needs A100). PPL needs a decoder.
-        'model_name': 'meta-llama/Llama-3.2-1B',
+        'model_name': 'Qwen/Qwen2.5-0.5B',
         
 
         # ========== Attack ==========
@@ -1361,11 +1361,11 @@ def main():
 
         # ========== Checkpoints ==========
         'save_global_checkpoint': True,   # needed for PPL / downstream eval
-        'global_checkpoint_subdir': 'global_checkpoint_agnews_llama_v8_seed42',
+        'global_checkpoint_subdir': 'global_checkpoint_agnews_qwen_v8_seed42_ablation_fill',
         # Per-round resume snapshot (Colab resilience; fingerprint guard: fed_resume.py)
         'save_round_checkpoint': True,
-        'resume_from_checkpoint': True,   # False = force a fresh run
-        'round_checkpoint_subdir': 'round_checkpoint_agnews_llama_v8_seed42',
+        'resume_from_checkpoint': False,   # False = force a fresh run
+        'round_checkpoint_subdir': 'round_checkpoint_agnews_qwen_v8_seed42_ablation_fill',
         # ========== Task 2: optional downstream generation after FL ==========
         'run_downstream_after_fl': False,   # subprocess run_downstream_generation.py
         'downstream_probes': None,          # probe JSON path; None skips Task 2
