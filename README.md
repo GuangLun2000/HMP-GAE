@@ -1,9 +1,5 @@
 # HMP-GAE
 
-Paper: Hallucination Immunization for Multimodal Federated LLMs via Hypergraph Message Passing.
-
-Code Author: Hanlin Cai, Zihao Liu, Kai Li
-
 ## Repository map
 
 | Path | Contents |
